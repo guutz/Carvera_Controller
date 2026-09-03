@@ -93,6 +93,19 @@ class Daemon:
     def set_text(self, row: int, text: str) -> None:
         self._send(f"TEXT {row} {text}")
 
+    def set_banner(self, text: str) -> None:
+        """Large centered text. Empty text returns the display to row-grid mode."""
+        self._send(f"BANNER {text}".rstrip())
+
+    def set_hint(self, text: str) -> None:
+        """Small hint line under the banner."""
+        self._send(f"HINT {text}".rstrip())
+
+    @property
+    def supports_banner(self) -> bool:
+        """BANNER/HINT were added in firmware 2; older firmware ignores them."""
+        return self.firmware_version >= 2
+
     def clear_text(self) -> None:
         self._send("CLEAR")
 
