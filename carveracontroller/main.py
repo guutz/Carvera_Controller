@@ -149,6 +149,7 @@ from carveracontroller.addons.pendant import (
     SUPPORTED_PENDANTS,
     OverrideController,
     SettingGamepadBindings,
+    SettingMacroPadLayout,
     SettingPendantSelector,
 )
 from carveracontroller.addons.probing.ProbingPopup import ProbingPopup
@@ -1976,6 +1977,7 @@ class MakeraConfigPanel(SettingsWithSidebar):
         self.register_type("gcodesnippet", custom_widgets.SettingGCodeSnippet)
         self.register_type("colorpicker", custom_widgets.SettingColorPicker)
         self.register_type("gamepad_bindings", SettingGamepadBindings)
+        self.register_type("macropad_layout", SettingMacroPadLayout)
 
     def create_json_panel(self, title, config, filename=None, data=None):
         panel = super().create_json_panel(title, config, filename, data)

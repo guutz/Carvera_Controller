@@ -18,11 +18,13 @@ from kivy.metrics import dp
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.settings import SettingItem
 from kivy.uix.spinner import Spinner
+from kivy.uix.textinput import TextInput
 
 from carveracontroller.CNC import CNC
 from carveracontroller.Controller import Controller
@@ -397,6 +399,94 @@ if WHB04_SUPPORTED:
             popup.open()
 
 
+# Bindable MacroPad actions: name -> (banner label, hint label, handler, confirms).
+#
+# The vocabulary of macropad_layout.json, and of the settings editor. Banner labels stay
+# <=8 characters so they render at a readable size on the OLED; hint labels are the compact
+# legend form. Whether an action confirms is a property of the action, not of where it is
+# bound, so moving a binding cannot accidentally drop the confirmation -- a layout entry can
+# still override it explicitly.
+#
+# The handler is a method name on MacroPadPendant, or "macro:<n>" for a user macro.
+MACROPAD_ACTIONS: dict[str, tuple[str, str, str, bool]] = {
+    "margin": ("MARGIN", "MARGIN", "_do_margin_scan", False),
+    "machine_home": ("M-HOME", "MHOME", "_do_machine_home", False),
+    "safe_z": ("SAFE Z", "SAFEZ", "_do_safe_z", False),
+    "work_home": ("W-HOME", "WHOME", "_do_work_home", False),
+    "run_pause": ("RUN", "RUN", "_do_start_pause", False),
+    "stop": ("STOP", "STOP", "_do_stop", False),
+    "spindle_toggle": ("SPINDLE", "SPIN", "_do_spindle_toggle", False),
+    "probe_z": ("PROBE Z", "PROBE", "_do_probe_z", False),
+    "probe_laser": ("LASER", "LASER", "_do_probe_laser_toggle", False),
+    # Zeroing silently redefines the work origin, so it confirms by default.
+    "zero_xy": ("ZERO XY", "ZEROXY", "_do_zero_xy", True),
+    "zero_z": ("ZERO Z", "ZEROZ", "_do_zero_z", True),
+}
+for _n in range(1, 11):
+    MACROPAD_ACTIONS[f"macro_{_n}"] = (f"MACRO {_n}", f"MAC{_n}", f"macro:{_n}", False)
+
+MACROPAD_JOG_AXES = ("X", "Y", "Z", "A")
+MACROPAD_KEY_COUNT = 12
+
+
+def validate_macropad_layout(raw: dict) -> None:
+    """
+    Raise ValueError describing the first problem with *raw*, or return cleanly.
+
+    Shared by the driver (which rejects a bad file and falls back) and the settings editor
+    (which refuses to save one), so both agree on what a valid layout is.
+    """
+
+    def key_number(value, what):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{what} '{value}' is not a key number") from None
+        if not 0 <= number < MACROPAD_KEY_COUNT:
+            raise ValueError(f"{what} {number} is out of range (keys are 0-{MACROPAD_KEY_COUNT - 1})")
+        return number
+
+    if not isinstance(raw, dict):
+        raise ValueError("layout must be a JSON object")
+
+    jog = raw.get("jog", {})
+    if not isinstance(jog, dict):
+        raise ValueError("'jog' must be an object of key -> axis")
+    for key, axis in jog.items():
+        key_number(key, "jog key")
+        if axis not in MACROPAD_JOG_AXES:
+            raise ValueError(f"jog key {key} has unknown axis '{axis}'")
+
+    modifiers = raw.get("modifiers", {})
+    if not isinstance(modifiers, dict):
+        raise ValueError("'modifiers' must be an object of key -> modifier")
+    jog_keys = {key_number(k, "jog key") for k in jog}
+    seen_names = set()
+    for key, entry in modifiers.items():
+        number = key_number(key, "modifier key")
+        if not isinstance(entry, dict):
+            raise ValueError(f"modifier {number} must be an object")
+        name = entry.get("name")
+        if not name or not isinstance(name, str):
+            raise ValueError(f"modifier {number} needs a 'name'")
+        if name in seen_names:
+            raise ValueError(f"two modifiers are both named '{name}'")
+        seen_names.add(name)
+        if number in jog_keys:
+            raise ValueError(f"key {number} is both a jog key and the '{name}' modifier")
+        targets = entry.get("targets", {})
+        if not isinstance(targets, dict):
+            raise ValueError(f"modifier '{name}' needs 'targets' as an object")
+        for target_key, binding in targets.items():
+            target = key_number(target_key, f"'{name}' target key")
+            action = binding.get("action") if isinstance(binding, dict) else binding
+            if action not in MACROPAD_ACTIONS:
+                raise ValueError(
+                    f"'{name}' key {target} uses unknown action '{action}'; "
+                    f"known actions: {', '.join(sorted(MACROPAD_ACTIONS))}"
+                )
+
+
 class _PendantTarget(NamedTuple):
     """One action, reached by a chord of a modifier key plus a target key."""
 
@@ -595,33 +685,18 @@ if MACROPAD_SUPPORTED:
             """
             Bindable actions by stable name: (banner label, hint label, handler, confirms).
 
-            These names are the vocabulary of macropad_layout.json. Banner labels stay <=8
-            characters so they render at a readable size; hint labels are the compact
-            legend form. Whether an action confirms is a property of the action itself, not
-            of where it is bound, so moving a binding cannot accidentally drop the
-            confirmation -- a layout entry can still override it explicitly.
+            The names, labels and confirm flags live in MACROPAD_ACTIONS at module level so
+            the settings editor can offer them without constructing a pendant; this only
+            binds each one to its handler on this instance.
             """
-            specs = {
-                "margin": ("MARGIN", "MARGIN", self._do_margin_scan, False),
-                "machine_home": ("M-HOME", "MHOME", self._do_machine_home, False),
-                "safe_z": ("SAFE Z", "SAFEZ", self._do_safe_z, False),
-                "work_home": ("W-HOME", "WHOME", self._do_work_home, False),
-                "run_pause": ("RUN", "RUN", self._do_start_pause, False),
-                "stop": ("STOP", "STOP", self._do_stop, False),
-                "spindle_toggle": ("SPINDLE", "SPIN", self._do_spindle_toggle, False),
-                "probe_z": ("PROBE Z", "PROBE", self._do_probe_z, False),
-                "probe_laser": ("LASER", "LASER", self._do_probe_laser_toggle, False),
-                # Zeroing silently redefines the work origin, so it confirms by default.
-                "zero_xy": ("ZERO XY", "ZEROXY", self._do_zero_xy, True),
-                "zero_z": ("ZERO Z", "ZEROZ", self._do_zero_z, True),
-            }
-            for n in range(1, 11):
-                specs[f"macro_{n}"] = (
-                    f"MACRO {n}",
-                    f"MAC{n}",
-                    (lambda macro_id=n: self.run_macro(macro_id)),
-                    False,
-                )
+            specs = {}
+            for name, (label, hint, handler_name, confirms) in MACROPAD_ACTIONS.items():
+                if handler_name.startswith("macro:"):
+                    macro_id = int(handler_name.split(":", 1)[1])
+                    handler = lambda macro_id=macro_id: self.run_macro(macro_id)
+                else:
+                    handler = getattr(self, handler_name)
+                specs[name] = (label, hint, handler, confirms)
             return specs
 
         def _layout_search_paths(self) -> list[str]:
@@ -663,55 +738,7 @@ if MACROPAD_SUPPORTED:
 
         def _validate_layout(self, raw: dict) -> None:
             """Raise ValueError describing the first problem found."""
-            known = self._action_specs()
-
-            def key_number(value, what):
-                try:
-                    number = int(value)
-                except (TypeError, ValueError):
-                    raise ValueError(f"{what} '{value}' is not a key number") from None
-                if not 0 <= number < 12:
-                    raise ValueError(f"{what} {number} is out of range (keys are 0-11)")
-                return number
-
-            if not isinstance(raw, dict):
-                raise ValueError("layout must be a JSON object")
-
-            jog = raw.get("jog", {})
-            if not isinstance(jog, dict):
-                raise ValueError("'jog' must be an object of key -> axis")
-            for key, axis in jog.items():
-                key_number(key, "jog key")
-                if axis not in ("X", "Y", "Z", "A"):
-                    raise ValueError(f"jog key {key} has unknown axis '{axis}'")
-
-            modifiers = raw.get("modifiers", {})
-            if not isinstance(modifiers, dict):
-                raise ValueError("'modifiers' must be an object of key -> modifier")
-            seen_names = set()
-            for key, entry in modifiers.items():
-                number = key_number(key, "modifier key")
-                if not isinstance(entry, dict):
-                    raise ValueError(f"modifier {number} must be an object")
-                name = entry.get("name")
-                if not name or not isinstance(name, str):
-                    raise ValueError(f"modifier {number} needs a 'name'")
-                if name in seen_names:
-                    raise ValueError(f"two modifiers are both named '{name}'")
-                seen_names.add(name)
-                if number in {key_number(k, "jog key") for k in jog}:
-                    raise ValueError(f"key {number} is both a jog key and the '{name}' modifier")
-                targets = entry.get("targets", {})
-                if not isinstance(targets, dict):
-                    raise ValueError(f"modifier '{name}' needs 'targets' as an object")
-                for target_key, binding in targets.items():
-                    target = key_number(target_key, f"'{name}' target key")
-                    action = binding.get("action") if isinstance(binding, dict) else binding
-                    if action not in known:
-                        raise ValueError(
-                            f"'{name}' key {target} uses unknown action '{action}'; "
-                            f"known actions: {', '.join(sorted(known))}"
-                        )
+            validate_macropad_layout(raw)
 
         def _apply_layout(self, raw: dict) -> None:
             """Turn a validated layout into the lookup tables the rest of the class uses."""
@@ -2036,6 +2063,305 @@ class SettingGamepadBindings(SettingItem):
 
         self.panel.set_value(self.section, self.key, new_value)
         self.value = new_value
+
+    def on_value(self, instance, value):
+        if hasattr(self, "summary_label"):
+            self.summary_label.text = self._get_summary()
+
+
+class MacroPadLayoutPopup(Popup):
+    """
+    Edit the MacroPad key layout: a 3x4 grid mirroring the physical pad.
+
+    One tab per modifier plus a Jog tab. Tap a key in a modifier's tab to choose what that
+    chord does; tap one in the Jog tab to cycle which axis it jogs. Adding or removing
+    modifiers is deliberately not offered here -- it changes the shape of the whole layout,
+    and macropad_layout.json remains the way to do that.
+    """
+
+    JOG_TAB = "__jog__"
+
+    def __init__(self, layout: dict, on_save: Callable[[dict], None], **kwargs) -> None:
+        kwargs.setdefault("title", tr._("MacroPad Layout"))
+        kwargs.setdefault("size_hint", (0.95, 0.95))
+        kwargs.setdefault("auto_dismiss", False)
+        super().__init__(**kwargs)
+
+        self._layout = json.loads(json.dumps(layout))  # edit a copy; Cancel must be free
+        self._on_save = on_save
+        self._tab = self.JOG_TAB
+        self._key_buttons: dict[int, Button] = {}
+        self._error_label: Label | None = None
+
+        modifiers = self._layout.get("modifiers", {})
+        if modifiers:
+            self._tab = sorted(modifiers, key=int)[0]
+
+        self._build_ui()
+        self._refresh()
+
+    # --- construction -------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+
+        self._tab_bar = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(4))
+        root.add_widget(self._tab_bar)
+
+        self._name_row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+        root.add_widget(self._name_row)
+
+        grid = GridLayout(cols=3, spacing=dp(6))
+        for key in range(MACROPAD_KEY_COUNT):
+            button = Button(halign="center", valign="middle")
+            button.bind(on_release=lambda _b, k=key: self._on_key(k))
+            self._key_buttons[key] = button
+            grid.add_widget(button)
+        root.add_widget(grid)
+
+        self._error_label = Label(text="", size_hint_y=None, height=dp(24), color=(1, 0.4, 0.4, 1))
+        root.add_widget(self._error_label)
+
+        bar = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(10))
+        reset = Button(text=tr._("Reset to Default"))
+        reset.bind(on_release=lambda *_: self._reset())
+        cancel = Button(text=tr._("Cancel"))
+        cancel.bind(on_release=lambda *_: self.dismiss())
+        save = Button(text=tr._("Save"))
+        save.bind(on_release=lambda *_: self._save())
+        bar.add_widget(reset)
+        bar.add_widget(cancel)
+        bar.add_widget(save)
+        root.add_widget(bar)
+
+        self.content = root
+
+    def _rebuild_tabs(self) -> None:
+        self._tab_bar.clear_widgets()
+        for key in sorted(self._layout.get("modifiers", {}), key=int):
+            name = self._layout["modifiers"][key].get("name", key)
+            button = Button(text=f"{name}  ({key})")
+            button.bold = self._tab == key
+            button.bind(on_release=lambda _b, k=key: self._select_tab(k))
+            self._tab_bar.add_widget(button)
+        jog = Button(text=tr._("Jog"))
+        jog.bold = self._tab == self.JOG_TAB
+        jog.bind(on_release=lambda *_: self._select_tab(self.JOG_TAB))
+        self._tab_bar.add_widget(jog)
+
+    def _select_tab(self, tab: str) -> None:
+        self._tab = tab
+        self._refresh()
+
+    # --- rendering ----------------------------------------------------------------------
+
+    def _refresh(self) -> None:
+        self._rebuild_tabs()
+        self._rebuild_name_row()
+        modifiers = self._layout.get("modifiers", {})
+        jog = self._layout.get("jog", {})
+
+        for key, button in self._key_buttons.items():
+            role = ""
+            if str(key) in modifiers:
+                role = tr._("[modifier {}]").format(modifiers[str(key)].get("name", ""))
+            elif self._tab == self.JOG_TAB:
+                role = jog.get(str(key), tr._("--"))
+            else:
+                binding = modifiers.get(self._tab, {}).get("targets", {}).get(str(key))
+                action = binding.get("action") if isinstance(binding, dict) else binding
+                role = MACROPAD_ACTIONS[action][0] if action in MACROPAD_ACTIONS else tr._("--")
+            button.text = f"{key}\n{role}"
+            # A key that is a modifier is not editable from another modifier's tab.
+            button.disabled = str(key) in modifiers and self._tab != self.JOG_TAB
+
+    def _rebuild_name_row(self) -> None:
+        self._name_row.clear_widgets()
+        if self._tab == self.JOG_TAB:
+            self._name_row.add_widget(
+                Label(text=tr._("Tap a key to cycle which axis it jogs."), halign="left", valign="middle")
+            )
+            return
+        self._name_row.add_widget(Label(text=tr._("Name:"), size_hint_x=None, width=dp(60)))
+        field = TextInput(text=self._layout["modifiers"][self._tab].get("name", ""), multiline=False)
+        field.bind(text=lambda _w, value: self._rename(value))
+        self._name_row.add_widget(field)
+
+    def _rename(self, value: str) -> None:
+        self._layout["modifiers"][self._tab]["name"] = value
+        self._rebuild_tabs()
+
+    # --- editing ------------------------------------------------------------------------
+
+    def _on_key(self, key: int) -> None:
+        if self._tab == self.JOG_TAB:
+            self._cycle_jog(key)
+        else:
+            self._choose_action(key)
+
+    def _cycle_jog(self, key: int) -> None:
+        jog = self._layout.setdefault("jog", {})
+        current = jog.get(str(key))
+        order = [None, *MACROPAD_JOG_AXES]
+        nxt = order[(order.index(current) + 1) % len(order)] if current in order else MACROPAD_JOG_AXES[0]
+        if nxt is None:
+            jog.pop(str(key), None)
+        else:
+            jog[str(key)] = nxt
+        self._refresh()
+
+    def _choose_action(self, key: int) -> None:
+        targets = self._layout["modifiers"][self._tab].setdefault("targets", {})
+
+        chooser = Popup(title=tr._("Key {} action").format(key), size_hint=(0.7, 0.9), auto_dismiss=True)
+        body = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+        scroll = ScrollView()
+        listing = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(4))
+        listing.bind(minimum_height=listing.setter("height"))
+
+        def assign(action):
+            if action is None:
+                targets.pop(str(key), None)
+            else:
+                targets[str(key)] = action
+            chooser.dismiss()
+            self._refresh()
+
+        none_btn = Button(text=tr._("(unbound)"), size_hint_y=None, height=dp(40))
+        none_btn.bind(on_release=lambda *_: assign(None))
+        listing.add_widget(none_btn)
+        for name, (label, _hint, _handler, confirms) in MACROPAD_ACTIONS.items():
+            caption = f"{label}  -  {name}" + (tr._("  (confirms)") if confirms else "")
+            button = Button(text=caption, size_hint_y=None, height=dp(40))
+            button.bind(on_release=lambda _b, a=name: assign(a))
+            listing.add_widget(button)
+
+        scroll.add_widget(listing)
+        body.add_widget(scroll)
+        close = Button(text=tr._("Cancel"), size_hint_y=None, height=dp(40))
+        close.bind(on_release=lambda *_: chooser.dismiss())
+        body.add_widget(close)
+        chooser.content = body
+        chooser.open()
+
+    # --- save / reset -------------------------------------------------------------------
+
+    def _reset(self) -> None:
+        self._on_save(None)  # None means "forget my copy and use the shipped default"
+        self.dismiss()
+
+    def _save(self) -> None:
+        try:
+            validate_macropad_layout(self._layout)
+        except ValueError as e:
+            # Same validator the driver uses, so anything saved here will load there.
+            self._error_label.text = str(e)[:120]
+            return
+        self._on_save(self._layout)
+        self.dismiss()
+
+
+class SettingMacroPadLayout(SettingItem):
+    """Settings row that opens the MacroPad layout editor."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.size_hint_y = None
+        self.height = dp(60)
+
+        wrapper = AnchorLayout(anchor_y="center", anchor_x="left")
+        inner = BoxLayout(
+            orientation="horizontal", spacing=dp(10), size_hint=(1, None), height=dp(40), padding=[dp(10), 0]
+        )
+
+        self.summary_label = Label(text=self._get_summary(), halign="left", valign="middle", size_hint=(1, 1))
+        self.summary_label.bind(size=lambda w, s: setattr(w, "text_size", s))
+
+        btn = Button(text=tr._("Configure..."), size_hint=(None, 1), width=dp(130))
+        btn.bind(on_release=self._open_popup)
+
+        inner.add_widget(self.summary_label)
+        inner.add_widget(btn)
+        wrapper.add_widget(inner)
+        self.add_widget(wrapper)
+
+    # --- where the layout lives ---------------------------------------------------------
+    #
+    # The JSON file is the single source of truth, not this setting's value: the driver
+    # already loads and validates it, and duplicating it into the Kivy config would give
+    # two places to disagree. The setting value only records whether a user copy exists so
+    # the summary can say so.
+
+    @staticmethod
+    def _user_layout_path() -> str | None:
+        app = App.get_running_app() if App is not None else None
+        if app is None or not app.user_data_dir:
+            return None
+        return os.path.join(app.user_data_dir, MacroPadPendant.LAYOUT_FILENAME)
+
+    @staticmethod
+    def _shipped_layout_path() -> str:
+        return os.path.join(os.path.dirname(__file__), MacroPadPendant.LAYOUT_FILENAME)
+
+    def _get_summary(self) -> str:
+        path = self._user_layout_path()
+        if path and os.path.exists(path):
+            return tr._("Custom")
+        return tr._("Default")
+
+    def _load_current(self) -> dict:
+        for path in (self._user_layout_path(), self._shipped_layout_path()):
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    return json.load(handle)
+            except Exception:
+                logger.warning("Could not read MacroPad layout %s", path, exc_info=True)
+        return {"jog": {}, "modifiers": {}}
+
+    def _open_popup(self, *args) -> None:
+        MacroPadLayoutPopup(layout=self._load_current(), on_save=self._save_layout).open()
+
+    def _save_layout(self, layout: dict | None) -> None:
+        path = self._user_layout_path()
+        if path is None:
+            logger.error("No app config directory; cannot save MacroPad layout")
+            return
+        try:
+            if layout is None:
+                if os.path.exists(path):
+                    os.remove(path)  # fall back to the shipped default
+            else:
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(layout, handle, indent=4)
+        except OSError:
+            logger.error("Could not write MacroPad layout %s", path, exc_info=True)
+            return
+
+        self.summary_label.text = self._get_summary()
+        # Mirrors the file into the setting purely so the panel registers a change.
+        self.panel.set_value(self.section, self.key, "custom" if layout is not None else "")
+        self._reload_live_pendant()
+
+    @staticmethod
+    def _reload_live_pendant() -> None:
+        """Apply the new layout to the running pendant without a reconnect."""
+        try:
+            pendant = App.get_running_app().root.pendant
+        except Exception:
+            return
+        if not isinstance(pendant, MacroPadPendant):
+            return
+        try:
+            pendant._build_targets()
+            pendant._led_cache.clear()
+            pendant._banner_cache = ("", "")
+            pendant._stroke_keys = set()
+            pendant._clear_pending_confirm()
+        except Exception:
+            logger.warning("Could not apply new MacroPad layout to the live pendant", exc_info=True)
 
     def on_value(self, instance, value):
         if hasattr(self, "summary_label"):
