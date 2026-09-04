@@ -697,7 +697,7 @@ def test_leds_idle_shows_jog_axes_and_modifiers_only():
     assert colors[0] == MacroPadPendant.AXIS_COLOR_IDLE["X"]
     assert colors[1] == MacroPadPendant.AXIS_COLOR_IDLE["Y"]
     assert colors[2] == MacroPadPendant.AXIS_COLOR_IDLE["Z"]
-    for key in MacroPadPendant.MODIFIER_KEYS:
+    for key in pendant._modifier_keys:
         assert colors[key] == MacroPadPendant.MODIFIER_IDLE_COLOR
     for key in (3, 4, 5, 6, 7, 8):  # targets are dark until a modifier is held
         assert colors[key] == 0x000000
@@ -710,9 +710,9 @@ def test_leds_light_only_valid_targets_while_modifier_held():
     pendant._refresh_leds(pendant._daemon)
     colors = dict(pendant._daemon.led_calls)
 
-    assert colors[GOTO] == MacroPadPendant.MODIFIER_COLORS[GOTO]
+    assert colors[GOTO] == MacroPadPendant.MODIFIER_COLORS["GOTO"]
     for key in (3, 6, 7, 8):
-        assert colors[key] == MacroPadPendant.TARGET_COLORS[GOTO]
+        assert colors[key] == MacroPadPendant.TARGET_COLORS["GOTO"]
     # Keys that do nothing under GOTO go dark, including the other modifiers.
     for key in (0, 1, 2, 4, 5, ACT, SET):
         assert colors[key] == 0x000000
@@ -727,7 +727,7 @@ def test_leds_highlight_only_the_pending_confirm_target():
     colors = dict(pendant._daemon.led_calls)
 
     assert colors[0] == MacroPadPendant.CONFIRM_COLOR
-    assert colors[SET] == MacroPadPendant.MODIFIER_COLORS[SET]
+    assert colors[SET] == MacroPadPendant.MODIFIER_COLORS["SET"]
     for key in (1, 2, 3, 4, 5, 6, 7, 8, GOTO, ACT):
         assert colors[key] == 0x000000
 
@@ -840,7 +840,7 @@ def test_laser_key_is_lit_while_act_is_held():
     pendant._refresh_leds(pendant._daemon)
     colors = dict(pendant._daemon.led_calls)
 
-    assert colors[8] == MacroPadPendant.TARGET_COLORS[ACT]
+    assert colors[8] == MacroPadPendant.TARGET_COLORS["ACT"]
 
 
 # --- margin scan (M495) -----------------------------------------------------------------------
@@ -963,4 +963,4 @@ def test_margin_key_is_lit_while_goto_is_held():
     pendant._refresh_leds(pendant._daemon)
     colors = dict(pendant._daemon.led_calls)
 
-    assert colors[3] == MacroPadPendant.TARGET_COLORS[GOTO]
+    assert colors[3] == MacroPadPendant.TARGET_COLORS["GOTO"]

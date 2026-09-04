@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Callable
 from typing import NamedTuple
@@ -451,8 +452,10 @@ if MACROPAD_SUPPORTED:
         the keys that are actually live in the current mode, so the layout is discoverable
         without memorizing it.
 
-        There's no settings-UI editor for the bindings yet -- edit MODIFIER_KEYS /
-        JOG_KEY_AXIS / the _targets table in __init__ (see macropad_pendant/README.md).
+        The layout is data, not code: modifiers, jog keys and every binding come from
+        macropad_layout.json (shipped alongside this module; a copy in the app's config
+        directory overrides it). See _action_specs for the bindable action names and
+        macropad_pendant/README.md for the file format.
         """
 
         DEFAULT_MAX_JOG_SPEED = 3000  # mm/min, continuous mode only
@@ -468,6 +471,9 @@ if MACROPAD_SUPPORTED:
         FLASH_DURATION = 0.9  # seconds an executed action's name stays on screen
         MAX_HINT_LEN = 45  # two ~21-col lines plus the "|" separator
 
+        # Key numbers of the shipped default layout. The live layout comes from
+        # macropad_layout.json (see _load_layout); these name the defaults for readability
+        # and are what the bundled layout is checked against in tests.
         KEY_JOG_X = 0
         KEY_JOG_Y = 1
         KEY_JOG_Z = 2
@@ -475,16 +481,18 @@ if MACROPAD_SUPPORTED:
         KEY_ACT = 10
         KEY_SET = 11
 
-        MODIFIER_KEYS = (KEY_GOTO, KEY_ACT, KEY_SET)
-        MODIFIER_NAMES = {KEY_GOTO: "GOTO", KEY_ACT: "ACT", KEY_SET: "SET"}
+        LAYOUT_FILENAME = "macropad_layout.json"
 
-        JOG_KEY_AXIS = {KEY_JOG_X: "X", KEY_JOG_Y: "Y", KEY_JOG_Z: "Z"}
         AXIS_COLOR_IDLE = {"X": 0x200000, "Y": 0x002000, "Z": 0x000020}
         AXIS_COLOR_HELD = {"X": 0xFF0000, "Y": 0x00FF00, "Z": 0x0000FF}
 
         MODIFIER_IDLE_COLOR = 0x0A0A0A
-        MODIFIER_COLORS = {KEY_GOTO: 0x0060FF, KEY_ACT: 0xFF6000, KEY_SET: 0xFF00C0}
-        TARGET_COLORS = {KEY_GOTO: 0x001830, KEY_ACT: 0x301400, KEY_SET: 0x300024}
+        # Keyed by modifier *name*, so renaming or moving a modifier in the layout file
+        # keeps its colour. Unknown names fall back to the default pair.
+        MODIFIER_COLORS = {"GOTO": 0x0060FF, "ACT": 0xFF6000, "SET": 0xFF00C0}
+        TARGET_COLORS = {"GOTO": 0x001830, "ACT": 0x301400, "SET": 0x300024}
+        DEFAULT_MODIFIER_COLOR = 0x808080
+        DEFAULT_TARGET_COLOR = 0x181818
         CONFIRM_COLOR = 0xFFFF00
 
         def __init__(self, *args, **kwargs) -> None:
@@ -528,33 +536,154 @@ if MACROPAD_SUPPORTED:
 
             self._daemon.start()
 
-        def _build_targets(self) -> dict[int, dict[int, _PendantTarget]]:
+        def _action_specs(self) -> dict[str, tuple[str, str, Callable[[], None], bool]]:
             """
-            modifier key -> {target key -> what it does}. Banner labels stay <=8 chars so
-            they render at a readable size; hint labels are the compact legend form.
+            Bindable actions by stable name: (banner label, hint label, handler, confirms).
+
+            These names are the vocabulary of macropad_layout.json. Banner labels stay <=8
+            characters so they render at a readable size; hint labels are the compact
+            legend form. Whether an action confirms is a property of the action itself, not
+            of where it is bound, so moving a binding cannot accidentally drop the
+            confirmation -- a layout entry can still override it explicitly.
             """
-            return {
-                self.KEY_GOTO: {
-                    3: _PendantTarget("MARGIN", "MARGIN", self._do_margin_scan),
-                    6: _PendantTarget("M-HOME", "MHOME", self._do_machine_home),
-                    7: _PendantTarget("SAFE Z", "SAFEZ", self._do_safe_z),
-                    8: _PendantTarget("W-HOME", "WHOME", self._do_work_home),
-                },
-                self.KEY_ACT: {
-                    3: _PendantTarget("RUN", "RUN", self._do_start_pause),
-                    4: _PendantTarget("STOP", "STOP", self._do_stop),
-                    5: _PendantTarget("SPINDLE", "SPIN", self._do_spindle_toggle),
-                    6: _PendantTarget("PROBE Z", "PROBE", self._do_probe_z),
-                    7: _PendantTarget("MACRO 1", "MAC1", lambda: self.run_macro(1)),
-                    8: _PendantTarget("LASER", "LASER", self._do_probe_laser_toggle),
-                },
-                self.KEY_SET: {
-                    # Zeroing silently redefines the work origin, so both need confirming.
-                    0: _PendantTarget("ZERO XY", "ZEROXY", self._do_zero_xy, True),
-                    1: _PendantTarget("ZERO XY", "ZEROXY", self._do_zero_xy, True),
-                    2: _PendantTarget("ZERO Z", "ZEROZ", self._do_zero_z, True),
-                },
+            specs = {
+                "margin": ("MARGIN", "MARGIN", self._do_margin_scan, False),
+                "machine_home": ("M-HOME", "MHOME", self._do_machine_home, False),
+                "safe_z": ("SAFE Z", "SAFEZ", self._do_safe_z, False),
+                "work_home": ("W-HOME", "WHOME", self._do_work_home, False),
+                "run_pause": ("RUN", "RUN", self._do_start_pause, False),
+                "stop": ("STOP", "STOP", self._do_stop, False),
+                "spindle_toggle": ("SPINDLE", "SPIN", self._do_spindle_toggle, False),
+                "probe_z": ("PROBE Z", "PROBE", self._do_probe_z, False),
+                "probe_laser": ("LASER", "LASER", self._do_probe_laser_toggle, False),
+                # Zeroing silently redefines the work origin, so it confirms by default.
+                "zero_xy": ("ZERO XY", "ZEROXY", self._do_zero_xy, True),
+                "zero_z": ("ZERO Z", "ZEROZ", self._do_zero_z, True),
             }
+            for n in range(1, 11):
+                specs[f"macro_{n}"] = (
+                    f"MACRO {n}",
+                    f"MAC{n}",
+                    (lambda macro_id=n: self.run_macro(macro_id)),
+                    False,
+                )
+            return specs
+
+        def _layout_search_paths(self) -> list[str]:
+            """
+            Where a layout may live, most specific first: a user copy in the app's config
+            directory, then the version shipped alongside this module.
+            """
+            paths = []
+            if App is not None:
+                try:
+                    app = App.get_running_app()
+                    if app is not None and app.user_data_dir:
+                        paths.append(os.path.join(app.user_data_dir, self.LAYOUT_FILENAME))
+                except Exception:
+                    pass
+            paths.append(os.path.join(os.path.dirname(__file__), self.LAYOUT_FILENAME))
+            return paths
+
+        def _load_layout(self) -> dict:
+            """
+            First readable, valid layout from _layout_search_paths.
+
+            A layout is taken whole or not at all: a typo'd action name invalidates the
+            file rather than silently unbinding one key, because a pendant that is missing
+            a key you expect is worse than one that plainly fell back to the default.
+            """
+            for path in self._layout_search_paths():
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, encoding="utf-8") as handle:
+                        raw = json.load(handle)
+                    self._validate_layout(raw)
+                    return raw
+                except Exception as e:
+                    logger.error("Ignoring MacroPad layout %s: %s", path, e)
+            logger.error("No usable MacroPad layout found; pendant will have no bindings")
+            return {"jog": {}, "modifiers": {}}
+
+        def _validate_layout(self, raw: dict) -> None:
+            """Raise ValueError describing the first problem found."""
+            known = self._action_specs()
+
+            def key_number(value, what):
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    raise ValueError(f"{what} '{value}' is not a key number") from None
+                if not 0 <= number < 12:
+                    raise ValueError(f"{what} {number} is out of range (keys are 0-11)")
+                return number
+
+            if not isinstance(raw, dict):
+                raise ValueError("layout must be a JSON object")
+
+            jog = raw.get("jog", {})
+            if not isinstance(jog, dict):
+                raise ValueError("'jog' must be an object of key -> axis")
+            for key, axis in jog.items():
+                key_number(key, "jog key")
+                if axis not in ("X", "Y", "Z", "A"):
+                    raise ValueError(f"jog key {key} has unknown axis '{axis}'")
+
+            modifiers = raw.get("modifiers", {})
+            if not isinstance(modifiers, dict):
+                raise ValueError("'modifiers' must be an object of key -> modifier")
+            seen_names = set()
+            for key, entry in modifiers.items():
+                number = key_number(key, "modifier key")
+                if not isinstance(entry, dict):
+                    raise ValueError(f"modifier {number} must be an object")
+                name = entry.get("name")
+                if not name or not isinstance(name, str):
+                    raise ValueError(f"modifier {number} needs a 'name'")
+                if name in seen_names:
+                    raise ValueError(f"two modifiers are both named '{name}'")
+                seen_names.add(name)
+                if number in {key_number(k, "jog key") for k in jog}:
+                    raise ValueError(f"key {number} is both a jog key and the '{name}' modifier")
+                targets = entry.get("targets", {})
+                if not isinstance(targets, dict):
+                    raise ValueError(f"modifier '{name}' needs 'targets' as an object")
+                for target_key, binding in targets.items():
+                    target = key_number(target_key, f"'{name}' target key")
+                    action = binding.get("action") if isinstance(binding, dict) else binding
+                    if action not in known:
+                        raise ValueError(
+                            f"'{name}' key {target} uses unknown action '{action}'; "
+                            f"known actions: {', '.join(sorted(known))}"
+                        )
+
+        def _apply_layout(self, raw: dict) -> None:
+            """Turn a validated layout into the lookup tables the rest of the class uses."""
+            specs = self._action_specs()
+
+            self._jog_keys = {int(key): axis for key, axis in raw.get("jog", {}).items()}
+
+            self._modifier_names = {}
+            self._targets = {}
+            for key, entry in raw.get("modifiers", {}).items():
+                number = int(key)
+                self._modifier_names[number] = entry["name"]
+                bound = {}
+                for target_key, binding in entry.get("targets", {}).items():
+                    action = binding.get("action") if isinstance(binding, dict) else binding
+                    label, hint, handler, confirms = specs[action]
+                    if isinstance(binding, dict) and "confirm" in binding:
+                        confirms = bool(binding["confirm"])
+                    bound[int(target_key)] = _PendantTarget(label, hint, handler, confirms)
+                self._targets[number] = bound
+
+            self._modifier_keys = tuple(self._modifier_names)
+
+        def _build_targets(self) -> dict[int, dict[int, _PendantTarget]]:
+            """Load and apply the layout; returns the target table for convenience."""
+            self._apply_layout(self._load_layout())
+            return self._targets
 
         def close(self) -> None:
             self._daemon.stop()
@@ -627,7 +756,7 @@ if MACROPAD_SUPPORTED:
             # keys mean "axis target", not "jog this axis".
             if self._active_modifier() is not None:
                 return None
-            for key, axis in self.JOG_KEY_AXIS.items():
+            for key, axis in self._jog_keys.items():
                 if key in self._daemon.pressed_keys:
                     return axis
             return None
@@ -638,7 +767,7 @@ if MACROPAD_SUPPORTED:
         # --- Key / encoder handling ----------------------------------------------------
 
         def _handle_key_press(self, daemon: macropad.Daemon, key_number: int) -> None:
-            if key_number in self.MODIFIER_KEYS:
+            if key_number in self._modifier_keys:
                 # Track press order so _active_modifier can prefer the newest held one.
                 if key_number in self._modifier_stack:
                     self._modifier_stack.remove(key_number)
@@ -666,13 +795,13 @@ if MACROPAD_SUPPORTED:
             target.action()
 
         def _handle_key_release(self, daemon: macropad.Daemon, key_number: int) -> None:
-            if key_number in self.MODIFIER_KEYS:
+            if key_number in self._modifier_keys:
                 # Letting go of the modifier abandons an unconfirmed action.
                 if self._pending_confirm and self._pending_confirm[0] == key_number:
                     self._clear_pending_confirm()
                 return
 
-            axis = self.JOG_KEY_AXIS.get(key_number)
+            axis = self._jog_keys.get(key_number)
             if axis is None:
                 return
 
@@ -868,6 +997,14 @@ if MACROPAD_SUPPORTED:
                 return 0.0
             return max(lo, min(num, hi))
 
+        def _modifier_color(self, modifier: int) -> int:
+            name = self._modifier_names.get(modifier)
+            return self.MODIFIER_COLORS.get(name, self.DEFAULT_MODIFIER_COLOR)
+
+        def _target_color(self, modifier: int) -> int:
+            name = self._modifier_names.get(modifier)
+            return self.TARGET_COLORS.get(name, self.DEFAULT_TARGET_COLOR)
+
         def _set_led_if_changed(self, daemon: macropad.Daemon, key: int, color: int) -> None:
             if self._led_cache.get(key) != color:
                 daemon.set_led(key, color)
@@ -926,7 +1063,7 @@ if MACROPAD_SUPPORTED:
 
             modifier = self._active_modifier()
             if modifier is not None:
-                return (self.MODIFIER_NAMES[modifier], self._hint_for(modifier))
+                return (self._modifier_names[modifier], self._hint_for(modifier))
 
             axis = self._held_jog_axis()
             if axis is not None:
@@ -996,20 +1133,20 @@ if MACROPAD_SUPPORTED:
             if self._pending_confirm:
                 # Only the key that will act, plus its modifier, stay lit.
                 modifier, key = self._pending_confirm
-                colors[modifier] = self.MODIFIER_COLORS[modifier]
+                colors[modifier] = self._modifier_color(modifier)
                 colors[key] = self.CONFIRM_COLOR
             else:
                 modifier = self._active_modifier()
                 if modifier is not None:
-                    colors[modifier] = self.MODIFIER_COLORS[modifier]
+                    colors[modifier] = self._modifier_color(modifier)
                     for key in self._targets_for(modifier):
-                        colors[key] = self.TARGET_COLORS[modifier]
+                        colors[key] = self._target_color(modifier)
                 else:
                     # Idle: show where the modifiers are, and the jog axes.
                     held_axis = self._held_jog_axis()
-                    for key, axis in self.JOG_KEY_AXIS.items():
+                    for key, axis in self._jog_keys.items():
                         colors[key] = self.AXIS_COLOR_HELD[axis] if axis == held_axis else self.AXIS_COLOR_IDLE[axis]
-                    for key in self.MODIFIER_KEYS:
+                    for key in self._modifier_keys:
                         colors[key] = self.MODIFIER_IDLE_COLOR
 
             for key, color in colors.items():
