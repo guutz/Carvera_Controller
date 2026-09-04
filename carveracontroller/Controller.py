@@ -529,6 +529,17 @@ class Controller:
             cmd = "M5\n"
         self.executeCommand(cmd)
 
+    def setProbeLaser(self, switch):
+        """
+        Turn the wired probe's laser crosshair on or off.
+
+        This is the probe's alignment pointer, unrelated to laser mode (M321) and to the
+        laser module. The firmware turns it off by itself after about five minutes, and
+        immediately if a tool is loaded, so "on" is not necessarily still on later --
+        re-sending is harmless and is the way to get it back.
+        """
+        self.executeCommand("M494.0\n" if switch else "M494.2\n")
+
     def setVacuumPower(self, power=0):
         if power > 0:
             self.executeCommand("M801 S%d\n" % (power))

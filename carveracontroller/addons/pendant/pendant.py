@@ -501,6 +501,7 @@ if MACROPAD_SUPPORTED:
             self._pending_deadline = 0.0
             self._flash_label = ""
             self._flash_until = 0.0
+            self._probe_laser_on = False
 
             self._targets = self._build_targets()
 
@@ -543,6 +544,7 @@ if MACROPAD_SUPPORTED:
                     5: _PendantTarget("SPINDLE", "SPIN", self._do_spindle_toggle),
                     6: _PendantTarget("PROBE Z", "PROBE", self._do_probe_z),
                     7: _PendantTarget("MACRO 1", "MAC1", lambda: self.run_macro(1)),
+                    8: _PendantTarget("LASER", "LASER", self._do_probe_laser_toggle),
                 },
                 self.KEY_SET: {
                     # Zeroing silently redefines the work origin, so both need confirming.
@@ -791,6 +793,23 @@ if MACROPAD_SUPPORTED:
             self._controller.setSpindleSwitch(not self._is_spindle_running())
             if self._update_ui_on_button_press:
                 self._update_ui_on_button_press("spindle_on_off")
+
+        def _do_probe_laser_toggle(self) -> None:
+            """
+            Toggle the wired probe's laser crosshair (M494) -- not laser mode.
+
+            The machine reports no probe-laser state, so this tracks it locally. The
+            firmware also drops the laser on its own after ~5 minutes and when a tool is
+            loaded, so the local flag can drift out of sync; the banner names the command
+            actually sent, and both directions are idempotent, so a stale flag costs at
+            worst one extra press.
+            """
+            self._probe_laser_on = not self._probe_laser_on
+            self._controller.setProbeLaser(self._probe_laser_on)
+            # Overrides the generic label flash set before the action ran.
+            self._flash_label = "LASER ON" if self._probe_laser_on else "LASER OFF"
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("probe_laser")
 
         # --- Display / LED feedback -----------------------------------------------------
 

@@ -83,6 +83,9 @@ class FakeController:
     def wcs_set(self, x=None, y=None, z=None, a=None):
         self.calls.append(("wcs_set", x, y, z, a))
 
+    def setProbeLaser(self, on):
+        self.calls.append(("probe_laser", on))
+
 
 def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabled=True) -> MacroPadPendant:
     pendant = MacroPadPendant.__new__(MacroPadPendant)
@@ -100,6 +103,7 @@ def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabl
     pendant._pending_deadline = 0.0
     pendant._flash_label = ""
     pendant._flash_until = 0.0
+    pendant._probe_laser_on = False
     pendant._max_jog_speed = MacroPadPendant.DEFAULT_MAX_JOG_SPEED
     pendant._brightness = 30
     pendant._is_jogging_enabled = lambda: jogging_enabled
@@ -515,7 +519,7 @@ def test_banner_shows_modifier_name_and_row_mirrored_hints():
     banner, hint = pendant._display_context()
     assert banner == "ACT"
     # Two lines mirroring key rows 1 and 2, each within one 21-col display line.
-    assert hint == "RUN STOP SPIN|PROBE MAC1"
+    assert hint == "RUN STOP SPIN|PROBE MAC1 LASER"
     assert all(len(line) <= 21 for line in hint.split("|"))
 
 
@@ -765,3 +769,72 @@ def test_handle_connect_resets_caches_sends_brightness_and_reports():
     assert pendant._banner_cache == ("", "")
     assert pendant._daemon.brightness_calls == [30]
     assert reported == [True]
+
+
+# --- probe laser (M494) -----------------------------------------------------------------------
+
+
+def test_act_plus_laser_key_turns_probe_laser_on_then_off():
+    pendant = make_pendant()
+
+    hold(pendant, ACT)
+    tap(pendant, 8)
+    assert ("probe_laser", True) in pendant._controller.calls
+
+    tap(pendant, 8)
+    assert pendant._controller.calls.count(("probe_laser", False)) == 1
+
+
+def test_probe_laser_is_not_reachable_without_the_act_modifier():
+    pendant = make_pendant()
+
+    tap(pendant, 8)
+
+    assert pendant._controller.calls == []
+
+
+def test_probe_laser_key_is_work_home_under_goto_not_the_laser():
+    """Key 8 is shared: GOTO+8 must stay work-home and never touch the laser."""
+    pendant = make_pendant()
+
+    hold(pendant, GOTO)
+    tap(pendant, 8)
+
+    assert ("w_home",) in pendant._controller.calls
+    assert not any(c[0] == "probe_laser" for c in pendant._controller.calls)
+
+
+def test_probe_laser_banner_names_the_direction_actually_sent(monkeypatch):
+    pendant = make_pendant(cnc_vars={"state": "Idle"})
+    fake_now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: fake_now[0])
+
+    hold(pendant, ACT)
+    tap(pendant, 8)
+    release(pendant, ACT)
+    assert pendant._display_context() == ("LASER ON", "")
+
+    fake_now[0] += MacroPadPendant.FLASH_DURATION + 0.1
+    hold(pendant, ACT)
+    tap(pendant, 8)
+    release(pendant, ACT)
+    assert pendant._display_context() == ("LASER OFF", "")
+
+
+def test_act_legend_lists_the_laser_and_still_fits_the_display():
+    pendant = make_pendant(cnc_vars={"state": "Idle"})
+    hold(pendant, ACT)
+
+    _banner, hint = pendant._display_context()
+    assert hint == "RUN STOP SPIN|PROBE MAC1 LASER"
+    assert all(len(line) <= 21 for line in hint.split("|"))
+
+
+def test_laser_key_is_lit_while_act_is_held():
+    pendant = make_pendant(cnc_vars={"state": "Idle"})
+    hold(pendant, ACT)
+
+    pendant._refresh_leds(pendant._daemon)
+    colors = dict(pendant._daemon.led_calls)
+
+    assert colors[8] == MacroPadPendant.TARGET_COLORS[ACT]
