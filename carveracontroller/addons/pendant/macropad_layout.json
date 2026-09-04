@@ -18,6 +18,12 @@
         "modifiers with a different meaning in each. Every action needs two controls at once,",
         "so a key bound nowhere simply does nothing.",
         "",
+        "Keep chord targets off the jog keys. A stroke of {jog key + modifier} would be",
+        "reachable by brushing a modifier while reaching for a jog key, and for something",
+        "like zeroing the work origin that is too easy an accident -- confirm-twice only",
+        "helps if you notice the prompt. With no overlap such a stroke spells nothing and",
+        "is completely inert.",
+        "",
         "Each target value is an action name from the list below. A few actions confirm by",
         "default (press the key twice); override per binding with the long form:",
         "    \"0\": {\"action\": \"zero_xy\", \"confirm\": false}",
@@ -67,9 +73,8 @@
         "11": {
             "name": "SET",
             "targets": {
-                "0": "zero_xy",
-                "1": "zero_xy",
-                "2": "zero_z"
+                "3": "zero_xy",
+                "5": "zero_z"
             }
         }
     }

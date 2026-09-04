@@ -26,7 +26,13 @@ from kivy.uix.settings import SettingItem
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 
-from carveracontroller.CNC import CNC
+from carveracontroller.CNC import (
+    CNC,
+    LASER_TOOL_NUMBER,
+    PROBE_3D_TOOL_NUMBER,
+    ZPROBE_TOOL_NUMBER,
+    is_probe_tools_range,
+)
 from carveracontroller.Controller import Controller
 from carveracontroller.translation import tr
 
@@ -1290,12 +1296,29 @@ if MACROPAD_SUPPORTED:
             return "G??"
 
         def _tool_text(self) -> str:
-            """Tool number, or T- when the machine has not reported one."""
+            """
+            What is in the spindle, named the way the app names it.
+
+            Several tool numbers are sentinels rather than pockets -- notably 0, which is
+            the touch probe, not "empty" -- so a bare "T0" would be actively misleading
+            about whether the probe is fitted. Labels are kept to five characters so the
+            whole row still fits 21 columns.
+            """
             try:
                 tool = int(self._cnc.vars.get("tool", -1))
             except (TypeError, ValueError):
                 return "T-"
-            return f"T{tool}" if tool >= 0 else "T-"
+            if tool < 0:
+                return "T-"  # machine has not reported a tool
+            if tool == ZPROBE_TOOL_NUMBER:
+                return "PROBE"
+            if tool == LASER_TOOL_NUMBER:
+                return "LASER"
+            if tool == PROBE_3D_TOOL_NUMBER:
+                return "3DPRB"
+            if is_probe_tools_range(tool):
+                return "PROBE"
+            return f"T{tool}"
 
         def _refresh_dro(self, daemon: macropad.Daemon) -> None:
             def wpos(key: str) -> str:
@@ -1314,9 +1337,10 @@ if MACROPAD_SUPPORTED:
             if self._show_a_axis:
                 lines.append(f"A {wpos('wa')}")
             lines += [
-                # No space before the number so the worst case ("G59.3 T99 TLO-123.456")
-                # still fits the 21-column display.
-                f"{self._wcs_name()} {self._tool_text()} TLO{tlo:.3f}",
+                # "H" is the G-code word for tool length offset, and short enough that
+                # even the worst case ("G59.3 3DPRB H-123.456") still fits 21 columns --
+                # with a "TLO" prefix it would overflow and silently truncate the digits.
+                f"{self._wcs_name()} {self._tool_text()} H{tlo:.3f}",
                 f"{state} step={self.current_step_size:g}mm",
                 f"F{feed:.0f} S{spindle:.0f}",
             ]

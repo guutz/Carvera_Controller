@@ -417,11 +417,11 @@ def test_encoder_press_cycles_step_size():
 def test_zeroing_needs_the_same_chord_twice():
     pendant = make_pendant()
 
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
     assert pendant._controller.calls == []
-    assert pendant._pending_confirm == frozenset((SET, 0))
+    assert pendant._pending_confirm == frozenset((SET, 3))
 
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
     assert ("wcs_set", 0, 0, None, None) in pendant._controller.calls
     assert pendant._pending_confirm is None
 
@@ -429,8 +429,8 @@ def test_zeroing_needs_the_same_chord_twice():
 def test_zero_z_needs_the_same_chord_twice():
     pendant = make_pendant()
 
-    stroke(pendant, SET, 2)
-    stroke(pendant, SET, 2)
+    stroke(pendant, SET, 5)
+    stroke(pendant, SET, 5)
 
     assert ("wcs_set", None, None, 0, None) in pendant._controller.calls
 
@@ -438,9 +438,9 @@ def test_zero_z_needs_the_same_chord_twice():
 def test_a_different_chord_in_between_cancels_the_confirmation():
     pendant = make_pendant()
 
-    stroke(pendant, SET, 0)  # arm zero XY
-    stroke(pendant, SET, 2)  # different chord -> arms that one instead
-    stroke(pendant, SET, 0)  # so this arms again rather than committing
+    stroke(pendant, SET, 3)  # arm zero XY
+    stroke(pendant, SET, 5)  # different chord -> arms that one instead
+    stroke(pendant, SET, 3)  # so this arms again rather than committing
 
     assert not any(call[0] == "wcs_set" for call in pendant._controller.calls)
 
@@ -450,7 +450,7 @@ def test_confirmation_expires(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
 
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
     now[0] += MacroPadPendant.CONFIRM_TIMEOUT + 0.1
     pendant._expire_pending_confirm()
 
@@ -461,7 +461,7 @@ def test_encoder_press_cancels_a_pending_confirmation():
     pendant = make_pendant()
     step_before = pendant.current_step_size
 
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
     pendant._handle_encoder_press(pendant._daemon)
 
     assert pendant._pending_confirm is None
@@ -471,7 +471,7 @@ def test_encoder_press_cancels_a_pending_confirmation():
 # --- machine-state gating ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("chord", [(GOTO, 6), (GOTO, 7), (SET, 2), (ACT, 6)])
+@pytest.mark.parametrize("chord", [(GOTO, 6), (GOTO, 7), (SET, 5), (ACT, 6)])
 def test_movement_chords_are_blocked_when_not_idle(chord):
     pendant = make_pendant(cnc_vars={"state": "Run", **LOADED_FILE})
 
@@ -503,7 +503,7 @@ def test_run_pause_is_allowed_while_running_but_not_while_alarmed():
 def test_blocked_chord_does_not_arm_a_confirmation():
     pendant = make_pendant(cnc_vars={"state": "Run"})
 
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
 
     assert pendant._pending_confirm is None
 
@@ -557,7 +557,7 @@ def test_preview_shows_the_live_coordinate_while_jogging():
 def test_preview_asks_for_a_repeat_when_confirmation_is_pending():
     pendant = make_pendant()
 
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
 
     assert pendant._display_context() == ("ZERO XY?", "REPEAT CHORD TO CONFIRM")
 
@@ -654,11 +654,11 @@ def test_idle_shows_modifiers_breathing_and_axes_steady():
 def test_pending_confirmation_blinks_the_chord():
     pendant = make_pendant()
 
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
     plan = pendant._led_plan()
 
     assert plan[SET] == (MacroPadPendant.CONFIRM_COLOR, "blink_fast")
-    assert plan[0] == (MacroPadPendant.CONFIRM_COLOR, "blink_fast")
+    assert plan[3] == (MacroPadPendant.CONFIRM_COLOR, "blink_fast")
 
 
 def test_alarm_strobes_every_key():
@@ -831,7 +831,7 @@ def test_dro_rows_formatting():
     assert rows[0] == "X 1.000"
     assert rows[1] == "Y -2.500"
     assert rows[2] == "Z 0.125"
-    assert rows[3] == "G54 T1 TLO-12.345"
+    assert rows[3] == "G54 T1 H-12.345"
     assert rows[4] == "Idle step=0.1mm"
     assert rows[5] == "F1200 S10000"
 
@@ -853,7 +853,7 @@ def test_dro_shows_the_fourth_axis_when_enabled_at_the_cost_of_feed_spindle():
 
     rows = dict(pendant._daemon.text_calls)
     assert rows[3] == "A 7.500"
-    assert rows[4] == "G54 T1 TLO-12.345"
+    assert rows[4] == "G54 T1 H-12.345"
     assert rows[5] == "Idle step=0.1mm"
     assert not any(text.startswith("F") for text in rows.values())
 
@@ -875,16 +875,6 @@ def test_wcs_name_survives_a_nonsense_index(bad):
     assert pendant._wcs_name() in ("G54", "G??")
 
 
-@pytest.mark.parametrize(
-    ("tool", "expected"),
-    [(0, "T0"), (1, "T1"), (7, "T7"), (-1, "T-"), ("x", "T-"), (None, "T-")],
-)
-def test_tool_text_handles_no_tool_and_junk(tool, expected):
-    pendant = make_pendant(cnc_vars={**DRO_VARS, "tool": tool})
-
-    assert pendant._tool_text() == expected
-
-
 def test_worst_case_wcs_row_still_fits_the_display():
     """G59.3 + a two-digit tool + a large negative offset is the longest this row gets."""
     pendant = make_pendant(cnc_vars={**DRO_VARS, "active_coord_system": 8, "tool": 99, "tlo": -123.456})
@@ -892,7 +882,7 @@ def test_worst_case_wcs_row_still_fits_the_display():
     pendant._refresh_dro(pendant._daemon)
 
     row = dict(pendant._daemon.text_calls)[3]
-    assert row == "G59.3 T99 TLO-123.456"
+    assert row == "G59.3 T99 H-123.456"
     assert len(row) <= pendant._daemon.num_cols
 
 
@@ -991,7 +981,7 @@ def test_firmware_animation_names_are_translated():
 
 def test_blink_fast_is_sent_as_blink():
     pendant = make_pendant()
-    stroke(pendant, SET, 0)  # arms a confirmation -> blink_fast
+    stroke(pendant, SET, 3)  # arms a confirmation -> blink_fast
 
     pendant._refresh_leds(pendant._daemon)
 
@@ -1135,7 +1125,7 @@ def test_pending_confirmation_beats_the_screensaver(monkeypatch):
     pendant = make_pendant()
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
-    stroke(pendant, SET, 0)
+    stroke(pendant, SET, 3)
     rest(pendant, now)
 
     assert pendant._screensaver_period() is None
@@ -1166,3 +1156,100 @@ def test_older_firmware_never_sleeps_the_screen(monkeypatch):
 
     assert pendant._daemon.saver_calls == []
     assert pendant._daemon.text_calls  # keeps showing the DRO instead
+
+
+# --- jog keys are never part of a chord ----------------------------------------------------------
+
+
+def test_no_chord_uses_a_jog_key():
+    """
+    The invariant behind the fix for brushing a modifier while reaching for a jog key.
+
+    If any chord shared a key with jogging, that stroke would be reachable by accident --
+    and for zeroing the work origin, confirm-twice only helps if you notice the prompt.
+    With no overlap the stroke spells nothing and cannot act at all.
+    """
+    pendant = make_pendant()
+
+    for chord in pendant._chords:
+        overlap = chord & set(pendant._jog_keys)
+        assert not overlap, f"chord {sorted(chord)} shares jog key(s) {sorted(overlap)}"
+
+
+@pytest.mark.parametrize("jog_key", [JOG_X, JOG_Y, JOG_Z])
+@pytest.mark.parametrize("modifier", [GOTO, ACT, SET])
+def test_brushing_a_modifier_while_holding_a_jog_key_is_inert(jog_key, modifier):
+    """The reported edge case: no motion, nothing armed, nothing fired, in either order."""
+    pendant = make_pendant()
+
+    press(pendant, jog_key)
+    press(pendant, modifier)
+    pendant._handle_encoder_delta(pendant._daemon, 3)
+    lift(pendant, jog_key)
+    lift(pendant, modifier)
+
+    assert pendant._controller.calls == []
+    assert pendant._pending_confirm is None
+
+
+def test_brushing_a_modifier_twice_still_cannot_zero_the_origin():
+    """
+    Previously this armed the confirmation on the first stroke and committed on the second,
+    so two brushes moved the work origin.
+    """
+    pendant = make_pendant()
+
+    for _ in range(2):
+        press(pendant, JOG_X)
+        press(pendant, SET)
+        lift(pendant, JOG_X)
+        lift(pendant, SET)
+
+    assert not any(call[0] == "wcs_set" for call in pendant._controller.calls)
+
+
+def test_the_deliberate_zero_chords_still_work():
+    pendant = make_pendant()
+
+    stroke(pendant, SET, 3)
+    stroke(pendant, SET, 3)
+    assert ("wcs_set", 0, 0, None, None) in pendant._controller.calls
+
+    stroke(pendant, SET, 5)
+    stroke(pendant, SET, 5)
+    assert ("wcs_set", None, None, 0, None) in pendant._controller.calls
+
+
+# --- tool sentinels -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tool", "expected"),
+    [
+        (0, "PROBE"),  # tool 0 is the touch probe, not an empty spindle
+        (1, "T1"),
+        (6, "T6"),
+        (8888, "LASER"),
+        (999990, "3DPRB"),
+        (999995, "PROBE"),
+        (999999, "PROBE"),
+        (-1, "T-"),
+        ("junk", "T-"),
+        (None, "T-"),
+    ],
+)
+def test_tool_text_names_the_sentinels(tool, expected):
+    pendant = make_pendant(cnc_vars={"tool": tool})
+
+    assert pendant._tool_text() == expected
+
+
+@pytest.mark.parametrize("tool", [0, 8888, 999990, 999995, 1, 99])
+def test_wcs_row_fits_the_display_for_every_tool_label(tool):
+    """Worst case is G59.3 + the longest label + a three-digit negative offset."""
+    pendant = make_pendant(cnc_vars={**DRO_VARS, "active_coord_system": 8, "tool": tool, "tlo": -123.456})
+
+    pendant._refresh_dro(pendant._daemon)
+
+    row = dict(pendant._daemon.text_calls)[3]
+    assert len(row) <= pendant._daemon.num_cols, row
