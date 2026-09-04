@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from collections.abc import Callable
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +396,552 @@ if WHB04_SUPPORTED:
             popup.open()
 
 
+class _PendantTarget(NamedTuple):
+    """One action reachable by holding a modifier key and pressing a target key."""
+
+    label: str  # shown large on the OLED ("what am I about to do")
+    hint: str  # compact form for the on-screen legend of available targets
+    action: Callable[[], None]
+    needs_confirm: bool = False
+
+
+try:
+    from . import macropad
+
+    MACROPAD_SUPPORTED = True
+except Exception as e:
+    logger.warning(f"MacroPad pendant not supported: {e}")
+    MACROPAD_SUPPORTED = False
+
+
+if MACROPAD_SUPPORTED:
+
+    class MacroPadPendant(Pendant):
+        """
+        Driver for the Adafruit MacroPad RP2040 pendant. Talks the application-agnostic
+        serial protocol implemented by the firmware in the sibling `macropad_pendant/`
+        project (see its PROTOCOL.md) -- this class is where all the CNC-specific meaning
+        gets attached to raw key/encoder events.
+
+        Every action requires two controls at once -- no single keypress ever moves the
+        machine. There are two chord shapes:
+
+          * hold a jog key (row 0) and turn the encoder to jog that axis
+          * hold a modifier key (row 3) and press one of its target keys
+
+        Layout (3x4 key grid, numbered left-to-right/top-to-bottom):
+
+            Row 0:  0 X          |  1 Y          |  2 Z         <- jog holds / SET targets
+            Row 1:  3 run/pause  |  4 stop       |  5 spindle   <- ACT targets
+            Row 2:  6 m-home     |  7 safe Z     |  8 w-home    <- GOTO targets
+                                    (6 probe Z, 7 macro 1 under ACT)
+            Row 3:  9 GOTO       | 10 ACT        | 11 SET       <- modifiers
+
+        So: hold GOTO + press 7 = go to safe Z. Hold ACT + press 3 = run/pause. Hold SET +
+        press 0/1 = zero XY (needs confirming), + press 2 = zero Z.
+
+        Targets marked needs_confirm show "<LABEL>?" on the OLED and only fire when the same
+        key is pressed a second time; the encoder press, releasing the modifier, or
+        CONFIRM_TIMEOUT elapsing all cancel. Holding two modifiers uses the most recently
+        pressed one.
+
+        The OLED shows the DRO when nothing is engaged, and switches to a big banner naming
+        the pending action the moment a jog key or modifier goes down. NeoPixels light only
+        the keys that are actually live in the current mode, so the layout is discoverable
+        without memorizing it.
+
+        There's no settings-UI editor for the bindings yet -- edit MODIFIER_KEYS /
+        JOG_KEY_AXIS / the _targets table in __init__ (see macropad_pendant/README.md).
+        """
+
+        DEFAULT_MAX_JOG_SPEED = 3000  # mm/min, continuous mode only
+        Z_MAX_JOG_SPEED = 800  # mm/min cap for Z in continuous mode
+        STEP_SIZES = [0.01, 0.1, 1.0, 10.0]
+        STEP_SIZE_SPEED_FRACTION = {0.01: 0.02, 0.1: 0.10, 1.0: 0.30, 10.0: 1.0}
+
+        CONFIRM_TIMEOUT = 4.0  # seconds an unconfirmed prompt stays live
+        FLASH_DURATION = 0.9  # seconds an executed action's name stays on screen
+        MAX_HINT_LEN = 45  # two ~21-col lines plus the "|" separator
+
+        KEY_JOG_X = 0
+        KEY_JOG_Y = 1
+        KEY_JOG_Z = 2
+        KEY_GOTO = 9
+        KEY_ACT = 10
+        KEY_SET = 11
+
+        MODIFIER_KEYS = (KEY_GOTO, KEY_ACT, KEY_SET)
+        MODIFIER_NAMES = {KEY_GOTO: "GOTO", KEY_ACT: "ACT", KEY_SET: "SET"}
+
+        JOG_KEY_AXIS = {KEY_JOG_X: "X", KEY_JOG_Y: "Y", KEY_JOG_Z: "Z"}
+        AXIS_COLOR_IDLE = {"X": 0x200000, "Y": 0x002000, "Z": 0x000020}
+        AXIS_COLOR_HELD = {"X": 0xFF0000, "Y": 0x00FF00, "Z": 0x0000FF}
+
+        MODIFIER_IDLE_COLOR = 0x0A0A0A
+        MODIFIER_COLORS = {KEY_GOTO: 0x0060FF, KEY_ACT: 0xFF6000, KEY_SET: 0xFF00C0}
+        TARGET_COLORS = {KEY_GOTO: 0x001830, KEY_ACT: 0x301400, KEY_SET: 0x300024}
+        CONFIRM_COLOR = 0xFFFF00
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+
+            self._step_index = 1  # 0.1mm default
+            self._last_jog_direction: dict[str, int] = {}
+            self._active_continuous_jog_axis: str | None = None
+            self._led_cache: dict[int, int] = {}
+            self._text_cache: dict[int, str] = {}
+            self._banner_cache: tuple[str, str] = ("", "")
+
+            self._modifier_stack: list[int] = []
+            self._pending_confirm: tuple[int, int] | None = None
+            self._pending_deadline = 0.0
+            self._flash_label = ""
+            self._flash_until = 0.0
+
+            self._targets = self._build_targets()
+
+            try:
+                self._max_jog_speed = float(Config.get("carvera", "macropad_max_jog_speed"))
+            except Exception:
+                self._max_jog_speed = self.DEFAULT_MAX_JOG_SPEED
+
+            try:
+                self._brightness = max(0, min(100, int(Config.get("carvera", "macropad_brightness"))))
+            except Exception:
+                self._brightness = 30
+
+            self._daemon = macropad.Daemon(self.executor)
+            self._daemon.on_connect = self._handle_connect
+            self._daemon.on_disconnect = self._handle_disconnect
+            self._daemon.on_update = self._handle_display_update
+            self._daemon.on_key_press = self._handle_key_press
+            self._daemon.on_key_release = self._handle_key_release
+            self._daemon.on_encoder_delta = self._handle_encoder_delta
+            self._daemon.on_encoder_press = self._handle_encoder_press
+            self._daemon.on_permission_error = self._handle_permission_error
+
+            self._daemon.start()
+
+        def _build_targets(self) -> dict[int, dict[int, _PendantTarget]]:
+            """
+            modifier key -> {target key -> what it does}. Banner labels stay <=8 chars so
+            they render at a readable size; hint labels are the compact legend form.
+            """
+            return {
+                self.KEY_GOTO: {
+                    6: _PendantTarget("M-HOME", "MHOME", self._do_machine_home),
+                    7: _PendantTarget("SAFE Z", "SAFEZ", self._do_safe_z),
+                    8: _PendantTarget("W-HOME", "WHOME", self._do_work_home),
+                },
+                self.KEY_ACT: {
+                    3: _PendantTarget("RUN", "RUN", self._do_start_pause),
+                    4: _PendantTarget("STOP", "STOP", self._do_stop),
+                    5: _PendantTarget("SPINDLE", "SPIN", self._do_spindle_toggle),
+                    6: _PendantTarget("PROBE Z", "PROBE", self._do_probe_z),
+                    7: _PendantTarget("MACRO 1", "MAC1", lambda: self.run_macro(1)),
+                },
+                self.KEY_SET: {
+                    # Zeroing silently redefines the work origin, so both need confirming.
+                    0: _PendantTarget("ZERO XY", "ZEROXY", self._do_zero_xy, True),
+                    1: _PendantTarget("ZERO XY", "ZEROXY", self._do_zero_xy, True),
+                    2: _PendantTarget("ZERO Z", "ZEROZ", self._do_zero_z, True),
+                },
+            }
+
+        def close(self) -> None:
+            self._daemon.stop()
+
+        @property
+        def current_step_size(self) -> float:
+            return self.STEP_SIZES[self._step_index]
+
+        # --- Connection lifecycle -----------------------------------------------------
+
+        def _handle_connect(self, daemon: macropad.Daemon) -> None:
+            # The firmware doesn't persist LED/text state across a reconnect, so drop our
+            # "what did we last send" cache and let the next update push everything fresh.
+            self._led_cache.clear()
+            self._text_cache.clear()
+            self._banner_cache = ("", "")
+            daemon.set_brightness(self._brightness)
+            self._report_connection()
+
+        def _handle_disconnect(self, daemon: macropad.Daemon) -> None:
+            self._report_disconnection()
+
+        def _handle_permission_error(self, daemon: macropad.Daemon) -> None:
+            message = (
+                "The MacroPad pendant was found but cannot be opened due to\n"
+                "insufficient permissions on the serial device.\n\n"
+                "See the documentation on how to fix these permissions on Linux:\n"
+                "https://carvera-community.gitbook.io/docs/controller/features/pendant-support#linux"
+            )
+            print(f"\nERROR: {message}\n", flush=True)
+
+            scroll = ScrollView(size_hint=(1, 1))
+            lbl = Label(text=message, halign="left", valign="top", size_hint_y=None)
+            lbl.bind(
+                width=lambda w, v: setattr(w, "text_size", (v, None)),
+                texture_size=lambda w, v: setattr(w, "height", v[1]),
+            )
+            scroll.add_widget(lbl)
+
+            btn = Button(text="Exit", size_hint_y=None, height=dp(44))
+
+            content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+            content.add_widget(scroll)
+            content.add_widget(btn)
+
+            popup = Popup(
+                title="Pendant Permission Error",
+                content=content,
+                size_hint=(0.85, 0.65),
+                auto_dismiss=False,
+            )
+            btn.bind(on_release=lambda *_: App.get_running_app().stop())
+            popup.open()
+
+        # --- Modifier / target resolution ----------------------------------------------
+
+        def _active_modifier(self) -> int | None:
+            """
+            The action modifier currently in effect: the most recently pressed one that is
+            still held. Rolling a finger from one modifier to another switches mode rather
+            than latching on whichever was pressed first.
+            """
+            for key in reversed(self._modifier_stack):
+                if key in self._daemon.pressed_keys:
+                    return key
+            return None
+
+        def _held_jog_axis(self) -> str | None:
+            # An action modifier suppresses jogging entirely -- while one is held the row-0
+            # keys mean "axis target", not "jog this axis".
+            if self._active_modifier() is not None:
+                return None
+            for key, axis in self.JOG_KEY_AXIS.items():
+                if key in self._daemon.pressed_keys:
+                    return axis
+            return None
+
+        def _targets_for(self, modifier: int) -> dict[int, _PendantTarget]:
+            return self._targets.get(modifier, {})
+
+        # --- Key / encoder handling ----------------------------------------------------
+
+        def _handle_key_press(self, daemon: macropad.Daemon, key_number: int) -> None:
+            if key_number in self.MODIFIER_KEYS:
+                # Track press order so _active_modifier can prefer the newest held one.
+                if key_number in self._modifier_stack:
+                    self._modifier_stack.remove(key_number)
+                self._modifier_stack.append(key_number)
+                self._clear_pending_confirm()
+                return
+
+            modifier = self._active_modifier()
+            if modifier is None:
+                # Nothing fires from a lone keypress -- every action needs a modifier held.
+                return
+
+            target = self._targets_for(modifier).get(key_number)
+            if target is None:
+                return
+
+            if target.needs_confirm and self._pending_confirm != (modifier, key_number):
+                self._pending_confirm = (modifier, key_number)
+                self._pending_deadline = time.monotonic() + self.CONFIRM_TIMEOUT
+                return
+
+            self._clear_pending_confirm()
+            self._flash_label = target.label
+            self._flash_until = time.monotonic() + self.FLASH_DURATION
+            target.action()
+
+        def _handle_key_release(self, daemon: macropad.Daemon, key_number: int) -> None:
+            if key_number in self.MODIFIER_KEYS:
+                # Letting go of the modifier abandons an unconfirmed action.
+                if self._pending_confirm and self._pending_confirm[0] == key_number:
+                    self._clear_pending_confirm()
+                return
+
+            axis = self.JOG_KEY_AXIS.get(key_number)
+            if axis is None:
+                return
+
+            self._last_jog_direction.pop(axis, None)
+            if axis == self._active_continuous_jog_axis and self._controller.continuous_jog_active:
+                self._controller.stopContinuousJog()
+                self._active_continuous_jog_axis = None
+                if self._update_ui_on_jog_stop:
+                    self._update_ui_on_jog_stop()
+
+        def _clear_pending_confirm(self) -> None:
+            self._pending_confirm = None
+            self._pending_deadline = 0.0
+
+        def _expire_pending_confirm(self) -> None:
+            """Drop a stale confirmation so a forgotten prompt can't fire much later."""
+            if self._pending_confirm and time.monotonic() > self._pending_deadline:
+                self._clear_pending_confirm()
+
+        def _handle_encoder_delta(self, daemon: macropad.Daemon, delta: int) -> None:
+            if not self._is_jogging_enabled():
+                return
+
+            axis = self._held_jog_axis()
+            if axis is None:
+                return
+
+            if self._controller.jog_mode == Controller.JOG_MODE_CONTINUOUS:
+                self._handle_continuous_jog(axis, delta)
+            else:
+                distance = self.current_step_size * delta
+                self._controller.jog(f"{axis}{round(distance, 4)}")
+
+        def _handle_continuous_jog(self, axis: str, delta: int) -> None:
+            direction = 1 if delta > 0 else -1
+            prev_direction = self._last_jog_direction.get(axis, 0)
+
+            if (
+                prev_direction != 0
+                and prev_direction != direction
+                and axis == self._active_continuous_jog_axis
+                and self._controller.continuous_jog_active
+            ):
+                self._controller.stopContinuousJog()
+
+            self._last_jog_direction[axis] = direction
+
+            if self._controller.continuous_jog_active:
+                return
+
+            feed = self.STEP_SIZE_SPEED_FRACTION[self.current_step_size] * self._max_jog_speed
+            if axis == "Z":
+                feed = min(feed, self.Z_MAX_JOG_SPEED)
+
+            self._controller.startContinuousJog(f"{axis}{direction}", feed)
+            self._active_continuous_jog_axis = axis
+
+        def _handle_encoder_press(self, daemon: macropad.Daemon) -> None:
+            # Doubles as an explicit "never mind" for a pending confirmation.
+            if self._pending_confirm:
+                self._clear_pending_confirm()
+                return
+
+            self._step_index = (self._step_index + 1) % len(self.STEP_SIZES)
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("step_size_changed")
+
+        # --- Action implementations (mirrors GamepadPendant's) --------------------------
+
+        def _do_start_pause(self) -> None:
+            self._handle_run_pause_resume()
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("start_pause")
+
+        def _do_stop(self) -> None:
+            self._controller.abortCommand()
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("stop")
+
+        def _do_zero_xy(self) -> None:
+            # G10L20P0: make the current machine position the given work coordinate.
+            self._controller.wcs_set(x=0, y=0)
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("zero_xy")
+
+        def _do_zero_z(self) -> None:
+            self._controller.wcs_set(z=0)
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("zero_z")
+
+        def _do_probe_z(self) -> None:
+            self._handle_probe_z()
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("probe_z")
+
+        def _do_machine_home(self) -> None:
+            self._controller.gotoMachineHome()
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("m_home")
+
+        def _do_safe_z(self) -> None:
+            self._controller.gotoSafeZ()
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("safe_z")
+
+        def _do_work_home(self) -> None:
+            self._controller.gotoWCSHome()
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("w_home")
+
+        def _is_spindle_running(self) -> bool:
+            try:
+                return float(self._cnc.vars.get("curspindle", 0)) > 0.0
+            except (TypeError, ValueError):
+                return False
+
+        def _do_spindle_toggle(self) -> None:
+            if self._cnc.vars.get("lasermode"):
+                return
+            self._controller.setSpindleSwitch(not self._is_spindle_running())
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("spindle_on_off")
+
+        # --- Display / LED feedback -----------------------------------------------------
+
+        @staticmethod
+        def _safe_number(value, lo: float, hi: float) -> float:
+            try:
+                num = float(value)
+            except OverflowError:
+                # A finite integer literal can exceed float's range; clamp it by sign.
+                return hi if value > 0 else lo
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(num):
+                return 0.0
+            return max(lo, min(num, hi))
+
+        def _set_led_if_changed(self, daemon: macropad.Daemon, key: int, color: int) -> None:
+            if self._led_cache.get(key) != color:
+                daemon.set_led(key, color)
+                self._led_cache[key] = color
+
+        def _set_text_if_changed(self, daemon: macropad.Daemon, row: int, text: str) -> None:
+            if self._text_cache.get(row) != text:
+                daemon.set_text(row, text)
+                self._text_cache[row] = text
+
+        def _set_banner_if_changed(self, daemon: macropad.Daemon, banner: str, hint: str) -> None:
+            if self._banner_cache == (banner, hint):
+                return
+            self._banner_cache = (banner, hint)
+
+            if not daemon.supports_banner:
+                # Firmware 1 has no BANNER/HINT; fall back to the small row grid so an
+                # un-updated pendant still shows what's about to happen.
+                self._set_text_if_changed(daemon, 0, banner)
+                self._set_text_if_changed(daemon, 1, hint.replace("|", " "))
+                return
+
+            daemon.set_banner(banner)
+            daemon.set_hint(hint)
+
+        def _handle_display_update(self, daemon: macropad.Daemon) -> None:
+            self._expire_pending_confirm()
+            self._refresh_display(daemon)
+            self._refresh_leds(daemon)
+
+        def _hint_for(self, modifier: int) -> str:
+            """
+            Legend of available targets, split into two lines mirroring the physical key
+            rows they sit on -- so the on-screen order matches the keys under your fingers.
+            """
+            by_row: dict[int, list[str]] = {}
+            for key, target in sorted(self._targets_for(modifier).items()):
+                labels = by_row.setdefault(key // 3, [])
+                if target.hint not in labels:  # e.g. ZERO XY is bound to two keys
+                    labels.append(target.hint)
+            return "|".join(" ".join(by_row[row]) for row in sorted(by_row))[: self.MAX_HINT_LEN]
+
+        def _display_context(self) -> tuple[str, str] | None:
+            """
+            (banner, hint) for the current input state, or None when nothing is engaged and
+            the DRO should be shown instead.
+            """
+            if self._cnc.vars.get("state") == "Alarm":
+                return ("ALARM", "UNLOCK IN APP")
+
+            if self._pending_confirm:
+                modifier, key = self._pending_confirm
+                target = self._targets_for(modifier).get(key)
+                if target is not None:
+                    return (f"{target.label}?", "PRESS AGAIN TO CONFIRM")
+
+            modifier = self._active_modifier()
+            if modifier is not None:
+                return (self.MODIFIER_NAMES[modifier], self._hint_for(modifier))
+
+            axis = self._held_jog_axis()
+            if axis is not None:
+                return (f"JOG {axis}", f"STEP {self.current_step_size:g}mm")
+
+            if self._flash_label and time.monotonic() < self._flash_until:
+                return (self._flash_label, "")
+
+            return None
+
+        def _refresh_display(self, daemon: macropad.Daemon) -> None:
+            if daemon.num_rows == 0:
+                return  # haven't completed the ID handshake yet
+
+            context = self._display_context()
+            if context is not None:
+                self._set_banner_if_changed(daemon, context[0], context[1])
+                return
+
+            # Nothing engaged -> back to grid mode with the DRO.
+            if self._banner_cache != ("", ""):
+                self._banner_cache = ("", "")
+                self._text_cache.clear()
+                if daemon.supports_banner:
+                    daemon.set_banner("")
+
+            self._refresh_dro(daemon)
+
+        def _refresh_dro(self, daemon: macropad.Daemon) -> None:
+            def wpos(key: str) -> str:
+                return f"{self._safe_number(self._cnc.vars.get(key, 0), -1e6, 1e6):.3f}"
+
+            feed = self._safe_number(self._cnc.vars.get("curfeed", 0), 0.0, 9999.0)
+            spindle = self._safe_number(self._cnc.vars.get("curspindle", 0), 0.0, 65535.0)
+            state = self._cnc.vars.get("state", "")
+
+            lines = [
+                f"X {wpos('wx')}",
+                f"Y {wpos('wy')}",
+                f"Z {wpos('wz')}",
+                f"A {wpos('wa')}",
+                f"F{feed:.0f} S{spindle:.0f}",
+                f"{state} step={self.current_step_size:g}mm",
+            ]
+
+            cols = daemon.num_cols or None
+            for row, text in enumerate(lines[: daemon.num_rows]):
+                self._set_text_if_changed(daemon, row, text[:cols] if cols else text)
+
+        def _refresh_leds(self, daemon: macropad.Daemon) -> None:
+            if self._cnc.vars.get("state") == "Alarm":
+                for key in range(12):
+                    self._set_led_if_changed(daemon, key, 0xFF0000)
+                return
+
+            colors = dict.fromkeys(range(12), 0x000000)
+
+            if self._pending_confirm:
+                # Only the key that will act, plus its modifier, stay lit.
+                modifier, key = self._pending_confirm
+                colors[modifier] = self.MODIFIER_COLORS[modifier]
+                colors[key] = self.CONFIRM_COLOR
+            else:
+                modifier = self._active_modifier()
+                if modifier is not None:
+                    colors[modifier] = self.MODIFIER_COLORS[modifier]
+                    for key in self._targets_for(modifier):
+                        colors[key] = self.TARGET_COLORS[modifier]
+                else:
+                    # Idle: show where the modifiers are, and the jog axes.
+                    held_axis = self._held_jog_axis()
+                    for key, axis in self.JOG_KEY_AXIS.items():
+                        colors[key] = self.AXIS_COLOR_HELD[axis] if axis == held_axis else self.AXIS_COLOR_IDLE[axis]
+                    for key in self.MODIFIER_KEYS:
+                        colors[key] = self.MODIFIER_IDLE_COLOR
+
+            for key, color in colors.items():
+                self._set_led_if_changed(daemon, key, color)
+
+
 class GamepadPendant(Pendant):
     DEFAULT_MAX_JOG_SPEED = 3000  # mm/min
     DEFAULT_Z_MAX_SPEED = 800  # mm/min cap for Z in continuous mode
@@ -670,6 +1218,9 @@ SUPPORTED_PENDANTS = {
 
 if WHB04_SUPPORTED:
     SUPPORTED_PENDANTS["WHB04"] = WHB04
+
+if MACROPAD_SUPPORTED:
+    SUPPORTED_PENDANTS["MacroPad"] = MacroPadPendant
 
 
 class SettingPendantSelector(SettingItem):
