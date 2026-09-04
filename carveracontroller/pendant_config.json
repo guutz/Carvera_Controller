@@ -191,6 +191,15 @@
     },
     {
         "type": "bool",
+        "title": "MacroPad: Sound",
+        "desc": "Click on each key press, and a short rising/falling tone when a chord runs, arms a confirmation, or is refused. Requires pendant firmware 4 or newer.",
+        "section": "carvera",
+        "key": "macropad_sound",
+        "default": "true",
+        "pendant_types": ["MacroPad"]
+    },
+    {
+        "type": "bool",
         "title": "MacroPad: Show 4th Axis On Screen",
         "desc": "Add an A axis row to the pendant readout. The display only has six rows, so enabling this drops the feed/spindle row.",
         "section": "carvera",

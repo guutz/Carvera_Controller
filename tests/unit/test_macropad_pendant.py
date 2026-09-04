@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +21,7 @@ JOG_Z = MacroPadPendant.KEY_JOG_Z
 
 
 class FakeDaemon:
-    def __init__(self, num_rows=6, num_cols=21, firmware_version=3):
+    def __init__(self, num_rows=6, num_cols=21, firmware_version=4):
         self.pressed_keys: set[int] = set()
         self.num_rows = num_rows
         self.num_cols = num_cols
@@ -32,6 +33,8 @@ class FakeDaemon:
         self.brightness_calls: list[int] = []
         self.led_anim_calls: list[tuple[int, str, int, int]] = []
         self.saver_calls: list[int | None] = []
+        self.play_calls: list[list[tuple[int, int]]] = []
+        self.key_tone_calls: list[int] = []
 
     @property
     def supports_banner(self) -> bool:
@@ -40,6 +43,16 @@ class FakeDaemon:
     @property
     def supports_animation(self) -> bool:
         return self.firmware_version >= 3
+
+    @property
+    def supports_sound(self) -> bool:
+        return self.firmware_version >= 4
+
+    def play(self, notes) -> None:
+        self.play_calls.append(list(notes))
+
+    def set_key_tone(self, base_hz: int) -> None:
+        self.key_tone_calls.append(base_hz)
 
     def set_led_anim(self, key: int, mode: str, rgb: int, period_ms: int) -> None:
         self.led_anim_calls.append((key, mode, rgb, period_ms))
@@ -143,6 +156,7 @@ def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabl
     pendant._max_jog_speed = MacroPadPendant.DEFAULT_MAX_JOG_SPEED
     pendant._brightness = 30
     pendant._show_a_axis = False
+    pendant._sound_enabled = True
     pendant._is_jogging_enabled = lambda: jogging_enabled
     pendant._handle_run_pause_resume = lambda: pendant._controller.calls.append(("run_pause",))
     pendant._handle_probe_z = lambda: pendant._controller.calls.append(("probe_z",))
@@ -166,6 +180,11 @@ def press(pendant: MacroPadPendant, key: int) -> None:
 def lift(pendant: MacroPadPendant, key: int) -> None:
     pendant._daemon.pressed_keys.discard(key)
     pendant._handle_key_release(pendant._daemon, key)
+
+
+def plain(hint: str) -> str:
+    """Legend with the hint pointer's brackets removed."""
+    return hint.replace("[", "").replace("]", "")
 
 
 def stroke(pendant: MacroPadPendant, *keys: int) -> None:
@@ -516,7 +535,8 @@ def test_preview_shows_the_menu_while_only_a_modifier_is_down():
 
     press(pendant, GOTO)
 
-    assert pendant._display_context() == ("GOTO", "MARGIN|MHOME SAFEZ WHOME")
+    banner, hint = pendant._display_context()
+    assert (banner, plain(hint)) == ("GOTO", "MARGIN|MHOME SAFEZ WHOME")
 
 
 def test_preview_shows_what_releasing_now_would_do():
@@ -633,8 +653,10 @@ def test_keys_that_would_complete_a_chord_are_offered():
     press(pendant, GOTO)
     plan = pendant._led_plan()
 
+    pointed = pendant._pointed_target(GOTO)
     for key in (3, 6, 7, 8):  # GOTO's targets
-        assert plan[key][1] == "glow", key
+        # All offered; the one the hint pointer is on is bright rather than glowing.
+        assert plan[key][1] == ("solid" if key == pointed else "glow"), key
     for key in (4, 5, ACT, SET):  # nothing GOTO combines with
         assert plan[key][0] == 0x000000, key
 
@@ -893,7 +915,7 @@ def test_banner_and_hint_go_out_when_supported():
     pendant._refresh_display(pendant._daemon)
 
     assert pendant._daemon.banner_calls == ["GOTO"]
-    assert pendant._daemon.hint_calls == ["MARGIN|MHOME SAFEZ WHOME"]
+    assert plain(pendant._daemon.hint_calls[0]) == "MARGIN|MHOME SAFEZ WHOME"
 
 
 def test_fw1_falls_back_to_text_rows():
@@ -1253,3 +1275,240 @@ def test_wcs_row_fits_the_display_for_every_tool_label(tool):
 
     row = dict(pendant._daemon.text_calls)[3]
     assert len(row) <= pendant._daemon.num_cols, row
+
+
+# --- hint pointer ---------------------------------------------------------------------------------
+
+
+def at_step(monkeypatch, step: int) -> None:
+    """Freeze the clock on a given position of the hint cycle."""
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: step * MacroPadPendant.HINT_CYCLE_PERIOD + 0.01)
+
+
+def test_hint_pointer_walks_the_targets_in_key_order(monkeypatch):
+    pendant = make_pendant()
+    press(pendant, GOTO)
+
+    pointed = []
+    for step in range(5):
+        at_step(monkeypatch, step)
+        pointed.append(pendant._pointed_target(GOTO))
+
+    assert pointed == [3, 6, 7, 8, 3]  # wraps
+
+
+def test_the_bracketed_label_matches_the_lit_key(monkeypatch):
+    """
+    The point of the feature: on a display with no colour to spare, the only way to link a
+    word to a key is to light them at the same instant. They must not drift.
+    """
+    pendant = make_pendant()
+    press(pendant, GOTO)
+    hint_for_key = {3: "[MARGIN]", 6: "[MHOME]", 7: "[SAFEZ]", 8: "[WHOME]"}
+
+    for step in range(4):
+        at_step(monkeypatch, step)
+        _banner, hint = pendant._display_context()
+        plan = pendant._led_plan()
+        pointed = pendant._pointed_target(GOTO)
+
+        assert hint_for_key[pointed] in hint, (step, pointed, hint)
+        assert plan[pointed][1] == "solid", (step, pointed)
+        for other in set(hint_for_key) - {pointed}:
+            assert plan[other][1] == "glow", (step, other)
+
+
+def test_only_one_label_is_bracketed_at_a_time(monkeypatch):
+    pendant = make_pendant()
+    press(pendant, ACT)
+
+    for step in range(6):
+        at_step(monkeypatch, step)
+        _banner, hint = pendant._display_context()
+        assert hint.count("[") == 1, hint
+
+
+def test_bracketing_never_overflows_the_display(monkeypatch):
+    pendant = make_pendant()
+    for modifier in (GOTO, ACT, SET):
+        pendant._stroke_keys = {modifier}
+        for step in range(8):
+            at_step(monkeypatch, step)
+            _banner, hint = pendant._display_context()
+            for line in hint.split("|"):
+                assert len(line) <= pendant._daemon.num_cols, (modifier, line)
+
+
+def test_bracketing_is_dropped_rather_than_truncated_when_it_would_not_fit(monkeypatch):
+    """A narrow display should lose the emphasis, not the words."""
+    pendant = make_pendant()
+    pendant._daemon.num_cols = 12
+    press(pendant, GOTO)
+    at_step(monkeypatch, 1)
+
+    _banner, hint = pendant._display_context()
+
+    assert "[" not in hint
+
+
+def test_targets_are_lit_in_their_own_action_colours():
+    """Neighbouring targets must not be a uniform wash, or the pointer teaches nothing."""
+    pendant = make_pendant()
+    press(pendant, ACT)
+
+    plan = pendant._led_plan()
+    colours = {plan[key][0] for key in pendant._targets_for(ACT)}
+
+    assert len(colours) == len(pendant._targets_for(ACT))
+
+
+def test_an_action_keeps_its_colour_wherever_it_is_bound():
+    pendant = make_pendant()
+
+    assert pendant._completion_color(4) == pendant_module.MACROPAD_ACTION_COLORS["stop"]
+    assert pendant._completion_color(3) in (
+        pendant_module.MACROPAD_ACTION_COLORS["margin"],
+        pendant_module.MACROPAD_ACTION_COLORS["run_pause"],
+        pendant_module.MACROPAD_ACTION_COLORS["zero_xy"],
+    )
+
+
+def test_every_bindable_action_has_a_colour():
+    missing = set(pendant_module.MACROPAD_ACTIONS) - set(pendant_module.MACROPAD_ACTION_COLORS)
+    assert missing == {f"macro_{n}" for n in range(1, 11)}, missing
+
+
+# --- sound ----------------------------------------------------------------------------------------
+
+
+def test_a_chord_that_runs_sounds_like_it_went_through():
+    pendant = make_pendant()
+
+    stroke(pendant, GOTO, 7)
+
+    assert pendant._daemon.play_calls == [list(MacroPadPendant.SOUND_FIRED)]
+
+
+def test_an_unrecognised_chord_sounds_refused():
+    pendant = make_pendant()
+
+    stroke(pendant, 4, 5)
+
+    assert pendant._daemon.play_calls == [list(MacroPadPendant.SOUND_REFUSED)]
+
+
+def test_a_state_blocked_chord_sounds_refused():
+    pendant = make_pendant(cnc_vars={"state": "Run"})
+
+    stroke(pendant, GOTO, 6)
+
+    assert pendant._daemon.play_calls == [list(MacroPadPendant.SOUND_REFUSED)]
+
+
+def test_arming_a_confirmation_asks_rather_than_confirms():
+    pendant = make_pendant()
+
+    stroke(pendant, SET, 3)
+    assert pendant._daemon.play_calls == [list(MacroPadPendant.SOUND_ARMED)]
+
+    stroke(pendant, SET, 3)
+    assert pendant._daemon.play_calls[-1] == list(MacroPadPendant.SOUND_FIRED)
+
+
+def lowest(step) -> int:
+    freqs, _ms = step
+    return min(freqs) if freqs else 0
+
+
+def test_the_fired_and_refused_sounds_move_in_opposite_directions():
+    """Direction is the cue you can read without looking, so it must be unambiguous."""
+    rising = [lowest(s) for s in MacroPadPendant.SOUND_FIRED]
+    falling = [lowest(s) for s in MacroPadPendant.SOUND_REFUSED]
+
+    assert rising == sorted(rising) and rising[0] < rising[-1]
+    assert falling == sorted(falling, reverse=True) and falling[0] > falling[-1]
+
+
+def test_sounds_are_short_enough_not_to_lag_behind_the_keys():
+    for name in ("SOUND_FIRED", "SOUND_ARMED", "SOUND_REFUSED"):
+        total = sum(ms for _f, ms in getattr(MacroPadPendant, name))
+        assert total <= 250, f"{name} takes {total}ms"
+
+
+def test_the_sounds_use_real_chords_not_arpeggios():
+    """synthio gives the RP2040 polyphony, so a chord should sound as one event."""
+    for name in ("SOUND_FIRED", "SOUND_ARMED", "SOUND_REFUSED"):
+        steps = getattr(MacroPadPendant, name)
+        assert any(len(freqs) > 1 for freqs, _ms in steps), name
+
+
+def test_refused_is_dissonant_and_fired_is_consonant():
+    """
+    The two must be tellable apart by texture as well as direction, for the case where you
+    catch only the tail of it.
+    """
+
+    def ratio(step):
+        freqs, _ms = step
+        return max(freqs) / min(freqs)
+
+    # A fifth is 1.5; a semitone is ~1.06.
+    assert ratio(MacroPadPendant.SOUND_FIRED[0]) > 1.4
+    assert ratio(MacroPadPendant.SOUND_REFUSED[0]) < 1.1
+
+
+def test_sound_can_be_turned_off():
+    pendant = make_pendant()
+    pendant._sound_enabled = False
+
+    stroke(pendant, GOTO, 7)
+
+    assert pendant._daemon.play_calls == []
+
+
+def test_older_firmware_is_never_sent_sound():
+    pendant = make_pendant()
+    pendant._daemon.firmware_version = 3
+
+    stroke(pendant, GOTO, 7)
+
+    assert pendant._daemon.play_calls == []
+
+
+def test_connecting_enables_device_side_key_clicks():
+    pendant = make_pendant()
+    pendant._report_connection = lambda: None
+
+    pendant._handle_connect(pendant._daemon)
+
+    assert pendant._daemon.key_tone_calls == [MacroPadPendant.SOUND_KEYTONE_BASE]
+
+
+def test_connecting_with_sound_off_silences_the_device():
+    pendant = make_pendant()
+    pendant._sound_enabled = False
+    pendant._report_connection = lambda: None
+
+    pendant._handle_connect(pendant._daemon)
+
+    assert pendant._daemon.key_tone_calls == [0]
+
+
+def test_success_sounds_stay_in_one_key_and_only_refusal_is_dissonant():
+    """
+    The sounds carry meaning, so their harmony has to agree with the lights: a valid chord
+    must not sound wrong. Consonant intervals for went-through and waiting-on-you,
+    chromatic clash reserved for refused.
+    """
+
+    def classes(steps):
+        out = set()
+        for freqs, _ms in steps:
+            for a, b in zip(sorted(freqs), sorted(freqs)[1:]):
+                out.add(round(12 * math.log2(b / a)) % 12)
+        return out
+
+    dissonant = {1, 6, 11}  # semitone, tritone, major seventh
+    assert not classes(MacroPadPendant.SOUND_FIRED) & dissonant
+    assert not classes(MacroPadPendant.SOUND_ARMED) & dissonant
+    assert classes(MacroPadPendant.SOUND_REFUSED) <= dissonant

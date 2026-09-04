@@ -431,6 +431,24 @@ MACROPAD_ACTIONS: dict[str, tuple[str, str, str, bool]] = {
 for _n in range(1, 11):
     MACROPAD_ACTIONS[f"macro_{_n}"] = (f"MACRO {_n}", f"MAC{_n}", f"macro:{_n}", False)
 
+# Colour per action, so the same action looks the same wherever it is bound and the
+# targets inside one menu are distinguishable from each other rather than a uniform wash.
+# Grouped by kind: travel blue, job control green/red, tooling amber/cyan, setting magenta.
+MACROPAD_ACTION_COLORS: dict[str, int] = {
+    "margin": 0x00A0C0,
+    "machine_home": 0x0060FF,
+    "safe_z": 0x4080FF,
+    "work_home": 0x00C0FF,
+    "run_pause": 0x00FF40,
+    "stop": 0xFF2000,
+    "spindle_toggle": 0xFFA000,
+    "probe_z": 0x00FFC0,
+    "probe_laser": 0xFF00FF,
+    "zero_xy": 0xFF0080,
+    "zero_z": 0xC000FF,
+}
+DEFAULT_ACTION_COLOR = 0x808080
+
 MACROPAD_JOG_AXES = ("X", "Y", "Z", "A")
 MACROPAD_KEY_COUNT = 12
 
@@ -564,6 +582,12 @@ if MACROPAD_SUPPORTED:
         # with the axis letter that's 9 chars, which the firmware renders at a fixed scale.
         JOG_READOUT_WIDTH = 8
 
+        # While a menu is open, the available keys are walked one at a time and the matching
+        # legend entry is bracketed at the same instant. Both are derived from this clock, so
+        # the light and the label cannot drift apart -- which is the whole point: it teaches
+        # which physical key belongs to which word on a display that has no colour to spare.
+        HINT_CYCLE_PERIOD = 0.8  # seconds per candidate
+
         CONFIRM_TIMEOUT = 4.0  # seconds an unconfirmed prompt stays live
         FLASH_DURATION = 0.9  # seconds an executed action's name stays on screen
         MAX_HINT_LEN = 45  # two ~21-col lines plus the "|" separator
@@ -638,6 +662,15 @@ if MACROPAD_SUPPORTED:
         # Mirrors the firmware's own table for the host-rendered fallback path.
         ANIMATION_FLOORS = {"pulse": 0.25, "breathe_slow": 0.35, "glow": 0.05}
 
+        # Sound. Short, and pitched so the meaning is audible without looking: rising =
+        # went through, falling = refused, a repeated question = waiting on you. Frequency
+        # 0 is a rest. This is the feedback channel that still works while you are watching
+        # the cutter instead of the pendant.
+        SOUND_FIRED = (((1046, 1568), 40), ((1318, 2093), 70))  # open fifth, resolving up
+        SOUND_ARMED = (((880, 1108), 45), ((), 30), ((880, 1108), 45))  # asks twice
+        SOUND_REFUSED = (((392, 415), 70), ((330, 349), 110))  # semitone clash, falling
+        SOUND_KEYTONE_BASE = 523  # C5; the device spreads 12 keys over one octave
+
         # Screensaver: the OLED blanks to a dot walking its perimeter once the pendant has
         # been left alone. Long enough that it never hides a readout you are still using,
         # and never engaged while the machine is doing something you would want to watch.
@@ -676,6 +709,8 @@ if MACROPAD_SUPPORTED:
                 self._brightness = max(0, min(100, int(Config.get("carvera", "macropad_brightness"))))
             except Exception:
                 self._brightness = 30
+
+            self._sound_enabled = Config.getboolean("carvera", "macropad_sound", fallback=True)
 
             # The 4th axis is off by default: on a six-row display it costs the feed/spindle
             # row, and most jobs never touch A.
@@ -822,6 +857,9 @@ if MACROPAD_SUPPORTED:
             self._text_cache.clear()
             self._banner_cache = ("", "")
             daemon.set_brightness(self._brightness)
+            if daemon.supports_sound:
+                # Key clicks are generated on the device; everything else is sent per event.
+                daemon.set_key_tone(self.SOUND_KEYTONE_BASE if self._sound_enabled else 0)
             self._report_connection()
 
         def _handle_disconnect(self, daemon: macropad.Daemon) -> None:
@@ -924,21 +962,30 @@ if MACROPAD_SUPPORTED:
             target = self._chord_for(chord)
             if target is None:
                 self._flash("NO CHORD")
+                self._play(self.SOUND_REFUSED)
                 return
 
             reason = self._disabled_reason(target)
             if reason is not None:
                 self._flash(reason)
+                self._play(self.SOUND_REFUSED)
                 return
 
             if target.needs_confirm and self._pending_confirm != chord:
                 self._pending_confirm = chord
                 self._pending_deadline = time.monotonic() + self.CONFIRM_TIMEOUT
+                self._play(self.SOUND_ARMED)
                 return
 
             self._clear_pending_confirm()
             self._flash(target.label)
+            self._play(self.SOUND_FIRED)
             target.action()
+
+        def _play(self, notes) -> None:
+            """Send a sound if the pendant can make one and the user wants it."""
+            if self._sound_enabled and self._daemon.supports_sound:
+                self._daemon.play(list(notes))
 
         def _flash(self, label: str) -> None:
             self._flash_label = label
@@ -1184,7 +1231,20 @@ if MACROPAD_SUPPORTED:
                 return None
             return self.SCREENSAVER_PERIOD_MS
 
-        def _hint_for(self, modifier: int) -> str:
+        def _hint_cycle_index(self, count: int) -> int:
+            """Which of *count* candidates the pointer is on right now."""
+            if count <= 0:
+                return 0
+            return int(time.monotonic() / self.HINT_CYCLE_PERIOD) % count
+
+        def _pointed_target(self, modifier: int) -> int | None:
+            """Target key the hint pointer is currently resting on."""
+            keys = sorted(self._targets_for(modifier))
+            if not keys:
+                return None
+            return keys[self._hint_cycle_index(len(keys))]
+
+        def _hint_for(self, modifier: int, highlight: int | None = None) -> str:
             """
             Legend of available targets, split into two lines mirroring the physical key
             rows they sit on -- so the on-screen order matches the keys under your fingers.
@@ -1192,9 +1252,16 @@ if MACROPAD_SUPPORTED:
             by_row: dict[int, list[str]] = {}
             for key, target in sorted(self._targets_for(modifier).items()):
                 labels = by_row.setdefault(key // 3, [])
-                if target.hint not in labels:  # e.g. ZERO XY is bound to two keys
-                    labels.append(target.hint)
-            return "|".join(" ".join(by_row[row]) for row in sorted(by_row))[: self.MAX_HINT_LEN]
+                if target.hint in labels:  # e.g. one action bound to two keys
+                    continue
+                labels.append(f"[{target.hint}]" if key == highlight else target.hint)
+            lines = ["|".join(" ".join(by_row[row]) for row in sorted(by_row))]
+            # Brackets cost two columns; if that pushes a row past the display, show the
+            # plain legend rather than a truncated one.
+            cols = self._daemon.num_cols or 21
+            if highlight is not None and any(len(line) > cols for line in lines[0].split("|")):
+                return self._hint_for(modifier)
+            return lines[0][: self.MAX_HINT_LEN]
 
         def _display_context(self) -> tuple[str, str] | None:
             """
@@ -1223,7 +1290,10 @@ if MACROPAD_SUPPORTED:
                 if len(chord) == 1:
                     only = next(iter(chord))
                     if only in self._modifier_names:
-                        return (self._modifier_names[only], self._hint_for(only))
+                        return (
+                            self._modifier_names[only],
+                            self._hint_for(only, self._pointed_target(only)),
+                        )
 
             axis = self._stroke_jog_axis()
             if axis is not None:
@@ -1397,8 +1467,14 @@ if MACROPAD_SUPPORTED:
 
                 for key in chord:
                     plan[key] = (colour, anim)
+
+                pointed = self._pointed_target(next(iter(chord))) if len(chord) == 1 else None
                 for key in self._completions(chord):
-                    plan[key] = (self._completion_color(key), "glow")
+                    key_colour = self._completion_color(key)
+                    if key == pointed:
+                        plan[key] = (key_colour, "solid")  # the pointer
+                    else:
+                        plan[key] = (key_colour, "glow")
                 return plan
 
             # Idle: where the modifiers are, and the jog axes.
@@ -1409,12 +1485,18 @@ if MACROPAD_SUPPORTED:
             return plan
 
         def _completion_color(self, key: int) -> int:
-            """Colour for a key offered as a completion: its own modifier's, if it is one."""
+            """
+            Colour for a key offered as a completion.
+
+            An action's own colour where there is one, so a given action looks the same
+            wherever it is bound and neighbouring targets are told apart at a glance.
+            """
             if key in self._modifier_names:
                 return self._modifier_color(key)
-            for modifier, targets in self._targets.items():
-                if key in targets:
-                    return self._target_color(modifier)
+            for targets in self._targets.values():
+                target = targets.get(key)
+                if target is not None:
+                    return MACROPAD_ACTION_COLORS.get(target.action_name, DEFAULT_ACTION_COLOR)
             return self.DEFAULT_TARGET_COLOR
 
         def _refresh_leds(self, daemon: macropad.Daemon) -> None:

@@ -107,6 +107,35 @@ class Daemon:
     def clear_screensaver(self) -> None:
         self._send("SAVER")
 
+    def play(self, notes) -> None:
+        """
+        Queue a short passage on the device (firmware 4+).
+
+        Each step is ``(frequency_or_frequencies, duration_ms)``. A tuple of frequencies
+        sounds together -- synthio gives the RP2040 real polyphony over its PWM output, so
+        a chord is a chord and not an arpeggio. An empty tuple, or 0, is a rest.
+        """
+        steps = []
+        for freqs, ms in notes or ():
+            group = (freqs,) if isinstance(freqs, (int, float)) else tuple(freqs)
+            pitches = "+".join(str(int(f)) for f in group) or "0"
+            steps.append(f"{pitches}:{int(ms)}")
+        if steps:
+            self._send("TONE " + " ".join(steps))
+
+    def set_key_tone(self, base_hz: int) -> None:
+        """
+        Let the device blip on each key press, pitched by key index (0 = silent).
+
+        Handled on-device so the click lands with the key rather than a round trip later.
+        """
+        self._send(f"KEYTONE {int(base_hz)}")
+
+    @property
+    def supports_sound(self) -> bool:
+        """TONE/KEYTONE were added in firmware 4."""
+        return self.firmware_version >= 4
+
     @property
     def supports_animation(self) -> bool:
         """LEDA/SAVER were added in firmware 3; older firmware ignores them."""
