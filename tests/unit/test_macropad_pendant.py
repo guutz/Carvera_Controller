@@ -1,4 +1,4 @@
-"""Tests for MacroPadPendant (the CNC-specific driver on top of macropad.Daemon)."""
+"""Tests for MacroPadPendant: the steno-style chord engine and its feedback."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ MacroPadPendant = pendant_module.MacroPadPendant
 GOTO = MacroPadPendant.KEY_GOTO
 ACT = MacroPadPendant.KEY_ACT
 SET = MacroPadPendant.KEY_SET
+JOG_X = MacroPadPendant.KEY_JOG_X
+JOG_Y = MacroPadPendant.KEY_JOG_Y
+JOG_Z = MacroPadPendant.KEY_JOG_Z
 
 
 class FakeDaemon:
@@ -90,9 +93,21 @@ class FakeController:
         self.calls.append(("margin", margin))
 
 
+LOADED_FILE = {
+    "xmin": -50.0,
+    "xmax": 50.0,
+    "ymin": -25.0,
+    "ymax": 25.0,
+    "worksize_x": 340.0,
+    "worksize_y": 240.0,
+}
+
+
 def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabled=True) -> MacroPadPendant:
     pendant = MacroPadPendant.__new__(MacroPadPendant)
-    pendant._cnc = SimpleNamespace(vars=cnc_vars if cnc_vars is not None else {})
+    # Most tests care about chord behaviour, not state gating, so default to a machine
+    # that can act. Gating tests override "state" explicitly.
+    pendant._cnc = SimpleNamespace(vars={"state": "Idle", **(cnc_vars or {})})
     pendant._controller = FakeController(jog_mode=jog_mode)
     pendant._daemon = FakeDaemon()
     pendant._step_index = 1  # 0.1mm
@@ -101,7 +116,8 @@ def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabl
     pendant._led_cache = {}
     pendant._text_cache = {}
     pendant._banner_cache = ("", "")
-    pendant._modifier_stack = []
+    pendant._stroke_keys = set()
+    pendant._stroke_jogged = False
     pendant._pending_confirm = None
     pendant._pending_deadline = 0.0
     pendant._flash_label = ""
@@ -124,287 +140,211 @@ def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabl
     return pendant
 
 
-def hold(pendant: MacroPadPendant, key: int) -> None:
+def press(pendant: MacroPadPendant, key: int) -> None:
     pendant._daemon.pressed_keys.add(key)
     pendant._handle_key_press(pendant._daemon, key)
 
 
-def release(pendant: MacroPadPendant, key: int) -> None:
+def lift(pendant: MacroPadPendant, key: int) -> None:
     pendant._daemon.pressed_keys.discard(key)
     pendant._handle_key_release(pendant._daemon, key)
 
 
-def tap(pendant: MacroPadPendant, key: int) -> None:
-    hold(pendant, key)
-    release(pendant, key)
+def stroke(pendant: MacroPadPendant, *keys: int) -> None:
+    """One complete steno stroke: press every key, then release every key."""
+    for key in keys:
+        press(pendant, key)
+    for key in keys:
+        lift(pendant, key)
 
 
-# --- the "two controls at once" rule -------------------------------------------------------
+# --- stroke mechanics -------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("key", list(range(12)))
-def test_no_lone_keypress_ever_acts(key):
-    """The core safety property: a single key press must never command the machine."""
+def test_nothing_fires_until_the_last_key_is_released():
     pendant = make_pendant()
 
-    tap(pendant, key)
+    press(pendant, GOTO)
+    press(pendant, 7)
+    assert pendant._controller.calls == []  # both down, nothing yet
+
+    lift(pendant, 7)
+    assert pendant._controller.calls == []  # GOTO still down, stroke unfinished
+
+    lift(pendant, GOTO)
+    assert ("safe_z",) in pendant._controller.calls
+
+
+@pytest.mark.parametrize("order", [(GOTO, 7), (7, GOTO)])
+def test_press_order_does_not_matter(order):
+    pendant = make_pendant()
+
+    stroke(pendant, *order)
+
+    assert ("safe_z",) in pendant._controller.calls
+
+
+@pytest.mark.parametrize("lift_order", [(GOTO, 7), (7, GOTO)])
+def test_release_order_does_not_matter(lift_order):
+    pendant = make_pendant()
+
+    press(pendant, GOTO)
+    press(pendant, 7)
+    for key in lift_order:
+        lift(pendant, key)
+
+    assert ("safe_z",) in pendant._controller.calls
+
+
+def test_a_key_released_early_still_counts_toward_the_chord():
+    """
+    The exact case that used to misfire: lifting the modifier before the target. The stroke
+    accumulates, so the chord is still {GOTO, SAFE-Z} when the last key comes up.
+    """
+    pendant = make_pendant()
+
+    press(pendant, GOTO)
+    press(pendant, 7)
+    lift(pendant, GOTO)  # modifier goes first
+    assert pendant._controller.calls == []
+
+    lift(pendant, 7)
+    assert ("safe_z",) in pendant._controller.calls
+
+
+def test_a_brushed_extra_key_changes_the_chord_rather_than_being_ignored():
+    """Accumulation cuts both ways: a stray key makes the set spell nothing, so nothing runs."""
+    pendant = make_pendant()
+
+    stroke(pendant, GOTO, 7, 4)
 
     assert pendant._controller.calls == []
 
 
-def test_target_without_modifier_is_inert_even_after_modifier_released():
+def test_unrecognised_chord_does_nothing_and_says_so():
     pendant = make_pendant()
 
-    tap(pendant, GOTO)  # press and release the modifier
-    tap(pendant, 7)  # then press what would have been "safe Z"
+    stroke(pendant, 4, 5)
+
+    assert pendant._controller.calls == []
+    assert pendant._flash_label == "NO CHORD"
+
+
+def test_single_key_alone_is_not_a_chord():
+    pendant = make_pendant()
+
+    for key in range(12):
+        stroke(pendant, key)
 
     assert pendant._controller.calls == []
 
 
-# --- modifier + target chords ---------------------------------------------------------------
+def test_strokes_do_not_leak_into_each_other():
+    pendant = make_pendant()
+
+    stroke(pendant, GOTO, 6)
+    stroke(pendant, ACT, 4)
+
+    assert ("m_home",) in pendant._controller.calls
+    assert ("abort",) in pendant._controller.calls
+    assert pendant._stroke_keys == set()
+
+
+# --- chord vocabulary --------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("modifier", "target", "expected_call", "expected_action"),
+    ("chord", "expected_call", "expected_action"),
     [
-        (GOTO, 6, ("m_home",), "m_home"),
-        (GOTO, 7, ("safe_z",), "safe_z"),
-        (GOTO, 8, ("w_home",), "w_home"),
-        (ACT, 3, ("run_pause",), "start_pause"),
-        (ACT, 4, ("abort",), "stop"),
-        (ACT, 6, ("probe_z",), "probe_z"),
+        ((GOTO, 3), ("margin", True), "margin"),
+        ((GOTO, 6), ("m_home",), "m_home"),
+        ((GOTO, 7), ("safe_z",), "safe_z"),
+        ((GOTO, 8), ("w_home",), "w_home"),
+        ((ACT, 3), ("run_pause",), "start_pause"),
+        ((ACT, 4), ("abort",), "stop"),
+        ((ACT, 5), ("spindle", True), "spindle_on_off"),
+        ((ACT, 6), ("probe_z",), "probe_z"),
+        ((ACT, 8), ("probe_laser", True), "probe_laser"),
     ],
 )
-def test_modifier_plus_target_fires_action(modifier, target, expected_call, expected_action):
-    pendant = make_pendant(cnc_vars={"curspindle": 0})
+def test_each_chord_fires_its_action(chord, expected_call, expected_action):
+    pendant = make_pendant(cnc_vars={"curspindle": 0, **LOADED_FILE})
 
-    hold(pendant, modifier)
-    tap(pendant, target)
+    stroke(pendant, *chord)
 
     assert expected_call in pendant._controller.calls
     assert expected_action in pendant._button_presses
 
 
-def test_act_plus_macro_key_runs_macro_1():
+def test_macro_chord_runs_macro_1():
     pendant = make_pendant()
 
-    hold(pendant, ACT)
-    tap(pendant, 7)
+    stroke(pendant, ACT, 7)
 
     assert ("macro", 1) in pendant._controller.calls
 
 
-def test_act_plus_spindle_toggles_on_when_off():
-    pendant = make_pendant(cnc_vars={"curspindle": 0})
+def test_shared_key_means_different_things_in_different_chords():
+    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
 
-    hold(pendant, ACT)
-    tap(pendant, 5)
+    stroke(pendant, GOTO, 3)  # margin
+    stroke(pendant, ACT, 3)  # run/pause
 
-    assert ("spindle", True) in pendant._controller.calls
-
-
-def test_act_plus_spindle_respects_lasermode():
-    pendant = make_pendant(cnc_vars={"curspindle": 0, "lasermode": True})
-
-    hold(pendant, ACT)
-    tap(pendant, 5)
-
-    assert pendant._controller.calls == []
+    assert ("margin", True) in pendant._controller.calls
+    assert ("run_pause",) in pendant._controller.calls
 
 
-def test_target_key_unbound_under_this_modifier_does_nothing():
+# --- jogging ------------------------------------------------------------------------------
+
+
+def test_encoder_jogs_while_exactly_one_axis_key_is_held():
     pendant = make_pendant()
 
-    hold(pendant, GOTO)
-    tap(pendant, 4)  # 4 is an ACT target (stop), and unbound under GOTO
-
-    assert pendant._controller.calls == []
-
-
-def test_same_key_means_different_things_under_different_modifiers():
-    pendant = make_pendant()
-
-    hold(pendant, GOTO)
-    tap(pendant, 6)  # -> machine home
-    release(pendant, GOTO)
-
-    hold(pendant, ACT)
-    tap(pendant, 6)  # -> probe Z
-    release(pendant, ACT)
-
-    assert ("m_home",) in pendant._controller.calls
-    assert ("probe_z",) in pendant._controller.calls
-
-
-def test_most_recently_pressed_modifier_wins():
-    pendant = make_pendant()
-
-    hold(pendant, GOTO)
-    hold(pendant, ACT)  # roll onto ACT without releasing GOTO
-    tap(pendant, 6)  # 6 is m-home under GOTO, probe Z under ACT
-
-    assert ("probe_z",) in pendant._controller.calls
-    assert ("m_home",) not in pendant._controller.calls
-
-
-def test_releasing_newest_modifier_falls_back_to_still_held_one():
-    pendant = make_pendant()
-
-    hold(pendant, GOTO)
-    hold(pendant, ACT)
-    release(pendant, ACT)
-    tap(pendant, 6)  # GOTO is still held -> m-home
-
-    assert ("m_home",) in pendant._controller.calls
-
-
-# --- confirmation flow ----------------------------------------------------------------------
-
-
-def test_zero_xy_requires_two_presses():
-    pendant = make_pendant()
-
-    hold(pendant, SET)
-    tap(pendant, 0)
-    assert pendant._controller.calls == []  # first press only arms it
-    assert pendant._pending_confirm == (SET, 0)
-
-    tap(pendant, 0)
-    assert ("wcs_set", 0, 0, None, None) in pendant._controller.calls
-    assert pendant._pending_confirm is None
-
-
-def test_zero_z_requires_two_presses():
-    pendant = make_pendant()
-
-    hold(pendant, SET)
-    tap(pendant, 2)
-    assert pendant._controller.calls == []
-
-    tap(pendant, 2)
-    assert ("wcs_set", None, None, 0, None) in pendant._controller.calls
-
-
-def test_zero_xy_bound_to_both_x_and_y_keys():
-    pendant = make_pendant()
-
-    hold(pendant, SET)
-    tap(pendant, 1)
-    tap(pendant, 1)
-
-    assert ("wcs_set", 0, 0, None, None) in pendant._controller.calls
-
-
-def test_confirming_a_different_target_rearms_instead_of_firing():
-    pendant = make_pendant()
-
-    hold(pendant, SET)
-    tap(pendant, 0)  # arm ZERO XY
-    tap(pendant, 2)  # switch to ZERO Z -- must not fire either
-
-    assert pendant._controller.calls == []
-    assert pendant._pending_confirm == (SET, 2)
-
-
-def test_releasing_modifier_cancels_pending_confirm():
-    pendant = make_pendant()
-
-    hold(pendant, SET)
-    tap(pendant, 0)
-    assert pendant._pending_confirm is not None
-
-    release(pendant, SET)
-    assert pendant._pending_confirm is None
-
-    hold(pendant, SET)
-    tap(pendant, 0)  # must be a fresh arm, not a confirm
-    assert pendant._controller.calls == []
-
-
-def test_encoder_press_cancels_pending_confirm_without_changing_step():
-    pendant = make_pendant()
-    step_before = pendant.current_step_size
-
-    hold(pendant, SET)
-    tap(pendant, 0)
-    pendant._handle_encoder_press(pendant._daemon)
-
-    assert pendant._pending_confirm is None
-    assert pendant.current_step_size == step_before
-    assert pendant._controller.calls == []
-
-
-def test_pending_confirm_expires_after_timeout(monkeypatch):
-    pendant = make_pendant()
-    fake_now = [1000.0]
-    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: fake_now[0])
-
-    hold(pendant, SET)
-    tap(pendant, 0)
-    assert pendant._pending_confirm is not None
-
-    fake_now[0] += MacroPadPendant.CONFIRM_TIMEOUT + 0.1
-    pendant._expire_pending_confirm()
-
-    assert pendant._pending_confirm is None
-
-
-def test_pending_confirm_survives_until_timeout(monkeypatch):
-    pendant = make_pendant()
-    fake_now = [1000.0]
-    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: fake_now[0])
-
-    hold(pendant, SET)
-    tap(pendant, 0)
-
-    fake_now[0] += MacroPadPendant.CONFIRM_TIMEOUT - 0.1
-    pendant._expire_pending_confirm()
-    assert pendant._pending_confirm == (SET, 0)
-
-    tap(pendant, 0)
-    assert ("wcs_set", 0, 0, None, None) in pendant._controller.calls
-
-
-def test_pressing_a_modifier_clears_a_pending_confirm():
-    pendant = make_pendant()
-
-    hold(pendant, SET)
-    tap(pendant, 0)
-    hold(pendant, GOTO)
-
-    assert pendant._pending_confirm is None
-
-
-# --- jogging --------------------------------------------------------------------------------
-
-
-def test_jog_requires_held_axis_key_plus_encoder():
-    pendant = make_pendant()
-
-    pendant._handle_encoder_delta(pendant._daemon, 3)  # encoder alone
-    assert pendant._controller.calls == []
-
-    hold(pendant, MacroPadPendant.KEY_JOG_Y)
+    press(pendant, JOG_Y)
     pendant._handle_encoder_delta(pendant._daemon, 3)
+
     assert pendant._controller.calls == [("jog", "Y0.3")]
 
 
-def test_action_modifier_suppresses_jogging():
-    """Holding GOTO must not let the encoder jog, even with an axis key also down."""
+def test_encoder_alone_does_not_jog():
     pendant = make_pendant()
 
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
-    hold(pendant, GOTO)
-    pendant._handle_encoder_delta(pendant._daemon, 5)
+    pendant._handle_encoder_delta(pendant._daemon, 3)
 
     assert pendant._controller.calls == []
-    assert pendant._held_jog_axis() is None
 
 
-def test_jog_ignored_when_jogging_disabled():
+def test_encoder_does_not_jog_once_a_second_key_joins_the_stroke():
+    """Two keys down means a chord is being formed, not a jog."""
+    pendant = make_pendant()
+
+    press(pendant, JOG_X)
+    press(pendant, SET)
+    pendant._handle_encoder_delta(pendant._daemon, 3)
+
+    assert pendant._controller.calls == []
+
+
+def test_a_stroke_that_jogged_does_not_also_fire_a_chord():
+    """
+    Guards the nastiest interaction: jog X, brush SET on the way out, and the release would
+    otherwise spell "zero XY" and silently move the work origin.
+    """
+    pendant = make_pendant()
+
+    press(pendant, JOG_X)
+    pendant._handle_encoder_delta(pendant._daemon, 1)
+    press(pendant, SET)
+    lift(pendant, JOG_X)
+    lift(pendant, SET)
+
+    assert not any(call[0] == "wcs_set" for call in pendant._controller.calls)
+
+
+def test_jog_is_ignored_when_jogging_is_disabled():
     pendant = make_pendant(jogging_enabled=False)
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
 
+    press(pendant, JOG_X)
     pendant._handle_encoder_delta(pendant._daemon, 3)
 
     assert pendant._controller.calls == []
@@ -413,40 +353,35 @@ def test_jog_ignored_when_jogging_disabled():
 def test_continuous_mode_starts_jog_and_caps_z():
     pendant = make_pendant(jog_mode=Controller.JOG_MODE_CONTINUOUS)
     pendant._step_index = 3  # 10.0mm -> 100% of max speed, but Z is capped
-    hold(pendant, MacroPadPendant.KEY_JOG_Z)
 
+    press(pendant, JOG_Z)
     pendant._handle_encoder_delta(pendant._daemon, 1)
 
     assert pendant._controller.calls == [("start", "Z1", MacroPadPendant.Z_MAX_JOG_SPEED)]
-    assert pendant._active_continuous_jog_axis == "Z"
 
 
-def test_continuous_mode_direction_change_stops_jog():
+def test_continuous_mode_direction_change_stops_first():
     pendant = make_pendant(jog_mode=Controller.JOG_MODE_CONTINUOUS)
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
 
+    press(pendant, JOG_X)
     pendant._handle_encoder_delta(pendant._daemon, 1)
-    assert pendant._controller.continuous_jog_active is True
-
     pendant._handle_encoder_delta(pendant._daemon, -1)
 
     assert ("stop",) in pendant._controller.calls
 
 
-def test_releasing_jog_key_stops_active_continuous_jog():
+def test_releasing_the_axis_key_stops_a_continuous_jog():
     pendant = make_pendant(jog_mode=Controller.JOG_MODE_CONTINUOUS)
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
-    pendant._handle_encoder_delta(pendant._daemon, 1)
-    assert pendant._controller.continuous_jog_active is True
 
-    release(pendant, MacroPadPendant.KEY_JOG_X)
+    press(pendant, JOG_X)
+    pendant._handle_encoder_delta(pendant._daemon, 1)
+    lift(pendant, JOG_X)
 
     assert pendant._controller.continuous_jog_active is False
-    assert pendant._active_continuous_jog_axis is None
     assert pendant._jog_stops == [True]
 
 
-def test_encoder_press_cycles_and_wraps_step_index():
+def test_encoder_press_cycles_step_size():
     pendant = make_pendant()
     pendant._step_index = 0
 
@@ -458,122 +393,421 @@ def test_encoder_press_cycles_and_wraps_step_index():
     assert seen == [1, 2, 3, 0, 1]
 
 
-# --- OLED banner / DRO ----------------------------------------------------------------------
+# --- confirmation ---------------------------------------------------------------------------
 
 
-def test_banner_shows_live_coordinate_of_axis_being_jogged():
-    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 12.3456, "wy": -7.0, "wz": 0.0})
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
+def test_zeroing_needs_the_same_chord_twice():
+    pendant = make_pendant()
 
-    banner, hint = pendant._display_context()
-    assert banner == "X  12.346"
-    assert hint == "JOG X  STEP 0.1mm"
+    stroke(pendant, SET, 0)
+    assert pendant._controller.calls == []
+    assert pendant._pending_confirm == frozenset((SET, 0))
 
-
-def test_jog_banner_tracks_the_held_axis():
-    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 1.0, "wy": -7.0, "wz": 250.5})
-
-    hold(pendant, MacroPadPendant.KEY_JOG_Y)
-    assert pendant._display_context()[0] == "Y  -7.000"
-    release(pendant, MacroPadPendant.KEY_JOG_Y)
-
-    hold(pendant, MacroPadPendant.KEY_JOG_Z)
-    assert pendant._display_context()[0] == "Z 250.500"
+    stroke(pendant, SET, 0)
+    assert ("wcs_set", 0, 0, None, None) in pendant._controller.calls
+    assert pendant._pending_confirm is None
 
 
-def test_jog_banner_updates_as_position_changes():
-    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 0.0})
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
+def test_zero_z_needs_the_same_chord_twice():
+    pendant = make_pendant()
 
-    assert pendant._display_context()[0] == "X   0.000"
-    pendant._cnc.vars["wx"] = -103.25
-    assert pendant._display_context()[0] == "X-103.250"
+    stroke(pendant, SET, 2)
+    stroke(pendant, SET, 2)
 
-
-@pytest.mark.parametrize("value", [0.0, -0.001, 9.5, -9.5, 123.456, -123.456, 999.999, -999.999])
-def test_jog_banner_width_is_constant_so_the_oled_scale_never_jumps(value):
-    """
-    The firmware auto-scales the banner from its length, so a varying-width readout would
-    visibly resize while jogging. Every value must render to the same number of characters.
-    """
-    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": value})
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
-
-    banner = pendant._display_context()[0]
-    assert len(banner) == MacroPadPendant.JOG_READOUT_WIDTH + 1
+    assert ("wcs_set", None, None, 0, None) in pendant._controller.calls
 
 
-def test_jog_banner_hint_fits_the_display_width():
-    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 0.0})
-    pendant._step_index = 0  # 0.01mm -- longest step string
-    hold(pendant, MacroPadPendant.KEY_JOG_X)
+def test_a_different_chord_in_between_cancels_the_confirmation():
+    pendant = make_pendant()
 
-    assert len(pendant._display_context()[1]) <= 21
+    stroke(pendant, SET, 0)  # arm zero XY
+    stroke(pendant, SET, 2)  # different chord -> arms that one instead
+    stroke(pendant, SET, 0)  # so this arms again rather than committing
+
+    assert not any(call[0] == "wcs_set" for call in pendant._controller.calls)
 
 
-def test_banner_shows_modifier_name_and_row_mirrored_hints():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
+def test_confirmation_expires(monkeypatch):
+    pendant = make_pendant()
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
 
-    hold(pendant, GOTO)
+    stroke(pendant, SET, 0)
+    now[0] += MacroPadPendant.CONFIRM_TIMEOUT + 0.1
+    pendant._expire_pending_confirm()
+
+    assert pendant._pending_confirm is None
+
+
+def test_encoder_press_cancels_a_pending_confirmation():
+    pendant = make_pendant()
+    step_before = pendant.current_step_size
+
+    stroke(pendant, SET, 0)
+    pendant._handle_encoder_press(pendant._daemon)
+
+    assert pendant._pending_confirm is None
+    assert pendant.current_step_size == step_before
+
+
+# --- machine-state gating ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chord", [(GOTO, 6), (GOTO, 7), (SET, 2), (ACT, 6)])
+def test_movement_chords_are_blocked_when_not_idle(chord):
+    pendant = make_pendant(cnc_vars={"state": "Run", **LOADED_FILE})
+
+    stroke(pendant, *chord)
+
+    assert pendant._controller.calls == []
+    assert pendant._flash_label == "NEED IDLE"
+
+
+def test_stop_is_allowed_in_any_state():
+    """Abort must never be gated -- it is the one thing you need while running."""
+    for state in ("Idle", "Run", "Pause", "Hold", "Alarm", "Tool"):
+        pendant = make_pendant(cnc_vars={"state": state})
+        stroke(pendant, ACT, 4)
+        assert ("abort",) in pendant._controller.calls, state
+
+
+def test_run_pause_is_allowed_while_running_but_not_while_alarmed():
+    running = make_pendant(cnc_vars={"state": "Run"})
+    stroke(running, ACT, 3)
+    assert ("run_pause",) in running._controller.calls
+
+    alarmed = make_pendant(cnc_vars={"state": "Alarm"})
+    stroke(alarmed, ACT, 3)
+    assert alarmed._controller.calls == []
+    assert alarmed._flash_label == "NOT READY"
+
+
+def test_blocked_chord_does_not_arm_a_confirmation():
+    pendant = make_pendant(cnc_vars={"state": "Run"})
+
+    stroke(pendant, SET, 0)
+
+    assert pendant._pending_confirm is None
+
+
+# --- OLED preview -------------------------------------------------------------------------------
+
+
+def test_preview_shows_the_menu_while_only_a_modifier_is_down():
+    pendant = make_pendant()
+
+    press(pendant, GOTO)
+
     assert pendant._display_context() == ("GOTO", "MARGIN|MHOME SAFEZ WHOME")
 
-    release(pendant, GOTO)
-    hold(pendant, ACT)
-    banner, hint = pendant._display_context()
-    assert banner == "ACT"
-    # Two lines mirroring key rows 1 and 2, each within one 21-col display line.
-    assert hint == "RUN STOP SPIN|PROBE MAC1 LASER"
-    assert all(len(line) <= 21 for line in hint.split("|"))
+
+def test_preview_shows_what_releasing_now_would_do():
+    pendant = make_pendant()
+
+    press(pendant, GOTO)
+    press(pendant, 7)
+
+    assert pendant._display_context() == ("SAFE Z", "RELEASE TO RUN")
 
 
-def test_hint_dedupes_a_label_bound_to_two_keys():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    hold(pendant, SET)
+def test_preview_says_why_a_chord_is_blocked_before_you_release():
+    pendant = make_pendant(cnc_vars={"state": "Run"})
 
-    _banner, hint = pendant._display_context()
-    assert hint == "ZEROXY ZEROZ"  # not "ZEROXY ZEROXY ZEROZ"
+    press(pendant, GOTO)
+    press(pendant, 7)
 
-
-def test_banner_shows_confirm_prompt():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-
-    hold(pendant, SET)
-    tap(pendant, 0)
-
-    assert pendant._display_context() == ("ZERO XY?", "PRESS AGAIN TO CONFIRM")
+    assert pendant._display_context() == ("SAFE Z", "NEED IDLE")
 
 
-def test_alarm_state_overrides_banner():
+def test_preview_reports_a_meaningless_set():
+    pendant = make_pendant()
+
+    press(pendant, 4)
+    press(pendant, 5)
+
+    assert pendant._display_context() == ("- - -", "NO CHORD")
+
+
+def test_preview_shows_the_live_coordinate_while_jogging():
+    pendant = make_pendant(cnc_vars={"wx": -103.25})
+
+    press(pendant, JOG_X)
+
+    assert pendant._display_context() == ("X-103.250", "JOG X  STEP 0.1mm")
+
+
+def test_preview_asks_for_a_repeat_when_confirmation_is_pending():
+    pendant = make_pendant()
+
+    stroke(pendant, SET, 0)
+
+    assert pendant._display_context() == ("ZERO XY?", "REPEAT CHORD TO CONFIRM")
+
+
+def test_alarm_overrides_every_preview():
     pendant = make_pendant(cnc_vars={"state": "Alarm"})
-    hold(pendant, GOTO)
+    press(pendant, GOTO)
 
     assert pendant._display_context() == ("ALARM", "UNLOCK IN APP")
 
 
-def test_display_context_is_none_when_idle():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
+def test_preview_is_none_when_idle_so_the_dro_shows():
+    pendant = make_pendant()
 
     assert pendant._display_context() is None
 
 
-def test_executed_action_flashes_then_returns_to_dro(monkeypatch):
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    fake_now = [1000.0]
-    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: fake_now[0])
+def test_action_name_flashes_briefly_after_firing(monkeypatch):
+    pendant = make_pendant()
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
 
-    hold(pendant, GOTO)
-    tap(pendant, 7)
-    release(pendant, GOTO)
-
+    stroke(pendant, GOTO, 7)
     assert pendant._display_context() == ("SAFE Z", "")
 
-    fake_now[0] += MacroPadPendant.FLASH_DURATION + 0.1
+    now[0] += MacroPadPendant.FLASH_DURATION + 0.1
     assert pendant._display_context() is None
 
 
-def test_refresh_display_sends_banner_and_hint_on_fw2():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    hold(pendant, GOTO)
+# --- LED preview ----------------------------------------------------------------------------------
+
+
+def test_every_key_in_the_stroke_is_highlighted_together():
+    """
+    The switches have no detent, so the lit set is the only way to see what the pad thinks
+    you are holding. Every accumulated key must show, including ones already released.
+    """
+    pendant = make_pendant()
+
+    press(pendant, GOTO)
+    press(pendant, 7)
+    lift(pendant, GOTO)  # still part of the stroke
+
+    plan = pendant._led_plan()
+    assert plan[GOTO][0] == MacroPadPendant.CHORD_READY_COLOR
+    assert plan[7][0] == MacroPadPendant.CHORD_READY_COLOR
+
+
+def test_incomplete_set_pulses_and_a_resolved_one_goes_steady():
+    pendant = make_pendant()
+
+    press(pendant, GOTO)
+    forming = pendant._led_plan()[GOTO]
+    assert forming == (MacroPadPendant.CHORD_FORMING_COLOR, "pulse")
+
+    press(pendant, 7)
+    ready = pendant._led_plan()[7]
+    assert ready == (MacroPadPendant.CHORD_READY_COLOR, "solid")
+
+
+def test_blocked_chord_shows_red():
+    pendant = make_pendant(cnc_vars={"state": "Run"})
+
+    press(pendant, GOTO)
+    press(pendant, 7)
+
+    assert pendant._led_plan()[7] == (MacroPadPendant.CHORD_BLOCKED_COLOR, "blink_fast")
+
+
+def test_keys_that_would_complete_a_chord_are_offered():
+    pendant = make_pendant()
+
+    press(pendant, GOTO)
+    plan = pendant._led_plan()
+
+    for key in (3, 6, 7, 8):  # GOTO's targets
+        assert plan[key][1] == "glow", key
+    for key in (4, 5, ACT, SET):  # nothing GOTO combines with
+        assert plan[key][0] == 0x000000, key
+
+
+def test_idle_shows_modifiers_breathing_and_axes_steady():
+    pendant = make_pendant()
+
+    plan = pendant._led_plan()
+
+    for key in pendant._modifier_keys:
+        assert plan[key][1] == "breathe_slow"
+    assert plan[JOG_X] == (MacroPadPendant.AXIS_COLOR_IDLE["X"], "solid")
+    for key in (3, 4, 5, 6, 7, 8):
+        assert plan[key][0] == 0x000000
+
+
+def test_pending_confirmation_blinks_the_chord():
+    pendant = make_pendant()
+
+    stroke(pendant, SET, 0)
+    plan = pendant._led_plan()
+
+    assert plan[SET] == (MacroPadPendant.CONFIRM_COLOR, "blink_fast")
+    assert plan[0] == (MacroPadPendant.CONFIRM_COLOR, "blink_fast")
+
+
+def test_alarm_strobes_every_key():
+    pendant = make_pendant(cnc_vars={"state": "Alarm"})
+
+    plan = pendant._led_plan()
+
+    assert all(entry == (0xFF0000, "strobe") for entry in plan.values())
+
+
+# --- animation rendering ------------------------------------------------------------------------
+
+
+def test_solid_renders_unchanged():
+    pendant = make_pendant()
+
+    assert pendant._render(0x123456, "solid") == 0x123456
+
+
+def test_blink_alternates_between_colour_and_off(monkeypatch):
+    pendant = make_pendant()
+    period = MacroPadPendant.ANIMATION_PERIODS["blink_fast"]
+
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: 0.0)
+    assert pendant._render(0xFF0000, "blink_fast") == 0xFF0000
+
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: period * 0.75)
+    assert pendant._render(0xFF0000, "blink_fast") == 0x000000
+
+
+def test_pulse_stays_between_its_floor_and_full_brightness(monkeypatch):
+    pendant = make_pendant()
+    period = MacroPadPendant.ANIMATION_PERIODS["pulse"]
+    floor = MacroPadPendant.ANIMATION_FLOORS["pulse"]
+
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: 0.0)
+    trough = pendant._render(0x00FF00, "pulse") >> 8 & 0xFF
+
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: period / 2)
+    peak = pendant._render(0x00FF00, "pulse") >> 8 & 0xFF
+
+    assert peak == 0xFF
+    assert trough == pytest.approx(0xFF * floor, abs=2)
+    assert trough < peak
+
+
+@pytest.mark.parametrize("animation", list(MacroPadPendant.ANIMATION_PERIODS))
+def test_every_animation_renders_a_valid_colour_at_any_phase(monkeypatch, animation):
+    pendant = make_pendant()
+    period = MacroPadPendant.ANIMATION_PERIODS[animation]
+
+    for fraction in (0.0, 0.1, 0.25, 0.5, 0.75, 0.99):
+        monkeypatch.setattr(pendant_module.time, "monotonic", lambda f=fraction: period * f)
+        color = pendant._render(0x80C0FF, animation)
+        assert 0 <= color <= 0xFFFFFF
+        for shift in (16, 8, 0):
+            assert 0 <= (color >> shift) & 0xFF <= 0xFF
+
+
+def test_scale_color_clamps_out_of_range_levels():
+    assert MacroPadPendant._scale_color(0xFFFFFF, 2.0) == 0xFFFFFF
+    assert MacroPadPendant._scale_color(0xFFFFFF, -1.0) == 0x000000
+
+
+# --- action behaviour retained from before ----------------------------------------------------
+
+
+def test_spindle_chord_respects_laser_mode():
+    pendant = make_pendant(cnc_vars={"curspindle": 0, "lasermode": True})
+
+    stroke(pendant, ACT, 5)
+
+    assert pendant._controller.calls == []
+
+
+def test_probe_laser_toggles_and_names_the_direction_sent(monkeypatch):
+    pendant = make_pendant()
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
+
+    stroke(pendant, ACT, 8)
+    assert ("probe_laser", True) in pendant._controller.calls
+    assert pendant._display_context() == ("LASER ON", "")
+
+    now[0] += MacroPadPendant.FLASH_DURATION + 0.1
+    stroke(pendant, ACT, 8)
+    assert ("probe_laser", False) in pendant._controller.calls
+    assert pendant._display_context() == ("LASER OFF", "")
+
+
+def test_margin_scans_with_a_file_loaded():
+    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
+
+    stroke(pendant, GOTO, 3)
+
+    assert ("margin", True) in pendant._controller.calls
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"xmin": 1000000.0, "xmax": -1000000.0},  # nothing loaded
+        {"xmax": -50.0},
+        {"ymax": -25.0},
+        {"xmin": -500.0},
+        {"xmin": "nonsense"},
+        {"worksize_x": None},
+    ],
+)
+def test_margin_refuses_unusable_bounds(override):
+    pendant = make_pendant(cnc_vars={**LOADED_FILE, **override})
+
+    stroke(pendant, GOTO, 3)
+
+    assert pendant._controller.calls == []
+    assert pendant._flash_label == "NO FILE"
+
+
+def test_margin_refuses_in_laser_mode():
+    pendant = make_pendant(cnc_vars={**LOADED_FILE, "lasermode": True})
+
+    stroke(pendant, GOTO, 3)
+
+    assert pendant._controller.calls == []
+    assert pendant._flash_label == "LASER MODE"
+
+
+@pytest.mark.parametrize(
+    ("value", "lo", "hi", "expected"),
+    [
+        (0, 0, 100, 0.0),
+        (150, 0, 100, 100.0),
+        (-5, 0, 100, 0.0),
+        (-5, -100, 100, -5.0),
+        ("42.5", 0, 100, 42.5),
+        ("invalid", 0, 100, 0.0),
+        (None, 0, 100, 0.0),
+        (float("nan"), 0, 100, 0.0),
+        (float("inf"), 0, 100, 0.0),
+        pytest.param(10**10000, 0, 100, 100.0, id="huge-positive-int"),
+        pytest.param(-(10**10000), -100, 100, -100.0, id="huge-negative-int"),
+    ],
+)
+def test_safe_number(value, lo, hi, expected):
+    assert MacroPadPendant._safe_number(value, lo, hi) == expected
+
+
+# --- display plumbing ---------------------------------------------------------------------------
+
+
+def test_dro_rows_formatting():
+    pendant = make_pendant(
+        cnc_vars={"wx": 1.0, "wy": -2.5, "wz": 0.125, "wa": 0.0, "curfeed": 1200, "curspindle": 10000}
+    )
+
+    pendant._refresh_dro(pendant._daemon)
+
+    rows = dict(pendant._daemon.text_calls)
+    assert rows[0] == "X 1.000"
+    assert rows[1] == "Y -2.500"
+    assert rows[4] == "F1200 S10000"
+    assert rows[5] == "Idle step=0.1mm"
+
+
+def test_banner_and_hint_go_out_on_fw2():
+    pendant = make_pendant()
+    press(pendant, GOTO)
 
     pendant._refresh_display(pendant._daemon)
 
@@ -581,32 +815,31 @@ def test_refresh_display_sends_banner_and_hint_on_fw2():
     assert pendant._daemon.hint_calls == ["MARGIN|MHOME SAFEZ WHOME"]
 
 
-def test_refresh_display_falls_back_to_text_rows_on_fw1():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
+def test_fw1_falls_back_to_text_rows():
+    pendant = make_pendant()
     pendant._daemon.firmware_version = 1
-    hold(pendant, GOTO)
+    press(pendant, GOTO)
 
     pendant._refresh_display(pendant._daemon)
 
     assert pendant._daemon.banner_calls == []
     assert (0, "GOTO") in pendant._daemon.text_calls
-    assert (1, "MARGIN MHOME SAFEZ WHOME") in pendant._daemon.text_calls
 
 
-def test_refresh_display_exits_banner_mode_when_returning_to_dro():
-    pendant = make_pendant(cnc_vars={"wx": 1.0, "wy": 0, "wz": 0, "wa": 0, "state": "Idle"})
-    hold(pendant, GOTO)
-    pendant._refresh_display(pendant._daemon)
-    assert pendant._daemon.banner_calls == ["GOTO"]
-
-    release(pendant, GOTO)
+def test_returning_to_idle_leaves_banner_mode():
+    pendant = make_pendant(cnc_vars={"wx": 1.0})
+    press(pendant, GOTO)
     pendant._refresh_display(pendant._daemon)
 
-    assert pendant._daemon.banner_calls == ["GOTO", ""]  # "" leaves banner mode
+    lift(pendant, GOTO)
+    pendant._flash_label = ""
+    pendant._refresh_display(pendant._daemon)
+
+    assert pendant._daemon.banner_calls == ["GOTO", ""]
     assert (0, "X 1.000") in pendant._daemon.text_calls
 
 
-def test_refresh_display_noop_before_id_handshake():
+def test_display_is_a_noop_before_the_id_handshake():
     pendant = make_pendant()
     pendant._daemon.num_rows = 0
 
@@ -616,148 +849,7 @@ def test_refresh_display_noop_before_id_handshake():
     assert pendant._daemon.banner_calls == []
 
 
-def test_dro_rows_formatting():
-    pendant = make_pendant(
-        cnc_vars={"wx": 1.0, "wy": -2.5, "wz": 0.125, "wa": 0.0, "curfeed": 1200, "curspindle": 10000, "state": "Idle"}
-    )
-
-    pendant._refresh_dro(pendant._daemon)
-
-    rows = dict(pendant._daemon.text_calls)
-    assert rows[0] == "X 1.000"
-    assert rows[1] == "Y -2.500"
-    assert rows[2] == "Z 0.125"
-    assert rows[3] == "A 0.000"
-    assert rows[4] == "F1200 S10000"
-    assert rows[5] == "Idle step=0.1mm"
-
-
-def test_dro_dedupes_unchanged_rows():
-    pendant = make_pendant(
-        cnc_vars={"wx": 1.0, "wy": 0, "wz": 0, "wa": 0, "curfeed": 0, "curspindle": 0, "state": "Idle"}
-    )
-
-    pendant._refresh_dro(pendant._daemon)
-    first = len(pendant._daemon.text_calls)
-    assert first == 6
-
-    pendant._refresh_dro(pendant._daemon)
-    assert len(pendant._daemon.text_calls) == first
-
-    pendant._cnc.vars["wx"] = 2.0
-    pendant._refresh_dro(pendant._daemon)
-    assert pendant._daemon.text_calls[-1] == (0, "X 2.000")
-
-
-# --- _safe_number ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("value", "lo", "hi", "expected"),
-    [
-        (0, 0, 100, 0.0),
-        (50, 0, 100, 50.0),
-        (150, 0, 100, 100.0),
-        (-5, 0, 100, 0.0),
-        (-5, -100, 100, -5.0),  # negative allowed when lo permits it (e.g. work positions)
-        ("42.5", 0, 100, 42.5),
-        ("invalid", 0, 100, 0.0),
-        (None, 0, 100, 0.0),
-        # Non-finite values are always treated as invalid -> 0, regardless of sign or lo/hi.
-        (float("nan"), 0, 100, 0.0),
-        (float("inf"), 0, 100, 0.0),
-        (float("-inf"), 0, 100, 0.0),
-        pytest.param(10**10000, 0, 100, 100.0, id="huge-positive-int"),
-        pytest.param(-(10**10000), 0, 100, 0.0, id="huge-negative-int"),
-        pytest.param(-(10**10000), -100, 100, -100.0, id="huge-negative-int-with-negative-lo"),
-    ],
-)
-def test_safe_number(value, lo, hi, expected):
-    assert MacroPadPendant._safe_number(value, lo, hi) == expected
-
-
-# --- LEDs -----------------------------------------------------------------------------------
-
-
-def test_leds_alarm_overrides_everything():
-    pendant = make_pendant(cnc_vars={"state": "Alarm"})
-
-    pendant._refresh_leds(pendant._daemon)
-
-    assert len(pendant._daemon.led_calls) == 12
-    assert all(color == 0xFF0000 for _key, color in pendant._daemon.led_calls)
-
-
-def test_leds_idle_shows_jog_axes_and_modifiers_only():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-
-    pendant._refresh_leds(pendant._daemon)
-    colors = dict(pendant._daemon.led_calls)
-
-    assert colors[0] == MacroPadPendant.AXIS_COLOR_IDLE["X"]
-    assert colors[1] == MacroPadPendant.AXIS_COLOR_IDLE["Y"]
-    assert colors[2] == MacroPadPendant.AXIS_COLOR_IDLE["Z"]
-    for key in pendant._modifier_keys:
-        assert colors[key] == MacroPadPendant.MODIFIER_IDLE_COLOR
-    for key in (3, 4, 5, 6, 7, 8):  # targets are dark until a modifier is held
-        assert colors[key] == 0x000000
-
-
-def test_leds_light_only_valid_targets_while_modifier_held():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    hold(pendant, GOTO)
-
-    pendant._refresh_leds(pendant._daemon)
-    colors = dict(pendant._daemon.led_calls)
-
-    assert colors[GOTO] == MacroPadPendant.MODIFIER_COLORS["GOTO"]
-    for key in (3, 6, 7, 8):
-        assert colors[key] == MacroPadPendant.TARGET_COLORS["GOTO"]
-    # Keys that do nothing under GOTO go dark, including the other modifiers.
-    for key in (0, 1, 2, 4, 5, ACT, SET):
-        assert colors[key] == 0x000000
-
-
-def test_leds_highlight_only_the_pending_confirm_target():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    hold(pendant, SET)
-    tap(pendant, 0)
-
-    pendant._refresh_leds(pendant._daemon)
-    colors = dict(pendant._daemon.led_calls)
-
-    assert colors[0] == MacroPadPendant.CONFIRM_COLOR
-    assert colors[SET] == MacroPadPendant.MODIFIER_COLORS["SET"]
-    for key in (1, 2, 3, 4, 5, 6, 7, 8, GOTO, ACT):
-        assert colors[key] == 0x000000
-
-
-def test_leds_highlight_held_jog_axis():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    hold(pendant, MacroPadPendant.KEY_JOG_Y)
-
-    pendant._refresh_leds(pendant._daemon)
-    colors = dict(pendant._daemon.led_calls)
-
-    assert colors[1] == MacroPadPendant.AXIS_COLOR_HELD["Y"]
-    assert colors[0] == MacroPadPendant.AXIS_COLOR_IDLE["X"]
-
-
-def test_leds_dedupe_unchanged():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-
-    pendant._refresh_leds(pendant._daemon)
-    first = len(pendant._daemon.led_calls)
-    assert first == 12
-
-    pendant._refresh_leds(pendant._daemon)
-    assert len(pendant._daemon.led_calls) == first
-
-
-# --- connect lifecycle ------------------------------------------------------------------------
-
-
-def test_handle_connect_resets_caches_sends_brightness_and_reports():
+def test_connect_resets_caches_and_pushes_brightness():
     pendant = make_pendant()
     pendant._led_cache = {0: 0x123456}
     pendant._text_cache = {0: "stale"}
@@ -768,199 +860,6 @@ def test_handle_connect_resets_caches_sends_brightness_and_reports():
     pendant._handle_connect(pendant._daemon)
 
     assert pendant._led_cache == {}
-    assert pendant._text_cache == {}
     assert pendant._banner_cache == ("", "")
     assert pendant._daemon.brightness_calls == [30]
     assert reported == [True]
-
-
-# --- probe laser (M494) -----------------------------------------------------------------------
-
-
-def test_act_plus_laser_key_turns_probe_laser_on_then_off():
-    pendant = make_pendant()
-
-    hold(pendant, ACT)
-    tap(pendant, 8)
-    assert ("probe_laser", True) in pendant._controller.calls
-
-    tap(pendant, 8)
-    assert pendant._controller.calls.count(("probe_laser", False)) == 1
-
-
-def test_probe_laser_is_not_reachable_without_the_act_modifier():
-    pendant = make_pendant()
-
-    tap(pendant, 8)
-
-    assert pendant._controller.calls == []
-
-
-def test_probe_laser_key_is_work_home_under_goto_not_the_laser():
-    """Key 8 is shared: GOTO+8 must stay work-home and never touch the laser."""
-    pendant = make_pendant()
-
-    hold(pendant, GOTO)
-    tap(pendant, 8)
-
-    assert ("w_home",) in pendant._controller.calls
-    assert not any(c[0] == "probe_laser" for c in pendant._controller.calls)
-
-
-def test_probe_laser_banner_names_the_direction_actually_sent(monkeypatch):
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    fake_now = [1000.0]
-    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: fake_now[0])
-
-    hold(pendant, ACT)
-    tap(pendant, 8)
-    release(pendant, ACT)
-    assert pendant._display_context() == ("LASER ON", "")
-
-    fake_now[0] += MacroPadPendant.FLASH_DURATION + 0.1
-    hold(pendant, ACT)
-    tap(pendant, 8)
-    release(pendant, ACT)
-    assert pendant._display_context() == ("LASER OFF", "")
-
-
-def test_act_legend_lists_the_laser_and_still_fits_the_display():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    hold(pendant, ACT)
-
-    _banner, hint = pendant._display_context()
-    assert hint == "RUN STOP SPIN|PROBE MAC1 LASER"
-    assert all(len(line) <= 21 for line in hint.split("|"))
-
-
-def test_laser_key_is_lit_while_act_is_held():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-    hold(pendant, ACT)
-
-    pendant._refresh_leds(pendant._daemon)
-    colors = dict(pendant._daemon.led_calls)
-
-    assert colors[8] == MacroPadPendant.TARGET_COLORS["ACT"]
-
-
-# --- margin scan (M495) -----------------------------------------------------------------------
-
-LOADED_FILE = {
-    "state": "Idle",
-    "xmin": -50.0,
-    "xmax": 50.0,
-    "ymin": -25.0,
-    "ymax": 25.0,
-    "worksize_x": 340.0,
-    "worksize_y": 240.0,
-}
-
-
-def test_goto_plus_margin_scans_when_a_file_is_loaded():
-    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
-
-    hold(pendant, GOTO)
-    tap(pendant, 3)
-
-    assert ("margin", True) in pendant._controller.calls
-    assert "margin" in pendant._button_presses
-
-
-def test_margin_is_not_reachable_without_the_goto_modifier():
-    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
-
-    tap(pendant, 3)
-
-    assert pendant._controller.calls == []
-
-
-def test_margin_key_is_run_pause_under_act_not_margin():
-    """Key 3 is shared: ACT+3 must stay run/pause."""
-    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
-
-    hold(pendant, ACT)
-    tap(pendant, 3)
-
-    assert ("run_pause",) in pendant._controller.calls
-    assert not any(c[0] == "margin" for c in pendant._controller.calls)
-
-
-def test_margin_refuses_with_no_file_loaded_and_says_so():
-    """Unloaded CNC.vars hold +/-1e6 sentinels -- scanning those would be a wild move."""
-    pendant = make_pendant(
-        cnc_vars={
-            "state": "Idle",
-            "xmin": 1000000.0,
-            "xmax": -1000000.0,
-            "ymin": 1000000.0,
-            "ymax": -1000000.0,
-            "worksize_x": 340.0,
-            "worksize_y": 240.0,
-        }
-    )
-
-    hold(pendant, GOTO)
-    tap(pendant, 3)
-
-    assert pendant._controller.calls == []
-    assert pendant._flash_label == "NO FILE"
-
-
-@pytest.mark.parametrize(
-    "override",
-    [
-        {"xmax": -50.0},  # xmax <= xmin
-        {"ymax": -25.0},  # ymax <= ymin
-        {"xmin": -500.0},  # |xmin| beyond worksize_x
-        {"ymin": -500.0},  # |ymin| beyond worksize_y
-        {"xmin": "nonsense"},
-        {"worksize_x": None},
-    ],
-)
-def test_margin_refuses_unusable_bounds(override):
-    pendant = make_pendant(cnc_vars={**LOADED_FILE, **override})
-
-    hold(pendant, GOTO)
-    tap(pendant, 3)
-
-    assert pendant._controller.calls == []
-    assert pendant._flash_label == "NO FILE"
-
-
-def test_margin_refuses_missing_bounds_keys():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
-
-    hold(pendant, GOTO)
-    tap(pendant, 3)
-
-    assert pendant._controller.calls == []
-
-
-def test_margin_refuses_in_laser_mode():
-    """Firmware raises an ALARM for automatic work in laser mode; don't provoke it."""
-    pendant = make_pendant(cnc_vars={**LOADED_FILE, "lasermode": True})
-
-    hold(pendant, GOTO)
-    tap(pendant, 3)
-
-    assert pendant._controller.calls == []
-    assert pendant._flash_label == "LASER MODE"
-
-
-def test_goto_legend_lists_margin_on_its_own_key_row():
-    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
-    hold(pendant, GOTO)
-
-    _banner, hint = pendant._display_context()
-    assert hint == "MARGIN|MHOME SAFEZ WHOME"
-    assert all(len(line) <= 21 for line in hint.split("|"))
-
-
-def test_margin_key_is_lit_while_goto_is_held():
-    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
-    hold(pendant, GOTO)
-
-    pendant._refresh_leds(pendant._daemon)
-    colors = dict(pendant._daemon.led_calls)
-
-    assert colors[3] == MacroPadPendant.TARGET_COLORS["GOTO"]

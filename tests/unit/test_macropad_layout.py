@@ -9,7 +9,7 @@ import pytest
 
 from carveracontroller.addons.pendant import pendant as pendant_module
 
-from .test_macropad_pendant import ACT, GOTO, SET, make_pendant
+from .test_macropad_pendant import ACT, GOTO, SET, make_pendant, stroke
 
 MacroPadPendant = pendant_module.MacroPadPendant
 
@@ -89,9 +89,7 @@ def test_remapped_binding_actually_fires_the_action(tmp_path):
     pendant = make_pendant()
     load_from(pendant, tmp_path, MINIMAL)
 
-    pendant._daemon.pressed_keys.add(11)
-    pendant._handle_key_press(pendant._daemon, 11)
-    pendant._handle_key_press(pendant._daemon, 5)
+    stroke(pendant, 11, 5)
 
     assert ("safe_z",) in pendant._controller.calls
 
@@ -231,10 +229,8 @@ def test_no_usable_layout_anywhere_leaves_the_pendant_inert_not_crashed(tmp_path
 
     assert pendant._targets == {}
     assert pendant._modifier_keys == ()
-    # Still safe to drive: no key does anything, and nothing raises.
-    pendant._daemon.pressed_keys.add(9)
-    pendant._handle_key_press(pendant._daemon, 9)
-    pendant._handle_key_press(pendant._daemon, 6)
+    # Still safe to drive: no chord resolves, and nothing raises.
+    stroke(pendant, 9, 6)
     assert pendant._controller.calls == []
 
 

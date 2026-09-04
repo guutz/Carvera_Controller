@@ -398,12 +398,13 @@ if WHB04_SUPPORTED:
 
 
 class _PendantTarget(NamedTuple):
-    """One action reachable by holding a modifier key and pressing a target key."""
+    """One action, reached by a chord of a modifier key plus a target key."""
 
     label: str  # shown large on the OLED ("what am I about to do")
     hint: str  # compact form for the on-screen legend of available targets
     action: Callable[[], None]
     needs_confirm: bool = False
+    action_name: str = ""  # registry key, used to look up machine-state requirements
 
 
 try:
@@ -486,6 +487,32 @@ if MACROPAD_SUPPORTED:
         AXIS_COLOR_IDLE = {"X": 0x200000, "Y": 0x002000, "Z": 0x000020}
         AXIS_COLOR_HELD = {"X": 0xFF0000, "Y": 0x00FF00, "Z": 0x0000FF}
 
+        # Machine states each action needs. Absent = always allowed. Kept here rather than
+        # in the layout file: it is a property of the action, not of where you bind it.
+        IDLE_ONLY = ("Idle",)
+        ACTION_REQUIRES = {
+            "margin": IDLE_ONLY,
+            "machine_home": IDLE_ONLY,
+            "safe_z": IDLE_ONLY,
+            "work_home": IDLE_ONLY,
+            "probe_z": IDLE_ONLY,
+            "zero_xy": IDLE_ONLY,
+            "zero_z": IDLE_ONLY,
+            "spindle_toggle": ("Idle", "Run", "Pause", "Hold"),
+            "run_pause": ("Idle", "Run", "Pause", "Hold"),
+        }
+        STATE_HINTS = {
+            "margin": "NEED IDLE",
+            "machine_home": "NEED IDLE",
+            "safe_z": "NEED IDLE",
+            "work_home": "NEED IDLE",
+            "probe_z": "NEED IDLE",
+            "zero_xy": "NEED IDLE",
+            "zero_z": "NEED IDLE",
+            "spindle_toggle": "NOT READY",
+            "run_pause": "NOT READY",
+        }
+
         MODIFIER_IDLE_COLOR = 0x0A0A0A
         # Keyed by modifier *name*, so renaming or moving a modifier in the layout file
         # keeps its colour. Unknown names fall back to the default pair.
@@ -494,6 +521,22 @@ if MACROPAD_SUPPORTED:
         DEFAULT_MODIFIER_COLOR = 0x808080
         DEFAULT_TARGET_COLOR = 0x181818
         CONFIRM_COLOR = 0xFFFF00
+
+        # Stroke preview. White while the set spells nothing yet, green once it resolves to
+        # something that can run, red when it resolves to something blocked by machine state.
+        CHORD_FORMING_COLOR = 0xFFFFFF
+        CHORD_READY_COLOR = 0x00FF40
+        CHORD_BLOCKED_COLOR = 0xFF0000
+
+        ANIMATION_PERIODS = {
+            "pulse": 0.7,
+            "blink_fast": 0.3,
+            "strobe": 0.25,
+            "breathe_slow": 3.0,
+            "glow": 2.0,
+        }
+        # How far each animation dims at its trough: a glow stays subtle, a pulse swings.
+        ANIMATION_FLOORS = {"pulse": 0.25, "breathe_slow": 0.35, "glow": 0.05}
 
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
@@ -505,8 +548,9 @@ if MACROPAD_SUPPORTED:
             self._text_cache: dict[int, str] = {}
             self._banner_cache: tuple[str, str] = ("", "")
 
-            self._modifier_stack: list[int] = []
-            self._pending_confirm: tuple[int, int] | None = None
+            self._stroke_keys: set[int] = set()
+            self._stroke_jogged = False
+            self._pending_confirm: frozenset | None = None
             self._pending_deadline = 0.0
             self._flash_label = ""
             self._flash_until = 0.0
@@ -675,10 +719,34 @@ if MACROPAD_SUPPORTED:
                     label, hint, handler, confirms = specs[action]
                     if isinstance(binding, dict) and "confirm" in binding:
                         confirms = bool(binding["confirm"])
-                    bound[int(target_key)] = _PendantTarget(label, hint, handler, confirms)
+                    bound[int(target_key)] = _PendantTarget(label, hint, handler, confirms, action)
                 self._targets[number] = bound
 
             self._modifier_keys = tuple(self._modifier_names)
+
+            # Flatten the tree into the chord dictionary the engine resolves against. The
+            # tree still drives the OLED legend and which keys light up; chords are how a
+            # stroke is looked up, which is what makes press order irrelevant.
+            self._chords = {}
+            for modifier, targets in self._targets.items():
+                for target_key, target in targets.items():
+                    self._chords[frozenset((modifier, target_key))] = target
+
+        def _disabled_reason(self, target: _PendantTarget) -> str | None:
+            """
+            Why *target* can't run right now, or None if it can.
+
+            Surfaced before the action rather than after: with switches this light you want
+            to know a key is unavailable while you can still change your mind, not discover
+            it from a firmware alarm afterwards.
+            """
+            requires = self.ACTION_REQUIRES.get(target.action_name)
+            if requires is None:
+                return None
+            state = str(self._cnc.vars.get("state", ""))
+            if state in requires:
+                return None
+            return self.STATE_HINTS.get(target.action_name, "UNAVAILABLE")
 
         def _build_targets(self) -> dict[int, dict[int, _PendantTarget]]:
             """Load and apply the layout; returns the target table for convenience."""
@@ -740,77 +808,88 @@ if MACROPAD_SUPPORTED:
 
         # --- Modifier / target resolution ----------------------------------------------
 
-        def _active_modifier(self) -> int | None:
-            """
-            The action modifier currently in effect: the most recently pressed one that is
-            still held. Rolling a finger from one modifier to another switches mode rather
-            than latching on whichever was pressed first.
-            """
-            for key in reversed(self._modifier_stack):
-                if key in self._daemon.pressed_keys:
-                    return key
-            return None
+        # --- Chord engine ----------------------------------------------------------------
+        #
+        # Input is stenotype-style. A *stroke* starts when the first key goes down from
+        # all-idle and accumulates the union of every key pressed during it; it ends when
+        # the last key is released, and only then is the accumulated set resolved and run.
+        #
+        # Accumulating (rather than sampling what is held at any instant) is the whole
+        # point: press order, press timing, and which finger lifts first stop mattering, so
+        # the pendant cannot do one thing when you meant another because two switches
+        # registered microseconds apart. The MacroPad's switches are light and detent-free,
+        # which makes that failure easy to provoke and impossible to feel.
 
-        def _held_jog_axis(self) -> str | None:
-            # An action modifier suppresses jogging entirely -- while one is held the row-0
-            # keys mean "axis target", not "jog this axis".
-            if self._active_modifier() is not None:
-                return None
-            for key, axis in self._jog_keys.items():
-                if key in self._daemon.pressed_keys:
-                    return axis
-            return None
+        def _chord_for(self, keys: frozenset) -> _PendantTarget | None:
+            """The action a set of keys resolves to, or None if it isn't a chord."""
+            return self._chords.get(keys)
 
         def _targets_for(self, modifier: int) -> dict[int, _PendantTarget]:
             return self._targets.get(modifier, {})
 
-        # --- Key / encoder handling ----------------------------------------------------
+        def _stroke_jog_axis(self) -> str | None:
+            """
+            Axis to jog for the stroke in progress.
+
+            Jogging is a sustained hold rather than a chord, so it only applies while the
+            stroke consists of exactly one jog key -- adding any second key means a chord is
+            being formed, not a jog.
+            """
+            if len(self._stroke_keys) != 1:
+                return None
+            return self._jog_keys.get(next(iter(self._stroke_keys)))
 
         def _handle_key_press(self, daemon: macropad.Daemon, key_number: int) -> None:
-            if key_number in self._modifier_keys:
-                # Track press order so _active_modifier can prefer the newest held one.
-                if key_number in self._modifier_stack:
-                    self._modifier_stack.remove(key_number)
-                self._modifier_stack.append(key_number)
-                self._clear_pending_confirm()
+            self._stroke_keys.add(key_number)
+
+        def _handle_key_release(self, daemon: macropad.Daemon, key_number: int) -> None:
+            axis = self._jog_keys.get(key_number)
+            if axis is not None:
+                self._last_jog_direction.pop(axis, None)
+                if axis == self._active_continuous_jog_axis and self._controller.continuous_jog_active:
+                    self._controller.stopContinuousJog()
+                    self._active_continuous_jog_axis = None
+                    if self._update_ui_on_jog_stop:
+                        self._update_ui_on_jog_stop()
+
+            if daemon.pressed_keys:
+                return  # stroke still in progress
+            self._end_stroke()
+
+        def _end_stroke(self) -> None:
+            """Resolve and run the completed stroke, then reset for the next one."""
+            chord = frozenset(self._stroke_keys)
+            jogged = self._stroke_jogged
+            self._stroke_keys = set()
+            self._stroke_jogged = False
+
+            if not chord or jogged:
+                # A stroke that jogged is spent: releasing the axis key must not also fire
+                # whatever chord those keys happen to spell.
                 return
 
-            modifier = self._active_modifier()
-            if modifier is None:
-                # Nothing fires from a lone keypress -- every action needs a modifier held.
-                return
-
-            target = self._targets_for(modifier).get(key_number)
+            target = self._chord_for(chord)
             if target is None:
+                self._flash("NO CHORD")
                 return
 
-            if target.needs_confirm and self._pending_confirm != (modifier, key_number):
-                self._pending_confirm = (modifier, key_number)
+            reason = self._disabled_reason(target)
+            if reason is not None:
+                self._flash(reason)
+                return
+
+            if target.needs_confirm and self._pending_confirm != chord:
+                self._pending_confirm = chord
                 self._pending_deadline = time.monotonic() + self.CONFIRM_TIMEOUT
                 return
 
             self._clear_pending_confirm()
-            self._flash_label = target.label
-            self._flash_until = time.monotonic() + self.FLASH_DURATION
+            self._flash(target.label)
             target.action()
 
-        def _handle_key_release(self, daemon: macropad.Daemon, key_number: int) -> None:
-            if key_number in self._modifier_keys:
-                # Letting go of the modifier abandons an unconfirmed action.
-                if self._pending_confirm and self._pending_confirm[0] == key_number:
-                    self._clear_pending_confirm()
-                return
-
-            axis = self._jog_keys.get(key_number)
-            if axis is None:
-                return
-
-            self._last_jog_direction.pop(axis, None)
-            if axis == self._active_continuous_jog_axis and self._controller.continuous_jog_active:
-                self._controller.stopContinuousJog()
-                self._active_continuous_jog_axis = None
-                if self._update_ui_on_jog_stop:
-                    self._update_ui_on_jog_stop()
+        def _flash(self, label: str) -> None:
+            self._flash_label = label
+            self._flash_until = time.monotonic() + self.FLASH_DURATION
 
         def _clear_pending_confirm(self) -> None:
             self._pending_confirm = None
@@ -825,9 +904,11 @@ if MACROPAD_SUPPORTED:
             if not self._is_jogging_enabled():
                 return
 
-            axis = self._held_jog_axis()
+            axis = self._stroke_jog_axis()
             if axis is None:
                 return
+
+            self._stroke_jogged = True
 
             if self._controller.jog_mode == Controller.JOG_MODE_CONTINUOUS:
                 self._handle_continuous_jog(axis, delta)
@@ -1056,16 +1137,27 @@ if MACROPAD_SUPPORTED:
                 return ("ALARM", "UNLOCK IN APP")
 
             if self._pending_confirm:
-                modifier, key = self._pending_confirm
-                target = self._targets_for(modifier).get(key)
+                target = self._chord_for(self._pending_confirm)
                 if target is not None:
-                    return (f"{target.label}?", "PRESS AGAIN TO CONFIRM")
+                    return (f"{target.label}?", "REPEAT CHORD TO CONFIRM")
 
-            modifier = self._active_modifier()
-            if modifier is not None:
-                return (self._modifier_names[modifier], self._hint_for(modifier))
+            # Mid-stroke: show what releasing right now would do, so the display leads the
+            # action instead of reporting it afterwards.
+            if self._stroke_keys:
+                chord = frozenset(self._stroke_keys)
+                target = self._chord_for(chord)
+                if target is not None:
+                    reason = self._disabled_reason(target)
+                    if reason is not None:
+                        return (target.label, reason)
+                    return (target.label, "RELEASE TO RUN")
 
-            axis = self._held_jog_axis()
+                if len(chord) == 1:
+                    only = next(iter(chord))
+                    if only in self._modifier_names:
+                        return (self._modifier_names[only], self._hint_for(only))
+
+            axis = self._stroke_jog_axis()
             if axis is not None:
                 # Live work coordinate of the axis being jogged. The value is right-aligned
                 # in a fixed-width field so the banner's auto-scaling picks one size and
@@ -1077,6 +1169,11 @@ if MACROPAD_SUPPORTED:
                     f"{axis}{pos:>{self.JOG_READOUT_WIDTH}.3f}",
                     f"JOG {axis}  STEP {self.current_step_size:g}mm",
                 )
+
+            if self._stroke_keys:
+                # Keys are down but spell nothing. Say so while it can still be corrected
+                # by adding a key, rather than staying blank until release.
+                return ("- - -", "NO CHORD")
 
             if self._flash_label and time.monotonic() < self._flash_until:
                 return (self._flash_label, "")
@@ -1122,35 +1219,104 @@ if MACROPAD_SUPPORTED:
             for row, text in enumerate(lines[: daemon.num_rows]):
                 self._set_text_if_changed(daemon, row, text[:cols] if cols else text)
 
-        def _refresh_leds(self, daemon: macropad.Daemon) -> None:
-            if self._cnc.vars.get("state") == "Alarm":
-                for key in range(12):
-                    self._set_led_if_changed(daemon, key, 0xFF0000)
-                return
+        def _completions(self, chord: frozenset) -> set[int]:
+            """Keys that, added to the current stroke, would complete some chord."""
+            candidates = set()
+            for known in self._chords:
+                if chord < known:
+                    candidates |= known - chord
+            return candidates
 
-            colors = dict.fromkeys(range(12), 0x000000)
+        def _led_plan(self) -> dict[int, tuple[int, str]]:
+            """
+            Per-key (colour, animation) for the current state.
+
+            Split out from sending so the animation vocabulary is decided in one place, and
+            so it can be handed to the firmware to render once the protocol carries
+            animations -- the caller does not care which end draws them.
+
+            The stroke preview is the important part. These switches have no detent, so the
+            only way to know the pad registered the key you brushed -- or one you didn't --
+            is to see it. Every key counted in the stroke pulses together, in one colour
+            that says whether the set means anything yet.
+            """
+            plan = dict.fromkeys(range(12), (0x000000, "solid"))
+
+            if self._cnc.vars.get("state") == "Alarm":
+                return dict.fromkeys(range(12), (0xFF0000, "strobe"))
 
             if self._pending_confirm:
-                # Only the key that will act, plus its modifier, stay lit.
-                modifier, key = self._pending_confirm
-                colors[modifier] = self._modifier_color(modifier)
-                colors[key] = self.CONFIRM_COLOR
-            else:
-                modifier = self._active_modifier()
-                if modifier is not None:
-                    colors[modifier] = self._modifier_color(modifier)
-                    for key in self._targets_for(modifier):
-                        colors[key] = self._target_color(modifier)
-                else:
-                    # Idle: show where the modifiers are, and the jog axes.
-                    held_axis = self._held_jog_axis()
-                    for key, axis in self._jog_keys.items():
-                        colors[key] = self.AXIS_COLOR_HELD[axis] if axis == held_axis else self.AXIS_COLOR_IDLE[axis]
-                    for key in self._modifier_keys:
-                        colors[key] = self.MODIFIER_IDLE_COLOR
+                target = self._chord_for(self._pending_confirm)
+                for key in self._pending_confirm:
+                    plan[key] = (self.CONFIRM_COLOR, "blink_fast")
+                if target is not None:
+                    return plan
 
-            for key, color in colors.items():
-                self._set_led_if_changed(daemon, key, color)
+            if self._stroke_keys:
+                chord = frozenset(self._stroke_keys)
+                target = self._chord_for(chord)
+
+                if target is None:
+                    colour, anim = self.CHORD_FORMING_COLOR, "pulse"
+                elif self._disabled_reason(target) is not None:
+                    colour, anim = self.CHORD_BLOCKED_COLOR, "blink_fast"
+                else:
+                    # Resolved and allowed: stop moving. Going steady is the closest thing
+                    # to a detent this pad can give you -- let go now and it runs.
+                    colour, anim = self.CHORD_READY_COLOR, "solid"
+
+                for key in chord:
+                    plan[key] = (colour, anim)
+                for key in self._completions(chord):
+                    plan[key] = (self._completion_color(key), "glow")
+                return plan
+
+            # Idle: where the modifiers are, and the jog axes.
+            for key, axis in self._jog_keys.items():
+                plan[key] = (self.AXIS_COLOR_IDLE[axis], "solid")
+            for key in self._modifier_keys:
+                plan[key] = (self._modifier_color(key), "breathe_slow")
+            return plan
+
+        def _completion_color(self, key: int) -> int:
+            """Colour for a key offered as a completion: its own modifier's, if it is one."""
+            if key in self._modifier_names:
+                return self._modifier_color(key)
+            for modifier, targets in self._targets.items():
+                if key in targets:
+                    return self._target_color(modifier)
+            return self.DEFAULT_TARGET_COLOR
+
+        def _refresh_leds(self, daemon: macropad.Daemon) -> None:
+            for key, (color, animation) in self._led_plan().items():
+                self._set_led_if_changed(daemon, key, self._render(color, animation))
+
+        def _render(self, color: int, animation: str) -> int:
+            """
+            Collapse (colour, animation) to the colour to show this instant.
+
+            Animation is driven from here for now, which costs one LED write per key per
+            visible change. Moving it into the firmware is the obvious next step -- the
+            board can render a smooth pulse locally with no serial traffic at all -- and
+            this is the only function that has to change when it does.
+            """
+            if animation == "solid":
+                return color
+            phase = (time.monotonic() % self.ANIMATION_PERIODS[animation]) / self.ANIMATION_PERIODS[animation]
+            if animation in ("blink_fast", "strobe"):
+                return color if phase < 0.5 else 0x000000
+            # pulse / breathe_slow / glow: triangle ramp between a floor and the full colour.
+            floor = self.ANIMATION_FLOORS[animation]
+            level = floor + (1.0 - floor) * (2 * phase if phase < 0.5 else 2 * (1 - phase))
+            return self._scale_color(color, level)
+
+        @staticmethod
+        def _scale_color(color: int, level: float) -> int:
+            level = max(0.0, min(1.0, level))
+            r = int(((color >> 16) & 0xFF) * level)
+            g = int(((color >> 8) & 0xFF) * level)
+            b = int((color & 0xFF) * level)
+            return (r << 16) | (g << 8) | b
 
 
 class GamepadPendant(Pendant):
