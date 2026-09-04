@@ -190,6 +190,15 @@
         "pendant_types": ["MacroPad"]
     },
     {
+        "type": "bool",
+        "title": "MacroPad: Show 4th Axis On Screen",
+        "desc": "Add an A axis row to the pendant readout. The display only has six rows, so enabling this drops the feed/spindle row.",
+        "section": "carvera",
+        "key": "macropad_show_a_axis",
+        "default": "false",
+        "pendant_types": ["MacroPad"]
+    },
+    {
         "type": "numeric",
         "title": "MacroPad: Brightness (%)",
         "desc": "NeoPixel brightness on the MacroPad, 0-100.",

@@ -671,6 +671,13 @@ if MACROPAD_SUPPORTED:
             except Exception:
                 self._brightness = 30
 
+            # The 4th axis is off by default: on a six-row display it costs the feed/spindle
+            # row, and most jobs never touch A.
+            try:
+                self._show_a_axis = Config.getboolean("carvera", "macropad_show_a_axis", fallback=False)
+            except Exception:
+                self._show_a_axis = False
+
             self._daemon = macropad.Daemon(self.executor)
             self._daemon.on_connect = self._handle_connect
             self._daemon.on_disconnect = self._handle_disconnect
@@ -1266,6 +1273,30 @@ if MACROPAD_SUPPORTED:
 
             self._refresh_dro(daemon)
 
+        def _wcs_name(self) -> str:
+            """
+            Active work coordinate system, e.g. "G54".
+
+            From active_coord_system, which the status report keeps current -- not from
+            CNC.vars["WCS"], which is initialised to G54 and never updated, and so would
+            claim G54 no matter which system was really in effect.
+            """
+            try:
+                index = int(self._cnc.vars.get("active_coord_system", 0))
+            except (TypeError, ValueError):
+                return CNC.wcs_names[0]
+            if 0 <= index < len(CNC.wcs_names):
+                return CNC.wcs_names[index]
+            return "G??"
+
+        def _tool_text(self) -> str:
+            """Tool number, or T- when the machine has not reported one."""
+            try:
+                tool = int(self._cnc.vars.get("tool", -1))
+            except (TypeError, ValueError):
+                return "T-"
+            return f"T{tool}" if tool >= 0 else "T-"
+
         def _refresh_dro(self, daemon: macropad.Daemon) -> None:
             def wpos(key: str) -> str:
                 return f"{self._safe_number(self._cnc.vars.get(key, 0), -1e6, 1e6):.3f}"
@@ -1273,14 +1304,21 @@ if MACROPAD_SUPPORTED:
             feed = self._safe_number(self._cnc.vars.get("curfeed", 0), 0.0, 9999.0)
             spindle = self._safe_number(self._cnc.vars.get("curspindle", 0), 0.0, 65535.0)
             state = self._cnc.vars.get("state", "")
+            tlo = self._safe_number(self._cnc.vars.get("tlo", 0), -1e4, 1e4)
 
             lines = [
                 f"X {wpos('wx')}",
                 f"Y {wpos('wy')}",
                 f"Z {wpos('wz')}",
-                f"A {wpos('wa')}",
-                f"F{feed:.0f} S{spindle:.0f}",
+            ]
+            if self._show_a_axis:
+                lines.append(f"A {wpos('wa')}")
+            lines += [
+                # No space before the number so the worst case ("G59.3 T99 TLO-123.456")
+                # still fits the 21-column display.
+                f"{self._wcs_name()} {self._tool_text()} TLO{tlo:.3f}",
                 f"{state} step={self.current_step_size:g}mm",
+                f"F{feed:.0f} S{spindle:.0f}",
             ]
 
             cols = daemon.num_cols or None

@@ -142,6 +142,7 @@ def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabl
     pendant._saver_cache = None
     pendant._max_jog_speed = MacroPadPendant.DEFAULT_MAX_JOG_SPEED
     pendant._brightness = 30
+    pendant._show_a_axis = False
     pendant._is_jogging_enabled = lambda: jogging_enabled
     pendant._handle_run_pause_resume = lambda: pendant._controller.calls.append(("run_pause",))
     pendant._handle_probe_z = lambda: pendant._controller.calls.append(("probe_z",))
@@ -808,18 +809,91 @@ def test_safe_number(value, lo, hi, expected):
 # --- display plumbing ---------------------------------------------------------------------------
 
 
+DRO_VARS = {
+    "wx": 1.0,
+    "wy": -2.5,
+    "wz": 0.125,
+    "wa": 7.5,
+    "curfeed": 1200,
+    "curspindle": 10000,
+    "active_coord_system": 0,
+    "tool": 1,
+    "tlo": -12.345,
+}
+
+
 def test_dro_rows_formatting():
-    pendant = make_pendant(
-        cnc_vars={"wx": 1.0, "wy": -2.5, "wz": 0.125, "wa": 0.0, "curfeed": 1200, "curspindle": 10000}
-    )
+    pendant = make_pendant(cnc_vars=dict(DRO_VARS))
 
     pendant._refresh_dro(pendant._daemon)
 
     rows = dict(pendant._daemon.text_calls)
     assert rows[0] == "X 1.000"
     assert rows[1] == "Y -2.500"
-    assert rows[4] == "F1200 S10000"
+    assert rows[2] == "Z 0.125"
+    assert rows[3] == "G54 T1 TLO-12.345"
+    assert rows[4] == "Idle step=0.1mm"
+    assert rows[5] == "F1200 S10000"
+
+
+def test_dro_omits_the_fourth_axis_by_default():
+    pendant = make_pendant(cnc_vars=dict(DRO_VARS))
+
+    pendant._refresh_dro(pendant._daemon)
+
+    assert not any(text.startswith("A ") for _row, text in pendant._daemon.text_calls)
+
+
+def test_dro_shows_the_fourth_axis_when_enabled_at_the_cost_of_feed_spindle():
+    """Six rows only, so the A row displaces the last one."""
+    pendant = make_pendant(cnc_vars=dict(DRO_VARS))
+    pendant._show_a_axis = True
+
+    pendant._refresh_dro(pendant._daemon)
+
+    rows = dict(pendant._daemon.text_calls)
+    assert rows[3] == "A 7.500"
+    assert rows[4] == "G54 T1 TLO-12.345"
     assert rows[5] == "Idle step=0.1mm"
+    assert not any(text.startswith("F") for text in rows.values())
+
+
+@pytest.mark.parametrize(
+    ("index", "expected"),
+    [(0, "G54"), (1, "G55"), (5, "G59"), (6, "G59.1"), (8, "G59.3")],
+)
+def test_wcs_row_follows_the_active_coordinate_system(index, expected):
+    pendant = make_pendant(cnc_vars={**DRO_VARS, "active_coord_system": index})
+
+    assert pendant._wcs_name() == expected
+
+
+@pytest.mark.parametrize("bad", [99, -1, "x", None])
+def test_wcs_name_survives_a_nonsense_index(bad):
+    pendant = make_pendant(cnc_vars={**DRO_VARS, "active_coord_system": bad})
+
+    assert pendant._wcs_name() in ("G54", "G??")
+
+
+@pytest.mark.parametrize(
+    ("tool", "expected"),
+    [(0, "T0"), (1, "T1"), (7, "T7"), (-1, "T-"), ("x", "T-"), (None, "T-")],
+)
+def test_tool_text_handles_no_tool_and_junk(tool, expected):
+    pendant = make_pendant(cnc_vars={**DRO_VARS, "tool": tool})
+
+    assert pendant._tool_text() == expected
+
+
+def test_worst_case_wcs_row_still_fits_the_display():
+    """G59.3 + a two-digit tool + a large negative offset is the longest this row gets."""
+    pendant = make_pendant(cnc_vars={**DRO_VARS, "active_coord_system": 8, "tool": 99, "tlo": -123.456})
+
+    pendant._refresh_dro(pendant._daemon)
+
+    row = dict(pendant._daemon.text_calls)[3]
+    assert row == "G59.3 T99 TLO-123.456"
+    assert len(row) <= pendant._daemon.num_cols
 
 
 def test_banner_and_hint_go_out_when_supported():
