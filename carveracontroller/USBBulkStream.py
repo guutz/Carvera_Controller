@@ -33,13 +33,12 @@ except ImportError:  # Android / iOS builds omit pyusb
 
 Z1_USB_VID = 0x303A
 Z1_USB_PID = 0x4002
-# The shipped ESP32-S3 image contains two vendor-class device descriptors, 0x4002 and
-# 0x4020 (the ESP32 app is shared across Carvera/Z1/Z1 Pro, so these may be per-model).
-# Which one a given unit actually enumerates as is not confirmed, and probing an extra
-# VID/PID is free -- whereas matching only 0x4002 would leave a 0x4020 machine silently
-# missing from the connection dropdown.
-Z1_USB_PID_ALT = 0x4020
-USB_BULK_DEVICE_IDS = ((Z1_USB_VID, Z1_USB_PID), (Z1_USB_VID, Z1_USB_PID_ALT))
+# The shipped ESP32-S3 image also carries a second vendor-class device descriptor at
+# 303A:4020, identical in shape (one class-0xFF interface, bulk 0x01 OUT / 0x81 IN). No
+# observed machine enumerates as it -- a real Z1 reports 303A:4002 -- so it is deliberately
+# not probed here; the ESP32 app is shared across Carvera/Z1/Z1 Pro, so 0x4020 is most
+# likely another model's id. Add it here if a machine ever turns up using it.
+USB_BULK_DEVICE_IDS = ((Z1_USB_VID, Z1_USB_PID),)
 
 USB_BULK_SCHEME = "usbbulk://"
 BULK_WRITE_TIMEOUT_MS = 2000
@@ -197,7 +196,7 @@ def _bulk_device_label(vid, pid, serial, product):
         return serial
     if product:
         return product
-    if (vid, pid) in USB_BULK_DEVICE_IDS:
+    if (vid, pid) == (Z1_USB_VID, Z1_USB_PID):
         return "Z1 USB"
     return f"{vid:04X}:{pid:04X}"
 
