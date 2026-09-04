@@ -7951,6 +7951,10 @@ class Makera(RelativeLayout):
             self.pendant.close()
             self.setup_pendant()
 
+        if "status_poll_interval_ms" in self.controller_setting_change_list:
+            # Applies to the live connection; no reconnect needed.
+            self.controller.refresh_status_poll_interval()
+
         self._update_macro_button_text()
 
         self.config_popup.btn_apply.disabled = True

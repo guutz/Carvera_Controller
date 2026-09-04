@@ -33,7 +33,22 @@ except ImportError:
     Clock = None
     App = None
 
-STREAM_POLL = 0.2  # s
+STREAM_POLL = 0.2  # s -- default status poll interval
+
+# Bounds for the user-configurable status poll interval.
+#
+# The floor is deliberately conservative. The limit is not the USB or WiFi link but the
+# RS-422 line between the mainboard and the motion controller, which is hardcoded to
+# 230400 8N1 (~23 kB/s). A status response is on the order of 100-150 bytes, so 20 Hz is
+# roughly 10-13% of that link, leaving ample headroom. Going much faster also increases how
+# often the motion controller enters its serial-receive path, which contains blocking
+# spin-waits against a ~24 ms main-loop latency budget and has no watchdog behind it.
+#
+# Status polling is already suppressed entirely while a job is streaming (see streamIO), so
+# this interval only ever applies when the machine is idle or jogging.
+STREAM_POLL_MIN = 0.05  # s (20 Hz)
+STREAM_POLL_MAX = 1.0  # s (1 Hz)
+
 DIAGNOSE_POLL = 0.5  # s
 RX_BUFFER_SIZE = 128
 
@@ -102,6 +117,9 @@ class Controller:
 
     JOG_MODE_STEP = 0
     JOG_MODE_CONTINUOUS = 1
+
+    # Overwritten by refresh_status_poll_interval() from settings.
+    stream_poll = STREAM_POLL
 
     stop = threading.Event()
     usb_stream = None
@@ -534,6 +552,24 @@ class Controller:
             self.executeCommand("M821\n")
         else:
             self.executeCommand("M822\n")
+
+    def refresh_status_poll_interval(self):
+        """
+        Re-read the status poll interval from settings, clamped to a safe range.
+
+        Called on connect and whenever controller settings change, rather than per I/O
+        loop iteration -- streamIO spins far faster than a config read should happen.
+        """
+        interval = STREAM_POLL
+        if App is not None:
+            try:
+                from kivy.config import Config
+
+                interval = float(Config.get("carvera", "status_poll_interval_ms")) / 1000.0
+            except Exception:
+                interval = STREAM_POLL
+        self.stream_poll = max(STREAM_POLL_MIN, min(STREAM_POLL_MAX, interval))
+        return self.stream_poll
 
     def _auto_lights_enabled(self):
         if App is None:
@@ -1628,6 +1664,7 @@ class Controller:
         # Persist the last connection target so callers can detect "same machine"
         # reconnects (e.g. for resume-at-line selection / loaded lines behavior).
         self.connection_address = address
+        self.refresh_status_poll_interval()
         self._connecting = True
         self._heartbeat_grace_until = 0.0
         # Keep self.stream unset until open + protocol detect finish so heartbeat
@@ -2306,7 +2343,7 @@ class Controller:
             running = self.sendNUM > 0 or self.loadNUM > 0 or self.pausing
             try:
                 if not running and self.protocol_ready:
-                    if t - tr > STREAM_POLL:
+                    if t - tr > self.stream_poll:
                         self.viewStatusReport(True)
                         tr = t
                     if self.diagnosing and t - td > DIAGNOSE_POLL:

@@ -316,6 +316,15 @@
         "options": ["115200", "230400", "460800", "921600", "1500000", "2000000", "2500000", "3000000"]
     },
     {
+        "type": "options",
+        "title": "Machine status poll interval (ms)",
+        "desc": "How often the controller asks the machine for position and state while idle or jogging. Lower is a smoother DRO and pendant readout. Polling is paused automatically while a job is streaming, so this does not affect running jobs.",
+        "section": "carvera",
+        "key": "status_poll_interval_ms",
+        "default": "200",
+        "options": ["50", "100", "150", "200", "300", "500", "1000"]
+    },
+    {
         "type": "bool",
         "title": "Estimate playback time remaining based on toolpaths",
         "desc": "This feature adds additional parsing time after selecting a file.",

@@ -454,11 +454,54 @@ def test_encoder_press_cycles_and_wraps_step_index():
 # --- OLED banner / DRO ----------------------------------------------------------------------
 
 
-def test_banner_shows_jog_axis_while_jog_key_held():
-    pendant = make_pendant(cnc_vars={"state": "Idle"})
+def test_banner_shows_live_coordinate_of_axis_being_jogged():
+    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 12.3456, "wy": -7.0, "wz": 0.0})
     hold(pendant, MacroPadPendant.KEY_JOG_X)
 
-    assert pendant._display_context() == ("JOG X", "STEP 0.1mm")
+    banner, hint = pendant._display_context()
+    assert banner == "X  12.346"
+    assert hint == "JOG X  STEP 0.1mm"
+
+
+def test_jog_banner_tracks_the_held_axis():
+    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 1.0, "wy": -7.0, "wz": 250.5})
+
+    hold(pendant, MacroPadPendant.KEY_JOG_Y)
+    assert pendant._display_context()[0] == "Y  -7.000"
+    release(pendant, MacroPadPendant.KEY_JOG_Y)
+
+    hold(pendant, MacroPadPendant.KEY_JOG_Z)
+    assert pendant._display_context()[0] == "Z 250.500"
+
+
+def test_jog_banner_updates_as_position_changes():
+    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 0.0})
+    hold(pendant, MacroPadPendant.KEY_JOG_X)
+
+    assert pendant._display_context()[0] == "X   0.000"
+    pendant._cnc.vars["wx"] = -103.25
+    assert pendant._display_context()[0] == "X-103.250"
+
+
+@pytest.mark.parametrize("value", [0.0, -0.001, 9.5, -9.5, 123.456, -123.456, 999.999, -999.999])
+def test_jog_banner_width_is_constant_so_the_oled_scale_never_jumps(value):
+    """
+    The firmware auto-scales the banner from its length, so a varying-width readout would
+    visibly resize while jogging. Every value must render to the same number of characters.
+    """
+    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": value})
+    hold(pendant, MacroPadPendant.KEY_JOG_X)
+
+    banner = pendant._display_context()[0]
+    assert len(banner) == MacroPadPendant.JOG_READOUT_WIDTH + 1
+
+
+def test_jog_banner_hint_fits_the_display_width():
+    pendant = make_pendant(cnc_vars={"state": "Idle", "wx": 0.0})
+    pendant._step_index = 0  # 0.01mm -- longest step string
+    hold(pendant, MacroPadPendant.KEY_JOG_X)
+
+    assert len(pendant._display_context()[1]) <= 21
 
 
 def test_banner_shows_modifier_name_and_row_mirrored_hints():

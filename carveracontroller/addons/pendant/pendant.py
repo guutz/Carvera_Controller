@@ -459,6 +459,10 @@ if MACROPAD_SUPPORTED:
         STEP_SIZES = [0.01, 0.1, 1.0, 10.0]
         STEP_SIZE_SPEED_FRACTION = {0.01: 0.02, 0.1: 0.10, 1.0: 0.30, 10.0: 1.0}
 
+        # Width of the numeric field in the jog readout banner. 8 covers -999.999..999.999;
+        # with the axis letter that's 9 chars, which the firmware renders at a fixed scale.
+        JOG_READOUT_WIDTH = 8
+
         CONFIRM_TIMEOUT = 4.0  # seconds an unconfirmed prompt stays live
         FLASH_DURATION = 0.9  # seconds an executed action's name stays on screen
         MAX_HINT_LEN = 45  # two ~21-col lines plus the "|" separator
@@ -865,7 +869,16 @@ if MACROPAD_SUPPORTED:
 
             axis = self._held_jog_axis()
             if axis is not None:
-                return (f"JOG {axis}", f"STEP {self.current_step_size:g}mm")
+                # Live work coordinate of the axis being jogged. The value is right-aligned
+                # in a fixed-width field so the banner's auto-scaling picks one size and
+                # keeps it -- otherwise the text would visibly jump between sizes as digits
+                # come and go while jogging. Freshness is bounded by the host's status poll
+                # rate, not by this refresh.
+                pos = self._safe_number(self._cnc.vars.get(f"w{axis.lower()}", 0), -1e6, 1e6)
+                return (
+                    f"{axis}{pos:>{self.JOG_READOUT_WIDTH}.3f}",
+                    f"JOG {axis}  STEP {self.current_step_size:g}mm",
+                )
 
             if self._flash_label and time.monotonic() < self._flash_until:
                 return (self._flash_label, "")
