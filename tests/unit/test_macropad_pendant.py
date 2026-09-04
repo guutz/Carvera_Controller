@@ -86,6 +86,9 @@ class FakeController:
     def setProbeLaser(self, on):
         self.calls.append(("probe_laser", on))
 
+    def autoCommand(self, margin=False, **kwargs):
+        self.calls.append(("margin", margin))
+
 
 def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabled=True) -> MacroPadPendant:
     pendant = MacroPadPendant.__new__(MacroPadPendant)
@@ -213,7 +216,7 @@ def test_target_key_unbound_under_this_modifier_does_nothing():
     pendant = make_pendant()
 
     hold(pendant, GOTO)
-    tap(pendant, 3)  # 3 is an ACT target, not a GOTO target
+    tap(pendant, 4)  # 4 is an ACT target (stop), and unbound under GOTO
 
     assert pendant._controller.calls == []
 
@@ -512,7 +515,7 @@ def test_banner_shows_modifier_name_and_row_mirrored_hints():
     pendant = make_pendant(cnc_vars={"state": "Idle"})
 
     hold(pendant, GOTO)
-    assert pendant._display_context() == ("GOTO", "MHOME SAFEZ WHOME")
+    assert pendant._display_context() == ("GOTO", "MARGIN|MHOME SAFEZ WHOME")
 
     release(pendant, GOTO)
     hold(pendant, ACT)
@@ -575,7 +578,7 @@ def test_refresh_display_sends_banner_and_hint_on_fw2():
     pendant._refresh_display(pendant._daemon)
 
     assert pendant._daemon.banner_calls == ["GOTO"]
-    assert pendant._daemon.hint_calls == ["MHOME SAFEZ WHOME"]
+    assert pendant._daemon.hint_calls == ["MARGIN|MHOME SAFEZ WHOME"]
 
 
 def test_refresh_display_falls_back_to_text_rows_on_fw1():
@@ -587,7 +590,7 @@ def test_refresh_display_falls_back_to_text_rows_on_fw1():
 
     assert pendant._daemon.banner_calls == []
     assert (0, "GOTO") in pendant._daemon.text_calls
-    assert (1, "MHOME SAFEZ WHOME") in pendant._daemon.text_calls
+    assert (1, "MARGIN MHOME SAFEZ WHOME") in pendant._daemon.text_calls
 
 
 def test_refresh_display_exits_banner_mode_when_returning_to_dro():
@@ -708,10 +711,10 @@ def test_leds_light_only_valid_targets_while_modifier_held():
     colors = dict(pendant._daemon.led_calls)
 
     assert colors[GOTO] == MacroPadPendant.MODIFIER_COLORS[GOTO]
-    for key in (6, 7, 8):
+    for key in (3, 6, 7, 8):
         assert colors[key] == MacroPadPendant.TARGET_COLORS[GOTO]
     # Keys that do nothing under GOTO go dark, including the other modifiers.
-    for key in (0, 1, 2, 3, 4, 5, ACT, SET):
+    for key in (0, 1, 2, 4, 5, ACT, SET):
         assert colors[key] == 0x000000
 
 
@@ -838,3 +841,126 @@ def test_laser_key_is_lit_while_act_is_held():
     colors = dict(pendant._daemon.led_calls)
 
     assert colors[8] == MacroPadPendant.TARGET_COLORS[ACT]
+
+
+# --- margin scan (M495) -----------------------------------------------------------------------
+
+LOADED_FILE = {
+    "state": "Idle",
+    "xmin": -50.0,
+    "xmax": 50.0,
+    "ymin": -25.0,
+    "ymax": 25.0,
+    "worksize_x": 340.0,
+    "worksize_y": 240.0,
+}
+
+
+def test_goto_plus_margin_scans_when_a_file_is_loaded():
+    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
+
+    hold(pendant, GOTO)
+    tap(pendant, 3)
+
+    assert ("margin", True) in pendant._controller.calls
+    assert "margin" in pendant._button_presses
+
+
+def test_margin_is_not_reachable_without_the_goto_modifier():
+    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
+
+    tap(pendant, 3)
+
+    assert pendant._controller.calls == []
+
+
+def test_margin_key_is_run_pause_under_act_not_margin():
+    """Key 3 is shared: ACT+3 must stay run/pause."""
+    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
+
+    hold(pendant, ACT)
+    tap(pendant, 3)
+
+    assert ("run_pause",) in pendant._controller.calls
+    assert not any(c[0] == "margin" for c in pendant._controller.calls)
+
+
+def test_margin_refuses_with_no_file_loaded_and_says_so():
+    """Unloaded CNC.vars hold +/-1e6 sentinels -- scanning those would be a wild move."""
+    pendant = make_pendant(
+        cnc_vars={
+            "state": "Idle",
+            "xmin": 1000000.0,
+            "xmax": -1000000.0,
+            "ymin": 1000000.0,
+            "ymax": -1000000.0,
+            "worksize_x": 340.0,
+            "worksize_y": 240.0,
+        }
+    )
+
+    hold(pendant, GOTO)
+    tap(pendant, 3)
+
+    assert pendant._controller.calls == []
+    assert pendant._flash_label == "NO FILE"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"xmax": -50.0},  # xmax <= xmin
+        {"ymax": -25.0},  # ymax <= ymin
+        {"xmin": -500.0},  # |xmin| beyond worksize_x
+        {"ymin": -500.0},  # |ymin| beyond worksize_y
+        {"xmin": "nonsense"},
+        {"worksize_x": None},
+    ],
+)
+def test_margin_refuses_unusable_bounds(override):
+    pendant = make_pendant(cnc_vars={**LOADED_FILE, **override})
+
+    hold(pendant, GOTO)
+    tap(pendant, 3)
+
+    assert pendant._controller.calls == []
+    assert pendant._flash_label == "NO FILE"
+
+
+def test_margin_refuses_missing_bounds_keys():
+    pendant = make_pendant(cnc_vars={"state": "Idle"})
+
+    hold(pendant, GOTO)
+    tap(pendant, 3)
+
+    assert pendant._controller.calls == []
+
+
+def test_margin_refuses_in_laser_mode():
+    """Firmware raises an ALARM for automatic work in laser mode; don't provoke it."""
+    pendant = make_pendant(cnc_vars={**LOADED_FILE, "lasermode": True})
+
+    hold(pendant, GOTO)
+    tap(pendant, 3)
+
+    assert pendant._controller.calls == []
+    assert pendant._flash_label == "LASER MODE"
+
+
+def test_goto_legend_lists_margin_on_its_own_key_row():
+    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
+    hold(pendant, GOTO)
+
+    _banner, hint = pendant._display_context()
+    assert hint == "MARGIN|MHOME SAFEZ WHOME"
+    assert all(len(line) <= 21 for line in hint.split("|"))
+
+
+def test_margin_key_is_lit_while_goto_is_held():
+    pendant = make_pendant(cnc_vars=dict(LOADED_FILE))
+    hold(pendant, GOTO)
+
+    pendant._refresh_leds(pendant._daemon)
+    colors = dict(pendant._daemon.led_calls)
+
+    assert colors[3] == MacroPadPendant.TARGET_COLORS[GOTO]

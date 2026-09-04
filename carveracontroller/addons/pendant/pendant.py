@@ -433,8 +433,9 @@ if MACROPAD_SUPPORTED:
 
             Row 0:  0 X          |  1 Y          |  2 Z         <- jog holds / SET targets
             Row 1:  3 run/pause  |  4 stop       |  5 spindle   <- ACT targets
+                    (3 margin scan under GOTO)
             Row 2:  6 m-home     |  7 safe Z     |  8 w-home    <- GOTO targets
-                                    (6 probe Z, 7 macro 1 under ACT)
+                    (6 probe Z, 7 macro 1, 8 probe laser under ACT)
             Row 3:  9 GOTO       | 10 ACT        | 11 SET       <- modifiers
 
         So: hold GOTO + press 7 = go to safe Z. Hold ACT + press 3 = run/pause. Hold SET +
@@ -534,6 +535,7 @@ if MACROPAD_SUPPORTED:
             """
             return {
                 self.KEY_GOTO: {
+                    3: _PendantTarget("MARGIN", "MARGIN", self._do_margin_scan),
                     6: _PendantTarget("M-HOME", "MHOME", self._do_machine_home),
                     7: _PendantTarget("SAFE Z", "SAFEZ", self._do_safe_z),
                     8: _PendantTarget("W-HOME", "WHOME", self._do_work_home),
@@ -793,6 +795,46 @@ if MACROPAD_SUPPORTED:
             self._controller.setSpindleSwitch(not self._is_spindle_running())
             if self._update_ui_on_button_press:
                 self._update_ui_on_button_press("spindle_on_off")
+
+        def _margin_bounds_ready(self) -> bool:
+            """
+            Whether the loaded file's extents are usable for a margin scan.
+
+            With no file loaded CNC.vars holds sentinels (xmin/ymin = +1e6,
+            xmax/ymax = -1e6), and Controller.autoCommand silently returns for out-of-range
+            bounds. Silent nothing is a bad pendant response, so the same conditions are
+            checked here in order to say why on the OLED instead.
+            """
+            v = self._cnc.vars
+            try:
+                xmin, xmax = float(v["xmin"]), float(v["xmax"])
+                ymin, ymax = float(v["ymin"]), float(v["ymax"])
+                worksize_x, worksize_y = float(v["worksize_x"]), float(v["worksize_y"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if xmax <= xmin or ymax <= ymin:  # sentinels, or a file with no XY motion
+                return False
+            # Mirrors autoCommand's own reject, so we never send what it would drop.
+            return abs(xmin) <= worksize_x and abs(ymin) <= worksize_y
+
+        def _do_margin_scan(self) -> None:
+            """
+            Trace the loaded file's XY bounding box (M495 X.. Y.. C.. D..).
+
+            Re-runnable at any time, unlike the app's run-time-only margin checkbox.
+            """
+            if self._cnc.vars.get("lasermode"):
+                # Firmware answers "Can not do Automatic work in laser mode" with an ALARM;
+                # say so on the pendant rather than provoking it.
+                self._flash_label = "LASER MODE"
+                return
+            if not self._margin_bounds_ready():
+                self._flash_label = "NO FILE"
+                return
+
+            self._controller.autoCommand(margin=True)
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("margin")
 
         def _do_probe_laser_toggle(self) -> None:
             """
