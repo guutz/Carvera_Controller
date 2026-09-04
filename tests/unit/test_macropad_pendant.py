@@ -31,7 +31,7 @@ class FakeDaemon:
         self.hint_calls: list[str] = []
         self.brightness_calls: list[int] = []
         self.led_anim_calls: list[tuple[int, str, int, int]] = []
-        self.chase_calls: list[tuple | None] = []
+        self.saver_calls: list[int | None] = []
 
     @property
     def supports_banner(self) -> bool:
@@ -44,11 +44,11 @@ class FakeDaemon:
     def set_led_anim(self, key: int, mode: str, rgb: int, period_ms: int) -> None:
         self.led_anim_calls.append((key, mode, rgb, period_ms))
 
-    def set_chase(self, rgb: int, period_ms: int) -> None:
-        self.chase_calls.append((rgb, period_ms))
+    def set_screensaver(self, period_ms: int) -> None:
+        self.saver_calls.append(period_ms)
 
-    def clear_chase(self) -> None:
-        self.chase_calls.append(None)
+    def clear_screensaver(self) -> None:
+        self.saver_calls.append(None)
 
     def set_led(self, key: int, color: int) -> None:
         self.led_calls.append((key, color))
@@ -139,7 +139,7 @@ def make_pendant(cnc_vars=None, jog_mode=Controller.JOG_MODE_STEP, jogging_enabl
     pendant._flash_until = 0.0
     pendant._probe_laser_on = False
     pendant._idle_since = pendant_module.time.monotonic()
-    pendant._chase_cache = None
+    pendant._saver_cache = None
     pendant._max_jog_speed = MacroPadPendant.DEFAULT_MAX_JOG_SPEED
     pendant._brightness = 30
     pendant._is_jogging_enabled = lambda: jogging_enabled
@@ -943,92 +943,216 @@ def test_older_firmware_gets_host_rendered_colours(monkeypatch):
     pendant._refresh_leds(pendant._daemon)
 
     assert pendant._daemon.led_anim_calls == []
-    assert pendant._daemon.chase_calls == []
     assert pendant._daemon.led_calls  # plain colours instead
 
 
-# --- idle chase ----------------------------------------------------------------------------------
+# --- OLED screensaver ----------------------------------------------------------------------------
 
 
-def test_chase_starts_only_after_a_spell_of_inactivity(monkeypatch):
+def rest(pendant, now, seconds=None) -> None:
+    """Advance a fake clock past the screensaver delay."""
+    pendant._idle_since = now[0]
+    now[0] += MacroPadPendant.SCREENSAVER_AFTER + 1 if seconds is None else seconds
+
+
+def test_screensaver_starts_only_after_a_spell_of_inactivity(monkeypatch):
     pendant = make_pendant()
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
     pendant._idle_since = now[0]
 
-    pendant._refresh_leds(pendant._daemon)
-    assert pendant._daemon.chase_calls == []  # nothing running, nothing to cancel
+    pendant._refresh_display(pendant._daemon)
+    assert pendant._daemon.saver_calls == []  # nothing running, nothing to cancel
 
-    now[0] += MacroPadPendant.IDLE_CHASE_AFTER + 1
-    pendant._refresh_leds(pendant._daemon)
-    assert pendant._daemon.chase_calls[-1] == (
-        MacroPadPendant.IDLE_CHASE_COLOR,
-        MacroPadPendant.IDLE_CHASE_PERIOD_MS,
-    )
+    now[0] += MacroPadPendant.SCREENSAVER_AFTER + 1
+    pendant._refresh_display(pendant._daemon)
+    assert pendant._daemon.saver_calls == [MacroPadPendant.SCREENSAVER_PERIOD_MS]
 
 
-def test_touching_a_key_cancels_the_chase(monkeypatch):
+def test_screensaver_blanks_the_display_rather_than_pushing_text(monkeypatch):
+    """While the device is animating the dot, sending rows would fight it."""
+    pendant = make_pendant(cnc_vars={"wx": 1.0})
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
+    rest(pendant, now)
+
+    pendant._refresh_display(pendant._daemon)
+
+    assert pendant._daemon.text_calls == []
+    assert pendant._daemon.banner_calls == []
+
+
+def test_touching_a_key_wakes_the_display(monkeypatch):
     pendant = make_pendant()
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
-    pendant._idle_since = now[0]
-    now[0] += MacroPadPendant.IDLE_CHASE_AFTER + 1
-    pendant._refresh_leds(pendant._daemon)
-    assert pendant._chase_cache is not None
+    rest(pendant, now)
+    pendant._refresh_display(pendant._daemon)
+    assert pendant._saver_cache is not None
 
     press(pendant, GOTO)
-    pendant._refresh_leds(pendant._daemon)
+    pendant._refresh_display(pendant._daemon)
 
-    assert pendant._chase_cache is None
-    assert pendant._daemon.chase_calls[-1] is None
+    assert pendant._saver_cache is None
+    assert pendant._daemon.saver_calls[-1] is None
+    assert pendant._daemon.banner_calls == ["GOTO"]  # and the banner is pushed again
 
 
-def test_chase_is_not_resent_every_refresh(monkeypatch):
+def test_waking_repushes_the_dro_the_device_blanked(monkeypatch):
+    pendant = make_pendant(cnc_vars={"wx": 1.0, "wy": 0, "wz": 0, "wa": 0})
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
+    pendant._refresh_display(pendant._daemon)  # DRO cached
+    rest(pendant, now)
+    pendant._refresh_display(pendant._daemon)  # sleeps
+
+    pendant._idle_since = now[0]
+    pendant._refresh_display(pendant._daemon)  # wakes
+
+    assert (0, "X 1.000") in pendant._daemon.text_calls[-6:]
+
+
+def test_screensaver_is_not_resent_every_refresh(monkeypatch):
     pendant = make_pendant()
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
-    pendant._idle_since = now[0]
-    now[0] += MacroPadPendant.IDLE_CHASE_AFTER + 1
+    rest(pendant, now)
 
-    pendant._refresh_leds(pendant._daemon)
-    pendant._refresh_leds(pendant._daemon)
+    pendant._refresh_display(pendant._daemon)
+    pendant._refresh_display(pendant._daemon)
 
-    assert (
-        pendant._daemon.chase_calls.count((MacroPadPendant.IDLE_CHASE_COLOR, MacroPadPendant.IDLE_CHASE_PERIOD_MS)) == 1
-    )
+    assert pendant._daemon.saver_calls.count(MacroPadPendant.SCREENSAVER_PERIOD_MS) == 1
 
 
-def test_chase_suppresses_per_key_updates(monkeypatch):
-    """While chasing, the device owns every pixel -- sending key colours would fight it."""
+def test_leds_keep_working_while_the_screen_sleeps(monkeypatch):
+    """Only the display sleeps; the keys stay readable so the pad still looks alive."""
     pendant = make_pendant()
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
-    pendant._idle_since = now[0]
-    now[0] += MacroPadPendant.IDLE_CHASE_AFTER + 1
+    rest(pendant, now)
 
+    pendant._refresh_display(pendant._daemon)
     pendant._refresh_leds(pendant._daemon)
 
-    assert pendant._daemon.led_calls == []
-    assert pendant._daemon.led_anim_calls == []
+    for key in pendant._modifier_keys:
+        assert any(call[0] == key for call in pendant._daemon.led_anim_calls)
 
 
-def test_alarm_beats_the_chase(monkeypatch):
+@pytest.mark.parametrize("state", list(MacroPadPendant.BUSY_STATES))
+def test_screensaver_never_hides_a_machine_that_is_doing_something(monkeypatch, state):
+    pendant = make_pendant(cnc_vars={"state": state})
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
+    rest(pendant, now)
+
+    assert pendant._screensaver_period() is None
+
+
+def test_alarm_beats_the_screensaver(monkeypatch):
     pendant = make_pendant(cnc_vars={"state": "Alarm"})
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
-    now[0] += MacroPadPendant.IDLE_CHASE_AFTER + 1
+    rest(pendant, now)
 
-    pendant._refresh_leds(pendant._daemon)
-
-    assert pendant._idle_chase() is None
-    assert {call[1] for call in pendant._daemon.led_anim_calls} == {"strobe"}
+    assert pendant._screensaver_period() is None
 
 
-def test_pending_confirmation_beats_the_chase(monkeypatch):
+def test_pending_confirmation_beats_the_screensaver(monkeypatch):
     pendant = make_pendant()
     now = [1000.0]
     monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
     stroke(pendant, SET, 0)
-    now[0] += MacroPadPendant.IDLE_CHASE_AFTER + 1
+    rest(pendant, now)
 
-    assert pendant._idle_chase() is None
+    assert pendant._screensaver_period() is None
+
+
+def test_activity_keeps_resetting_the_idle_clock(monkeypatch):
+    pendant = make_pendant()
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
+    pendant._idle_since = now[0]
+
+    press(pendant, GOTO)
+    now[0] += MacroPadPendant.SCREENSAVER_AFTER + 1
+    pendant._handle_display_update(pendant._daemon)
+
+    assert pendant._idle_since == now[0]
+    assert pendant._screensaver_period() is None
+
+
+def test_older_firmware_never_sleeps_the_screen(monkeypatch):
+    pendant = make_pendant()
+    pendant._daemon.firmware_version = 2
+    now = [1000.0]
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: now[0])
+    rest(pendant, now)
+
+    pendant._refresh_display(pendant._daemon)
+
+    assert pendant._daemon.saver_calls == []
+    assert pendant._daemon.text_calls  # keeps showing the DRO instead
+
+
+# --- firmware animation offload -----------------------------------------------------------------
+
+
+def test_animated_keys_are_handed_to_the_firmware():
+    """Firmware 3+ renders animations itself, so we send one command, not frames."""
+    pendant = make_pendant()
+
+    pendant._refresh_leds(pendant._daemon)
+
+    modifier_anims = [c for c in pendant._daemon.led_anim_calls if c[0] in pendant._modifier_keys]
+    assert len(modifier_anims) == 3
+    for _key, mode, _rgb, period_ms in modifier_anims:
+        assert mode == "breathe"  # firmware's name for breathe_slow
+        assert period_ms == int(MacroPadPendant.ANIMATION_PERIODS["breathe_slow"] * 1000)
+
+
+def test_solid_keys_use_the_plain_led_command_even_on_fw3():
+    pendant = make_pendant()
+
+    pendant._refresh_leds(pendant._daemon)
+
+    assert (JOG_X, MacroPadPendant.AXIS_COLOR_IDLE["X"]) in pendant._daemon.led_calls
+    assert not any(call[0] == JOG_X for call in pendant._daemon.led_anim_calls)
+
+
+def test_firmware_animation_names_are_translated():
+    pendant = make_pendant(cnc_vars={"state": "Alarm"})
+
+    pendant._refresh_leds(pendant._daemon)
+
+    assert {call[1] for call in pendant._daemon.led_anim_calls} == {"strobe"}
+
+
+def test_blink_fast_is_sent_as_blink():
+    pendant = make_pendant()
+    stroke(pendant, SET, 0)  # arms a confirmation -> blink_fast
+
+    pendant._refresh_leds(pendant._daemon)
+
+    modes = {call[1] for call in pendant._daemon.led_anim_calls}
+    assert modes == {"blink"}
+
+
+def test_repeated_refreshes_do_not_resend_unchanged_animations():
+    pendant = make_pendant()
+
+    pendant._refresh_leds(pendant._daemon)
+    first = len(pendant._daemon.led_anim_calls) + len(pendant._daemon.led_calls)
+
+    pendant._refresh_leds(pendant._daemon)
+    assert len(pendant._daemon.led_anim_calls) + len(pendant._daemon.led_calls) == first
+
+
+def test_older_firmware_gets_host_rendered_colours(monkeypatch):
+    pendant = make_pendant()
+    pendant._daemon.firmware_version = 2
+    monkeypatch.setattr(pendant_module.time, "monotonic", lambda: 0.0)
+
+    pendant._refresh_leds(pendant._daemon)
+
+    assert pendant._daemon.led_anim_calls == []
+    assert pendant._daemon.led_calls  # plain colours instead

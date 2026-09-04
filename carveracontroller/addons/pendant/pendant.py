@@ -632,10 +632,12 @@ if MACROPAD_SUPPORTED:
         # Mirrors the firmware's own table for the host-rendered fallback path.
         ANIMATION_FLOORS = {"pulse": 0.25, "breathe_slow": 0.35, "glow": 0.05}
 
-        # Resting attract animation: a single pixel around the perimeter of the grid.
-        IDLE_CHASE_AFTER = 30.0  # seconds of no input before it starts
-        IDLE_CHASE_COLOR = 0x102030
-        IDLE_CHASE_PERIOD_MS = 2500
+        # Screensaver: the OLED blanks to a dot walking its perimeter once the pendant has
+        # been left alone. Long enough that it never hides a readout you are still using,
+        # and never engaged while the machine is doing something you would want to watch.
+        SCREENSAVER_AFTER = 60.0  # seconds showing nothing but the plain DRO
+        SCREENSAVER_PERIOD_MS = 8000  # one lap
+        BUSY_STATES = ("Run", "Pause", "Hold", "Tool", "Wait")
 
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
@@ -655,7 +657,7 @@ if MACROPAD_SUPPORTED:
             self._flash_until = 0.0
             self._probe_laser_on = False
             self._idle_since = time.monotonic()
-            self._chase_cache: tuple[int, int] | None = None
+            self._saver_cache: int | None = None
 
             self._targets = self._build_targets()
 
@@ -1151,8 +1153,23 @@ if MACROPAD_SUPPORTED:
 
         def _handle_display_update(self, daemon: macropad.Daemon) -> None:
             self._expire_pending_confirm()
+            if self._display_context() is not None or self._machine_busy():
+                # Anything worth looking at counts as activity, so the screensaver only
+                # ever takes over a plain resting DRO.
+                self._idle_since = time.monotonic()
             self._refresh_display(daemon)
             self._refresh_leds(daemon)
+
+        def _machine_busy(self) -> bool:
+            return str(self._cnc.vars.get("state", "")) in self.BUSY_STATES
+
+        def _screensaver_period(self) -> int | None:
+            """Lap time for the screensaver, or None if the display should stay awake."""
+            if self._display_context() is not None or self._machine_busy():
+                return None
+            if time.monotonic() < self._idle_since + self.SCREENSAVER_AFTER:
+                return None
+            return self.SCREENSAVER_PERIOD_MS
 
         def _hint_for(self, modifier: int) -> str:
             """
@@ -1221,6 +1238,19 @@ if MACROPAD_SUPPORTED:
         def _refresh_display(self, daemon: macropad.Daemon) -> None:
             if daemon.num_rows == 0:
                 return  # haven't completed the ID handshake yet
+
+            saver = self._screensaver_period() if daemon.supports_animation else None
+            if saver != self._saver_cache:
+                self._saver_cache = saver
+                if saver is None:
+                    daemon.clear_screensaver()
+                    # The device blanked the display, so our idea of what is on it is stale.
+                    self._text_cache.clear()
+                    self._banner_cache = ("", "")
+                else:
+                    daemon.set_screensaver(saver)
+            if saver is not None:
+                return
 
             context = self._display_context()
             if context is not None:
@@ -1325,34 +1355,7 @@ if MACROPAD_SUPPORTED:
                     return self._target_color(modifier)
             return self.DEFAULT_TARGET_COLOR
 
-        def _idle_chase(self) -> tuple[int, int] | None:
-            """
-            (colour, period_ms) for the resting attract animation, or None if not resting.
-
-            Only after a spell of real inactivity, so it never competes with feedback you
-            are actually trying to read.
-            """
-            if self._cnc.vars.get("state") == "Alarm" or self._stroke_keys or self._pending_confirm:
-                return None
-            if time.monotonic() < self._idle_since + self.IDLE_CHASE_AFTER:
-                return None
-            return (self.IDLE_CHASE_COLOR, self.IDLE_CHASE_PERIOD_MS)
-
         def _refresh_leds(self, daemon: macropad.Daemon) -> None:
-            if self._stroke_keys or self._pending_confirm:
-                self._idle_since = time.monotonic()
-
-            chase = self._idle_chase() if daemon.supports_animation else None
-            if chase != self._chase_cache:
-                self._chase_cache = chase
-                self._led_cache.clear()  # the device owns every pixel while chasing
-                if chase is None:
-                    daemon.clear_chase()
-                else:
-                    daemon.set_chase(*chase)
-            if chase is not None:
-                return
-
             for key, (color, animation) in self._led_plan().items():
                 if daemon.supports_animation:
                     self._set_led_anim_if_changed(daemon, key, color, animation)

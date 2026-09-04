@@ -96,16 +96,20 @@ class Daemon:
         """
         self._send(f"LEDA {index} {mode} {rgb:06X} {int(period_ms)}")
 
-    def set_chase(self, rgb: int, period_ms: int) -> None:
-        """Run a single pixel around the perimeter of the key grid (firmware 3+)."""
-        self._send(f"CHASE {rgb:06X} {int(period_ms)}")
+    def set_screensaver(self, period_ms: int) -> None:
+        """
+        Blank the display down to one dot walking its perimeter (firmware 3+).
 
-    def clear_chase(self) -> None:
-        self._send("CHASE")
+        The device animates it, so resting costs no traffic at all.
+        """
+        self._send(f"SAVER {int(period_ms)}")
+
+    def clear_screensaver(self) -> None:
+        self._send("SAVER")
 
     @property
     def supports_animation(self) -> bool:
-        """LEDA/CHASE were added in firmware 3; older firmware ignores them."""
+        """LEDA/SAVER were added in firmware 3; older firmware ignores them."""
         return self.firmware_version >= 3
 
     def set_brightness(self, percent: int) -> None:
