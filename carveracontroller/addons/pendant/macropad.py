@@ -87,6 +87,27 @@ class Daemon:
     def set_led_all(self, rgb: int) -> None:
         self._send(f"LEDALL {rgb:06X}")
 
+    def set_led_anim(self, index: int, mode: str, rgb: int, period_ms: int) -> None:
+        """
+        Animate one key on the device itself (firmware 3+).
+
+        The board redraws locally, so an animation costs one command rather than a stream
+        of frames, and keys sharing a mode and period stay in phase with each other.
+        """
+        self._send(f"LEDA {index} {mode} {rgb:06X} {int(period_ms)}")
+
+    def set_chase(self, rgb: int, period_ms: int) -> None:
+        """Run a single pixel around the perimeter of the key grid (firmware 3+)."""
+        self._send(f"CHASE {rgb:06X} {int(period_ms)}")
+
+    def clear_chase(self) -> None:
+        self._send("CHASE")
+
+    @property
+    def supports_animation(self) -> bool:
+        """LEDA/CHASE were added in firmware 3; older firmware ignores them."""
+        return self.firmware_version >= 3
+
     def set_brightness(self, percent: int) -> None:
         self._send(f"BRIGHT {max(0, min(100, int(percent)))}")
 

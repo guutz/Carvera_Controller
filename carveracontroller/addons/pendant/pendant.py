@@ -528,6 +528,9 @@ if MACROPAD_SUPPORTED:
         CHORD_READY_COLOR = 0x00FF40
         CHORD_BLOCKED_COLOR = 0xFF0000
 
+        # The firmware's mode vocabulary; ours is a little more descriptive.
+        FIRMWARE_ANIMATION_NAMES = {"breathe_slow": "breathe", "blink_fast": "blink"}
+
         ANIMATION_PERIODS = {
             "pulse": 0.7,
             "blink_fast": 0.3,
@@ -536,7 +539,13 @@ if MACROPAD_SUPPORTED:
             "glow": 2.0,
         }
         # How far each animation dims at its trough: a glow stays subtle, a pulse swings.
+        # Mirrors the firmware's own table for the host-rendered fallback path.
         ANIMATION_FLOORS = {"pulse": 0.25, "breathe_slow": 0.35, "glow": 0.05}
+
+        # Resting attract animation: a single pixel around the perimeter of the grid.
+        IDLE_CHASE_AFTER = 30.0  # seconds of no input before it starts
+        IDLE_CHASE_COLOR = 0x102030
+        IDLE_CHASE_PERIOD_MS = 2500
 
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
@@ -555,6 +564,8 @@ if MACROPAD_SUPPORTED:
             self._flash_label = ""
             self._flash_until = 0.0
             self._probe_laser_on = False
+            self._idle_since = time.monotonic()
+            self._chase_cache: tuple[int, int] | None = None
 
             self._targets = self._build_targets()
 
@@ -1287,9 +1298,54 @@ if MACROPAD_SUPPORTED:
                     return self._target_color(modifier)
             return self.DEFAULT_TARGET_COLOR
 
+        def _idle_chase(self) -> tuple[int, int] | None:
+            """
+            (colour, period_ms) for the resting attract animation, or None if not resting.
+
+            Only after a spell of real inactivity, so it never competes with feedback you
+            are actually trying to read.
+            """
+            if self._cnc.vars.get("state") == "Alarm" or self._stroke_keys or self._pending_confirm:
+                return None
+            if time.monotonic() < self._idle_since + self.IDLE_CHASE_AFTER:
+                return None
+            return (self.IDLE_CHASE_COLOR, self.IDLE_CHASE_PERIOD_MS)
+
         def _refresh_leds(self, daemon: macropad.Daemon) -> None:
+            if self._stroke_keys or self._pending_confirm:
+                self._idle_since = time.monotonic()
+
+            chase = self._idle_chase() if daemon.supports_animation else None
+            if chase != self._chase_cache:
+                self._chase_cache = chase
+                self._led_cache.clear()  # the device owns every pixel while chasing
+                if chase is None:
+                    daemon.clear_chase()
+                else:
+                    daemon.set_chase(*chase)
+            if chase is not None:
+                return
+
             for key, (color, animation) in self._led_plan().items():
-                self._set_led_if_changed(daemon, key, self._render(color, animation))
+                if daemon.supports_animation:
+                    self._set_led_anim_if_changed(daemon, key, color, animation)
+                else:
+                    # Firmware 1-2 can only be told a colour, so step the animation here.
+                    self._set_led_if_changed(daemon, key, self._render(color, animation))
+
+        def _set_led_anim_if_changed(self, daemon: macropad.Daemon, key: int, color: int, animation: str) -> None:
+            if self._led_cache.get(key) == (color, animation):
+                return
+            self._led_cache[key] = (color, animation)
+            if animation == "solid":
+                daemon.set_led(key, color)
+            else:
+                daemon.set_led_anim(
+                    key,
+                    self.FIRMWARE_ANIMATION_NAMES.get(animation, animation),
+                    color,
+                    int(self.ANIMATION_PERIODS[animation] * 1000),
+                )
 
         def _render(self, color: int, animation: str) -> int:
             """
