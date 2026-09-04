@@ -1,11 +1,15 @@
 """Userspace USB bulk transport for Makera Z1.
 
-The Z1 presents VID 0x303A / PID 0x4002 as a vendor-class device with bulk IN
-and bulk OUT endpoints, not a FTDI serial port like previous Makera machines.
+The Z1 presents VID 0x303A with a vendor-class interface (class 0xFF) exposing bulk IN
+and bulk OUT endpoints, not a FTDI serial port like previous Makera machines. There is no
+CDC interface anywhere in its descriptors, so the Z1 never enumerates as a COM port on any
+OS -- a serial transport cannot reach it, which is why this module exists.
 
 This module uses libusb to interact with the Z1
 
-Windows still needs the WinUSB driver bound to 303A:4002 (via Zadig).
+Windows needs the WinUSB driver bound to the device. Makera's own Z1 driver installer
+already does that (it ships libwdi, the same library Zadig is built on), so a machine that
+has had the Makera driver installed is usually ready without running Zadig separately.
 """
 
 from __future__ import annotations
@@ -29,7 +33,13 @@ except ImportError:  # Android / iOS builds omit pyusb
 
 Z1_USB_VID = 0x303A
 Z1_USB_PID = 0x4002
-USB_BULK_DEVICE_IDS = ((Z1_USB_VID, Z1_USB_PID),)
+# The shipped ESP32-S3 image contains two vendor-class device descriptors, 0x4002 and
+# 0x4020 (the ESP32 app is shared across Carvera/Z1/Z1 Pro, so these may be per-model).
+# Which one a given unit actually enumerates as is not confirmed, and probing an extra
+# VID/PID is free -- whereas matching only 0x4002 would leave a 0x4020 machine silently
+# missing from the connection dropdown.
+Z1_USB_PID_ALT = 0x4020
+USB_BULK_DEVICE_IDS = ((Z1_USB_VID, Z1_USB_PID), (Z1_USB_VID, Z1_USB_PID_ALT))
 
 USB_BULK_SCHEME = "usbbulk://"
 BULK_WRITE_TIMEOUT_MS = 2000
@@ -187,7 +197,7 @@ def _bulk_device_label(vid, pid, serial, product):
         return serial
     if product:
         return product
-    if (vid, pid) == (Z1_USB_VID, Z1_USB_PID):
+    if (vid, pid) in USB_BULK_DEVICE_IDS:
         return "Z1 USB"
     return f"{vid:04X}:{pid:04X}"
 
