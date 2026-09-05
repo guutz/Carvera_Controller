@@ -5,18 +5,31 @@ from carveracontroller.addons.probing.operations.OperationsBase import Operation
 from carveracontroller.addons.probing.operations.SingleAxis.SingleAxisProbeParameterDefinitions import (
     SingleAxisProbeParameterDefinitions,
 )
+from carveracontroller.addons.probing.operations.Z1Probing import (
+    Z1UnsupportedOperation,
+    generate_m480,
+    z1_probing_active,
+)
 
 
 class BossOperation(OperationsBase):
     imagePath: str
 
-    def __init__(self, title, requires_x, requires_y, image_path, **kwargs):
+    def __init__(self, title, requires_x, requires_y, image_path, z1_subcode=None, **kwargs):
         self.title = title
         self.imagePath = image_path
         self.requires_x = requires_x
         self.requires_y = requires_y
+        self.z1_subcode = z1_subcode
 
     def generate(self, input_config: dict[str, float]):
+        if z1_probing_active():
+            # M480.{9,10} always centre on both axes, so the single-axis
+            # variants have no equivalent and must not silently run a 2-axis move.
+            if self.z1_subcode is None:
+                raise Z1UnsupportedOperation(self.title)
+            return generate_m480(self.z1_subcode, input_config)
+
         config = copy.deepcopy(input_config)
 
         if not self.requires_x:

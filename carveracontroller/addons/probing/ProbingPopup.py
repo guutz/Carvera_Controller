@@ -26,6 +26,7 @@ from .operations.ProbeTip.ProbeTipOperationType import ProbeTipOperationType
 from .operations.ProbeTip.ProbeTipSettings import ProbeTipSettings
 from .operations.SingleAxis.SingleAxisProbeOperationType import SingleAxisProbeOperationType
 from .operations.SingleAxis.SingleAxisProbeSettings import SingleAxisProbeSettings
+from .operations.Z1Probing import Z1UnsupportedOperation, ignored_parameters, z1_probing_active
 from .preview.ProbingPreviewPopup import ProbingPreviewPopup
 
 logger = logging.getLogger(__name__)
@@ -143,16 +144,45 @@ class ProbingPopup(ModalView):
         the_op = FourthAxisOperationType[operation_key].value
         self.show_preview(the_op, cfg)
 
+    def _generate_for_machine(self, operation: OperationsBase, cfg):
+        """
+        Build the G-code for *operation*, or explain why this machine cannot.
+
+        Returns ``(gcode, note)``. An empty gcode means nothing will be sent --
+        the preview shows the note instead. Refusing is deliberate: the Z1
+        silently ignores the Community firmware's M460-M469, so emitting them
+        would look like a probe cycle that simply never happens.
+        """
+        try:
+            gcode = operation.generate(cfg)
+        except Z1UnsupportedOperation:
+            return "", tr._("This machine's firmware has no equivalent for this probing operation.")
+
+        if not z1_probing_active():
+            return gcode, ""
+
+        if not gcode.startswith("M480"):
+            return "", tr._("This machine's firmware has no equivalent for this probing operation.")
+
+        note = ""
+        ignored = ignored_parameters(cfg)
+        if ignored:
+            note = "\n\n" + tr._("Ignored on this machine: ") + ", ".join(ignored)
+        # M480 always writes the work offset; the Community firmware's S option
+        # to probe without zeroing has no equivalent.
+        note += "\n" + tr._("This sets the work origin and finishes at X0 Y0.")
+        return gcode, note
+
     def show_preview(self, operation: OperationsBase, cfg):
         missing_definition = operation.get_missing_config(cfg)
 
-        if missing_definition is None:
-            gcode = operation.generate(cfg)
-            self.preview_popup.gcode = gcode
-            self.preview_popup.probe_preview_label = gcode
-        else:
+        if missing_definition is not None:
             self.preview_popup.gcode = ""
             self.preview_popup.probe_preview_label = "Missing required parameter " + missing_definition.label
+        else:
+            gcode, note = self._generate_for_machine(operation, cfg)
+            self.preview_popup.gcode = gcode
+            self.preview_popup.probe_preview_label = gcode + note if gcode else note
 
         self.preview_popup.open()
 
