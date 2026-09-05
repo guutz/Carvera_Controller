@@ -182,6 +182,11 @@ def lift(pendant: MacroPadPendant, key: int) -> None:
     pendant._handle_key_release(pendant._daemon, key)
 
 
+def brightness(colour: int) -> int:
+    """Crude perceived brightness, enough to compare a key against its neighbours."""
+    return ((colour >> 16) & 0xFF) + ((colour >> 8) & 0xFF) + (colour & 0xFF)
+
+
 def plain(hint: str) -> str:
     """Legend with the hint pointer's brackets removed."""
     return hint.replace("[", "").replace("]", "")
@@ -654,9 +659,11 @@ def test_keys_that_would_complete_a_chord_are_offered():
     plan = pendant._led_plan()
 
     pointed = pendant._pointed_target(GOTO)
-    for key in (3, 6, 7, 8):  # GOTO's targets
-        # All offered; the one the hint pointer is on is bright rather than glowing.
-        assert plan[key][1] == ("solid" if key == pointed else "glow"), key
+    for key in (3, 6, 7, 8):  # GOTO's targets: all offered, none dark
+        assert plan[key][0] != 0x000000, key
+    # The pointer has to be the one bright thing, not merely the brightest of several.
+    others = [brightness(plan[k][0]) for k in (3, 6, 7, 8) if k != pointed]
+    assert brightness(plan[pointed][0]) > 3 * max(others)
     for key in (4, 5, ACT, SET):  # nothing GOTO combines with
         assert plan[key][0] == 0x000000, key
 
@@ -1313,9 +1320,12 @@ def test_the_bracketed_label_matches_the_lit_key(monkeypatch):
         pointed = pendant._pointed_target(GOTO)
 
         assert hint_for_key[pointed] in hint, (step, pointed, hint)
+        # Nothing animates among the offered keys; the pointer is simply the bright one, so
+        # it does not have to compete with a row of shimmering neighbours.
         assert plan[pointed][1] == "solid", (step, pointed)
         for other in set(hint_for_key) - {pointed}:
-            assert plan[other][1] == "glow", (step, other)
+            assert plan[other][1] == "solid", (step, other)
+            assert brightness(plan[other][0]) < brightness(plan[pointed][0]), (step, other)
 
 
 def test_only_one_label_is_bracketed_at_a_time(monkeypatch):
@@ -1512,3 +1522,17 @@ def test_success_sounds_stay_in_one_key_and_only_refusal_is_dissonant():
     assert not classes(MacroPadPendant.SOUND_FIRED) & dissonant
     assert not classes(MacroPadPendant.SOUND_ARMED) & dissonant
     assert classes(MacroPadPendant.SOUND_REFUSED) <= dissonant
+
+
+def test_offered_keys_do_not_animate_against_the_pointer():
+    """
+    Reported from hardware: with every offered key glowing, the pointer was hard to pick
+    out -- a glow at its peak is as bright as the pointer. Only the pointer moves now.
+    """
+    pendant = make_pendant()
+    press(pendant, ACT)
+
+    plan = pendant._led_plan()
+    offered = set(pendant._targets_for(ACT))
+
+    assert {plan[key][1] for key in offered} == {"solid"}

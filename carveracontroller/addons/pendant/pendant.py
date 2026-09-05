@@ -648,6 +648,10 @@ if MACROPAD_SUPPORTED:
         CHORD_READY_COLOR = 0x00FF40
         CHORD_BLOCKED_COLOR = 0xFF0000
 
+        # How far an offered-but-not-pointed key is dimmed, so the pointer reads as the one
+        # bright thing rather than merely the brightest of twelve.
+        COMPLETION_DIM = 0.12
+
         # The firmware's mode vocabulary; ours is a little more descriptive.
         FIRMWARE_ANIMATION_NAMES = {"breathe_slow": "breathe", "blink_fast": "blink"}
 
@@ -669,7 +673,9 @@ if MACROPAD_SUPPORTED:
         SOUND_FIRED = (((1046, 1568), 40), ((1318, 2093), 70))  # open fifth, resolving up
         SOUND_ARMED = (((880, 1108), 45), ((), 30), ((880, 1108), 45))  # asks twice
         SOUND_REFUSED = (((392, 415), 70), ((330, 349), 110))  # semitone clash, falling
-        SOUND_KEYTONE_BASE = 523  # C5; the device spreads 12 keys over one octave
+        # C4. The device maps keys up a pentatonic scale from here, bottom row lowest --
+        # C5 put the modifier row above 2kHz, which was shrill on a small PWM speaker.
+        SOUND_KEYTONE_BASE = 262
 
         # Screensaver: the OLED blanks to a dot walking its perimeter once the pendant has
         # been left alone. Long enough that it never hides a readout you are still using,
@@ -1468,13 +1474,17 @@ if MACROPAD_SUPPORTED:
                 for key in chord:
                     plan[key] = (colour, anim)
 
+                # Offered keys sit still and dim; only the pointer is bright, and only it
+                # moves. Animating all of them competed with the pointer -- a glow at its
+                # peak is as bright as the pointer, so nothing stood out and the whole row
+                # just shimmered. One moving thing at a time is the point.
                 pointed = self._pointed_target(next(iter(chord))) if len(chord) == 1 else None
                 for key in self._completions(chord):
                     key_colour = self._completion_color(key)
                     if key == pointed:
-                        plan[key] = (key_colour, "solid")  # the pointer
+                        plan[key] = (key_colour, "solid")
                     else:
-                        plan[key] = (key_colour, "glow")
+                        plan[key] = (self._scale_color(key_colour, self.COMPLETION_DIM), "solid")
                 return plan
 
             # Idle: where the modifiers are, and the jog axes.
