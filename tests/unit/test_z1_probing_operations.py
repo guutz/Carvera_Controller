@@ -139,3 +139,49 @@ class TestUnsupportedOperations:
 
     def test_single_axis_still_works_on_a_carvera(self, on_carvera):
         assert BoreOperationType["CenterX"].value.generate(dict(BASE)).startswith("M461")
+
+
+class TestPreviewGuard:
+    """
+    The preview is the last stop before a move runs, so it refuses anything
+    that would reach a Z1 as a command it silently discards.
+    """
+
+    @staticmethod
+    def _generate(operation, cfg):
+        from carveracontroller.addons.probing.ProbingPopup import ProbingPopup
+
+        # _generate_for_machine touches nothing on self.
+        return ProbingPopup._generate_for_machine(None, operation, cfg)
+
+    def test_refuses_an_unmapped_community_operation(self, on_z1):
+        """
+        The 4th axis operation here is M465.1, "4th Axis Level". The Z1's
+        own 4th axis probing is a different thing entirely -- a headstock Z
+        probe offset to the rotation centreline, driven from Config and Run --
+        so there is nothing to map it onto.
+        """
+        from carveracontroller.addons.probing.operations.FourthAxis.FourthAxisOperationType import (
+            FourthAxisOperationType,
+        )
+
+        gcode, note = self._generate(FourthAxisOperationType.Level.value, {"D": "3"})
+        assert gcode == ""
+        assert "no equivalent" in note
+
+    def test_passes_a_mapped_operation_through(self, on_z1):
+        gcode, note = self._generate(OutsideCornerOperationType["TopLeft"].value, dict(BASE))
+        assert gcode.startswith("M480.1 ")
+        assert "work origin" in note
+
+    def test_names_parameters_it_cannot_honour(self, on_z1):
+        cfg = dict(BASE)
+        cfg["L"] = "1"
+        gcode, note = self._generate(OutsideCornerOperationType["TopLeft"].value, cfg)
+        assert gcode.startswith("M480.1 ")
+        assert "L" in note
+
+    def test_carvera_is_untouched(self, on_carvera):
+        gcode, note = self._generate(OutsideCornerOperationType["TopLeft"].value, dict(BASE))
+        assert gcode.startswith("M464")
+        assert note == ""
