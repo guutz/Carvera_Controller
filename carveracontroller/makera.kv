@@ -11,7 +11,6 @@
 #:import CameraView carveracontroller.addons.camera.CameraView.CameraView
 #:import LASER_TOOL_NUMBER carveracontroller.CNC.LASER_TOOL_NUMBER
 #:import ZPROBE_TOOL_NUMBER carveracontroller.CNC.ZPROBE_TOOL_NUMBER
-#:import PROBE_3D_TOOL_NUMBER carveracontroller.CNC.PROBE_3D_TOOL_NUMBER
 #:include ui/GcodeColorSchemePanel.kv
 #:include addons/tooltips/Tooltips.kv
 #:include addons/intellisense/Intellisense.kv
@@ -908,7 +907,7 @@
         values: 'Probe', 'Tool: 1', 'Tool: 2', 'Tool: 3', 'Tool: 4', 'Tool: 5', 'Tool: 6', 'Custom'
         on_text:
             if self.text == 'Custom': app.root.coord_popup.change_tool_popup.open()
-            if self.text == '3D Probe': app.root.controller.change_tool_command(PROBE_3D_TOOL_NUMBER)
+            if self.text == '3D Probe': app.root.controller.change_to_3d_probe_command()
             elif self.text != tr._("Change..."): app.root.controller.change_tool_command(self.text[-1])
             if self.text != tr._("Change..."): self.text = tr._('Change...')
             root.select('Third Item')
@@ -943,7 +942,7 @@
         values: 'Empty', 'Probe', 'Tool: 1', 'Tool: 2', 'Tool: 3', 'Tool: 4', 'Tool: 5', 'Tool: 6', 'Custom'
         on_text:
             if self.text == 'Custom': app.root.coord_popup.settool_popup.open()
-            if self.text == '3D Probe': app.root.controller.set_tool_command(PROBE_3D_TOOL_NUMBER)
+            if self.text == '3D Probe': app.root.controller.set_3d_probe_command()
             elif self.text != tr._("Set..."): app.root.controller.set_tool_command(self.text[-1])
             if self.text != tr._("Set..."): self.text = tr._('Set...')
             root.select('Third Item')
@@ -1661,10 +1660,10 @@
                     root.dismiss()
             Button:
                 text: tr._('Change to 3D probe')
-                disabled: not app.is_community_firmware
+                disabled: not app.supports_3d_probe
                 on_release:
                     root.dismiss()
-                    app.root.controller.change_tool_command(PROBE_3D_TOOL_NUMBER)
+                    app.root.controller.change_to_3d_probe_command()
             Button:
                 text: tr._('Change to stock Makera probe')
                 on_release:

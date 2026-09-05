@@ -715,6 +715,19 @@ class Controller:
         else:
             self.executeCommand("M6T%s\n" % tool)
 
+    def change_to_3d_probe_command(self):
+        """
+        Load the 3D probe, using whichever tool number the connected model expects.
+
+        Kept here rather than in the .kv so the Z1's T9999 sentinel and the
+        Community firmware's T999990 stay a single decision (CNC.probe_3d_tool).
+        """
+        self.change_tool_command(CNC.probe_3d_tool)
+
+    def set_3d_probe_command(self):
+        """Declare the 3D probe as the loaded tool without running a tool change."""
+        self.set_tool_command(CNC.probe_3d_tool)
+
     def set_tool_command(self, tool):
         if tool == "e":
             self.executeCommand("M493.2T%d\n" % ZPROBE_TOOL_NUMBER)

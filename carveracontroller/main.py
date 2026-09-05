@@ -266,7 +266,10 @@ from .CNC import (
     detect_document_unit,
     escape_gcode_markup,
     highlight_gcode_line,
+    is_3d_probe_tool,
     is_probe_tools_range,
+    is_probing_tool,
+    probe_3d_tool_for_model,
     unit_scale_to_mm,
 )
 from .Controller import (
@@ -3771,7 +3774,7 @@ class Makera(RelativeLayout):
                 subprocess.Popen([opener, log_dir])
 
     def open_probing_popup(self):
-        if CNC.vars["tool"] == ZPROBE_TOOL_NUMBER or is_probe_tools_range(CNC.vars["tool"]):
+        if CNC.vars["tool"] == ZPROBE_TOOL_NUMBER or is_probing_tool(CNC.vars["tool"]):
             # Disable keyboard control to prevent accidents when opening the popup
             # But save the state to restore after probing is closed
             self._pre_modal_keyboard_jog = self.keyboard_jog_control
@@ -4643,6 +4646,9 @@ class Makera(RelativeLayout):
                         self.fw_version = remote_version[0].split("=")[1].strip()
                         app.is_community_firmware = bool(self.fw_version) and "c" in self.fw_version.lower()
                         self.controller.is_community_firmware = app.is_community_firmware
+                        # Model and version arrive on separate lines in either order,
+                        # so 3D probe support is recomputed from whichever lands last.
+                        self._refresh_3d_probe_support()
                         if not app.is_community_firmware or not CNC.can_rotate_wcs:
                             self.controller.viewWCS()
                         app.fw_version_digitized = Utils.digitize_v(self.fw_version)
@@ -4980,7 +4986,7 @@ class Makera(RelativeLayout):
             return "Probe"
         if tool_number == LASER_TOOL_NUMBER:
             return "Laser"
-        if tool_number == PROBE_3D_TOOL_NUMBER:
+        if is_3d_probe_tool(tool_number):
             return "3D Probe"
         if is_probe_tools_range(tool_number):
             return "Custom Probe"
@@ -5663,12 +5669,27 @@ class Makera(RelativeLayout):
             popup.open()
 
     # -----------------------------------------------------------------------
+    def _refresh_3d_probe_support(self):
+        """
+        Recompute which 3D probe, if any, the connected machine offers.
+
+        Z1/Z1Pro stock firmware has a wired 3D probe on T9999; Carvera Community
+        firmware has one in the T999990 probe range. Stock Carvera firmware has
+        neither. Called from both the model and version handlers because the two
+        status lines arrive independently.
+        """
+        app = App.get_running_app()
+        CNC.probe_3d_tool = probe_3d_tool_for_model(app.model)
+        app.supports_3d_probe = bool(app.model.startswith("Z1") or app.is_community_firmware)
+
+    # -----------------------------------------------------------------------
     def setUIForModel(self, model, *args):
         app = App.get_running_app()
         model_changed = False
         if model != app.model:
             app.model = model.strip()
             model_changed = True
+        self._refresh_3d_probe_support()
         app.has_anchor2 = app.model != "Z1"
         if not app.has_anchor2 and getattr(self, "coord_popup", None):
             if self.coord_popup.config.get("origin", {}).get("anchor") == 2:
@@ -5713,6 +5734,15 @@ class Makera(RelativeLayout):
                 "Laser",
                 "Custom",
             ]
+        elif app.supports_3d_probe:
+            # Z1 stock firmware: add the 3D probe entry only. The rest of the
+            # community list (Laser, Empty) drives commands this firmware
+            # handles differently, so the .kv defaults stand.
+            for spinner in (self.tool_drop_down.set_dropdown, self.tool_drop_down.change_dropdown):
+                if "3D Probe" not in spinner.values:
+                    values = list(spinner.values)
+                    values.insert(values.index("Probe") + 1, "3D Probe")
+                    spinner.values = values
         app.has_atc = bool(CNC.vars["FuncSetting"] & 4)
         # The first machine config load must happen after /sd/config.txt is parsed.
         if model_changed and self.config_loaded:
@@ -6589,6 +6619,8 @@ class Makera(RelativeLayout):
                     app.fw_version_digitized = 0
                     app.is_community_firmware = False
                     app.supports_auto_ext_out = False
+                    app.supports_3d_probe = False
+                    CNC.probe_3d_tool = PROBE_3D_TOOL_NUMBER
                     app.supports_camera = False
                     self.camera_checked = False
                     self.camera_probe += 1  # discard the result of a probe still in flight
@@ -6867,7 +6899,7 @@ class Makera(RelativeLayout):
                     self.tool_data_view.main_text = tr._("Probe")
                 elif CNC.vars["tool"] == LASER_TOOL_NUMBER:
                     self.tool_data_view.main_text = tr._("Laser")
-                elif CNC.vars["tool"] == PROBE_3D_TOOL_NUMBER:
+                elif is_3d_probe_tool(CNC.vars["tool"]):
                     self.tool_data_view.main_text = tr._("3DProb")
                 else:
                     self.tool_data_view.main_text = "{:.0f}".format(CNC.vars["tool"])
@@ -8916,6 +8948,10 @@ class MakeraApp(App):
     camera_gamma = NumericProperty(ADJUST_DEFAULT)
     camera_resolution = NumericProperty(DEFAULT_RESOLUTION)
     supports_auto_ext_out = BooleanProperty(False)
+    # Narrow capability flag: the machine has a selectable 3D probe. Deliberately
+    # separate from is_community_firmware, which gates ~40 unrelated widgets whose
+    # commands Z1 stock firmware does not implement.
+    supports_3d_probe = BooleanProperty(False)
     fw_version_digitized = NumericProperty(0)
     show_tooltips = BooleanProperty(True)
     tooltip_delay = NumericProperty(0.5)

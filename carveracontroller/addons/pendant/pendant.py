@@ -29,8 +29,8 @@ from kivy.uix.textinput import TextInput
 from carveracontroller.CNC import (
     CNC,
     LASER_TOOL_NUMBER,
-    PROBE_3D_TOOL_NUMBER,
     ZPROBE_TOOL_NUMBER,
+    is_3d_probe_tool,
     is_probe_tools_range,
 )
 from carveracontroller.Controller import Controller
@@ -1390,7 +1390,7 @@ if MACROPAD_SUPPORTED:
                 return "PROBE"
             if tool == LASER_TOOL_NUMBER:
                 return "LASER"
-            if tool == PROBE_3D_TOOL_NUMBER:
+            if is_3d_probe_tool(tool):
                 return "3DPRB"
             if is_probe_tools_range(tool):
                 return "PROBE"

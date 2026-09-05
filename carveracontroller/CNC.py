@@ -148,6 +148,20 @@ PROBE_TOOLS_RANGE_START = 999990
 PROBE_TOOLS_RANGE_END = 999999
 PROBE_3D_TOOL_NUMBER = PROBE_TOOLS_RANGE_START
 
+# Makera Z1/Z1Pro stock firmware predates the Community firmware's probe tool
+# range and selects its wired 3D probe with a single sentinel instead. The
+# distinction matters beyond naming: the Z1 firmware only skips the (Carvera,
+# wireless) probe liveness check for tools other than T0, so selecting the
+# stock "Probe" entry on a Z1 measures tool length and then halts with
+# "Probe dead or not set". T9999 takes the same path minus that check, and
+# additionally drives the wired probe laser.
+Z1_PROBE_3D_TOOL_NUMBER = 9999
+
+
+def probe_3d_tool_for_model(model):
+    """Tool number that selects the 3D probe on *model*."""
+    return Z1_PROBE_3D_TOOL_NUMBER if str(model or "").startswith("Z1") else PROBE_3D_TOOL_NUMBER
+
 
 def is_probe_tools_range(tool_num):
     """True if *tool_num* is in the firmware probe tool number range."""
@@ -158,12 +172,43 @@ def is_probe_tools_range(tool_num):
     return PROBE_TOOLS_RANGE_START <= n <= PROBE_TOOLS_RANGE_END
 
 
+def is_3d_probe_tool(tool_num):
+    """
+    True if *tool_num* is *the* 3D probe on the machine currently connected.
+
+    Deliberately narrower than is_probing_tool: the rest of the probe range is
+    made up of custom probes, which display as a generic probe rather than 3D.
+    """
+    try:
+        n = int(tool_num)
+    except (TypeError, ValueError):
+        return False
+    return n == CNC.probe_3d_tool
+
+
+def is_probing_tool(tool_num):
+    """
+    True if *tool_num* is any tool the probing screen can drive.
+
+    Covers the Community firmware's probe range plus the connected model's 3D
+    probe, which on a Z1 (9999) falls outside that range.
+    """
+    try:
+        n = int(tool_num)
+    except (TypeError, ValueError):
+        return False
+    return is_probe_tools_range(n) or n == CNC.probe_3d_tool
+
+
 # ===============================================================================
 # Command operations on a CNC
 # ===============================================================================
 class CNC:
     has_4axis = False
     can_rotate_wcs = False
+    # Tool number that selects the 3D probe, per connected model (see
+    # probe_3d_tool_for_model). Set when the machine reports its model.
+    probe_3d_tool = PROBE_3D_TOOL_NUMBER
     inch = False
     travel_x = 340
     travel_y = 240
