@@ -4045,6 +4045,17 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def play(self, file_name, start_line):
+        # The pre-run check has to come before apply(): apply() already buffers the
+        # margin/probe/level sequence, so a dialog after it would be asking about
+        # commands the machine has been handed. Resume has its own confirmation,
+        # which shows the whole recovery sequence, so it is not doubled up here.
+        if not start_line and self._pre_run_check_enabled():
+            self.open_pre_run_check_popup(file_name)
+            return
+        self._start_play(file_name, start_line)
+
+    # -----------------------------------------------------------------------
+    def _start_play(self, file_name, start_line):
         # stop review play first
         self.gcode_playing = False
         self.gcode_viewer.dynamic_display = False
@@ -4057,6 +4068,76 @@ class Makera(RelativeLayout):
             self.open_resume_playback_confirm_popup(file_name, start_line)
         else:
             self.controller.playCommand(file_name, has_ocodes=self.file_has_ocodes)
+
+    # -----------------------------------------------------------------------
+    def _pre_run_check_enabled(self):
+        return Config.get("carvera", "show_pre_run_check") == "1"
+
+    # -----------------------------------------------------------------------
+    def _active_wcs_name(self):
+        """
+        The WCS the machine reports right now.
+
+        CNC.vars["WCS"] looks like the obvious source but is dead -- initialised to
+        "G54" and never written. active_coord_system is the live one.
+        """
+        try:
+            return CNC.wcs_names[int(CNC.vars["active_coord_system"])]
+        except (KeyError, IndexError, TypeError, ValueError):
+            return ""
+
+    # -----------------------------------------------------------------------
+    def _pre_run_check_text(self, warnings, selections):
+        """Say which origin the job will use, and what would silently replace it."""
+        active = self._active_wcs_name() or tr._("unknown")
+        if selections:
+            seen = []
+            for cmd, line_no in selections:
+                if cmd not in [c for c, _ in seen]:
+                    seen.append((cmd, line_no))
+            file_wcs = ", ".join(f"{cmd} (line {line_no})" for cmd, line_no in seen)
+        else:
+            file_wcs = tr._("none — the file uses whichever is active")
+
+        body = [
+            tr._("Active work coordinate system: %s") % active,
+            tr._("Offsets  X %.3f   Y %.3f   Z %.3f") % (CNC.vars["wcox"], CNC.vars["wcoy"], CNC.vars["wcoz"]),
+            "",
+            tr._("Selected by this file: %s") % file_wcs,
+        ]
+
+        messages = {
+            "wcs_mismatch": tr._(
+                "- This file selects a different coordinate system than the active one, so the offsets above are NOT what it will cut against."
+            ),
+            "wcs_multiple": tr._("- This file switches between several coordinate systems."),
+            "zprobe_overwrites_z": tr._(
+                "- Z probe is enabled in Config and Run. It ends in G10 L20 P0, which will REPLACE the work Z zero shown above."
+            ),
+        }
+        flagged = [messages[key] for key in warnings if key in messages]
+        if flagged:
+            body += ["", tr._("Before you start:")] + flagged
+        return "\n".join(body)
+
+    # -----------------------------------------------------------------------
+    def open_pre_run_check_popup(self, file_name):
+        if self.confirm_popup.showing:
+            return
+
+        lines = self.lines if getattr(self, "lines", None) else []
+        warnings = self.controller.pre_run_warnings(lines, self._active_wcs_name(), self.coord_config)
+        selections = self.controller.scan_wcs_selections(lines)
+
+        self.confirm_popup.size_hint = (0.7, 0.6)
+        self.confirm_popup.pos_hint = {"center_x": 0.5, "center_y": 0.5}
+        self.confirm_popup.lb_title.text = tr._("Before running")
+        self.confirm_popup.lb_title.size_hint_y = None
+        self.confirm_popup.lb_content.halign = "left"
+        self.confirm_popup.lb_content.text = self._pre_run_check_text(warnings, selections)
+        self.confirm_popup.confirm = partial(self._start_play, file_name, None)
+        self.confirm_popup.cancel = None
+        self.confirm_popup.open(self)
 
     # -----------------------------------------------------------------------
     def apply(self, buffer=False):

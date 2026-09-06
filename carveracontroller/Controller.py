@@ -1185,6 +1185,57 @@ class Controller:
                 return True
         return False
 
+    # Work-coordinate systems a file can select, longest first so "G59.1" is not
+    # matched as "G59".
+    WCS_SELECT_COMMANDS = ("G59.3", "G59.2", "G59.1", "G59", "G58", "G57", "G56", "G55", "G54")
+
+    def scan_wcs_selections(self, lines):
+        """
+        Every work-coordinate-system selection in *lines*, in file order.
+
+        Returned as a list of (command, line_number). Uses the same tokeniser as
+        the resume preamble, so a selection inside a comment does not count.
+        """
+        found = []
+        if not lines:
+            return found
+        for index, raw in enumerate(lines):
+            for token in self._gcode_line_to_cmd_tokens(raw):
+                upper = token.upper()
+                for candidate in self.WCS_SELECT_COMMANDS:
+                    if upper == candidate:
+                        found.append((candidate, index + 1))
+                        break
+        return found
+
+    def pre_run_warnings(self, lines, active_wcs, coord_config):
+        """
+        What is worth saying out loud before a file runs, as warning keys.
+
+        Answers "is the origin I just probed the one this job will use, and will
+        anything quietly replace it":
+
+          - "wcs_mismatch": the file selects a WCS other than the active one, so
+            the offsets on screen are not the ones the job will cut against
+          - "wcs_multiple": the file switches between several, so no single
+            answer holds for the whole job
+          - "zprobe_overwrites_z": the Z probe step is enabled, and it ends in
+            G10 L20 P0 Z... -- whatever Z zero is set now will be replaced
+
+        Margin and auto-levelling are deliberately absent: neither writes an
+        offset (fill_margin_scripts and fill_autolevel_scripts contain no G10).
+        """
+        warnings = []
+        selections = self.scan_wcs_selections(lines)
+        distinct = {cmd for cmd, _line in selections}
+        if len(distinct) > 1:
+            warnings.append("wcs_multiple")
+        elif distinct and active_wcs and distinct != {active_wcs}:
+            warnings.append("wcs_mismatch")
+        if (coord_config or {}).get("zprobe", {}).get("active"):
+            warnings.append("zprobe_overwrites_z")
+        return warnings
+
     def resume_playback_warnings(self, commands):
         """
         Inspect resume-at-line command preview and return missing-state warning keys.

@@ -81,6 +81,14 @@
     },
     {
         "type": "bool",
+        "title": "Confirm Coordinate System Before Running",
+        "desc": "Before starting a file, show which work coordinate system is active, which one the file selects, and whether any enabled step will overwrite the work origin.",
+        "section": "carvera",
+        "key": "show_pre_run_check",
+        "default": "true"
+    },
+    {
+        "type": "bool",
         "title": "Use Instant Feed And Spindle Overrides",
         "desc": "Off uses stock commands that wait for the current block to execute",
         "section": "carvera",
