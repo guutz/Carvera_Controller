@@ -397,6 +397,21 @@ class Controller:
             cmd = "buffer " + cmd
         self.executeCommand(cmd)
 
+    def probe4thAxisCommand(self, buffer=False):
+        """
+        Probe the 4th-axis headstock and set work Z to the rotation centreline.
+
+        Sent directly rather than through autoCommand because that path rejects
+        out-of-range file bounds, and this operation needs no file: the firmware
+        drives to anchor1 + coordinate.rotation_offset_x/y itself and applies
+        rotation_offset_z to the result. X and Y are required only to enter the
+        M495 parameter branch; the zprobe_abs path ignores them.
+        """
+        cmd = "M495 X0 Y0 O0"
+        if buffer:
+            cmd = "buffer " + cmd
+        self.executeCommand(cmd + "\n")
+
     def xyzProbe(self, height=9.0, diameter=3.175, buffer=False):
         cmd = "M495.3 H%g D%g" % (height, diameter)
         if buffer:

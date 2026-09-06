@@ -424,6 +424,9 @@ MACROPAD_ACTIONS: dict[str, tuple[str, str, str, bool]] = {
     "spindle_toggle": ("SPINDLE", "SPIN", "_do_spindle_toggle", False),
     "probe_z": ("PROBE Z", "PROBE", "_do_probe_z", False),
     "probe_laser": ("LASER", "LASER", "_do_probe_laser_toggle", False),
+    "level": ("LEVEL", "LEVEL", "_do_auto_level", False),
+    # Sets work Z from the headstock, so it confirms like the other zeroing actions.
+    "probe_4th": ("PROBE 4A", "PRB4A", "_do_probe_4th_axis", True),
     # Zeroing silently redefines the work origin, so it confirms by default.
     "zero_xy": ("ZERO XY", "ZEROXY", "_do_zero_xy", True),
     "zero_z": ("ZERO Z", "ZEROZ", "_do_zero_z", True),
@@ -443,6 +446,8 @@ MACROPAD_ACTION_COLORS: dict[str, int] = {
     "stop": 0xFF2000,
     "spindle_toggle": 0xFFA000,
     "probe_z": 0x00FFC0,
+    "level": 0x00C0A0,
+    "probe_4th": 0xC000FF,
     "probe_laser": 0xFF00FF,
     "zero_xy": 0xFF0080,
     "zero_z": 0xC000FF,
@@ -618,6 +623,8 @@ if MACROPAD_SUPPORTED:
             "probe_z": IDLE_ONLY,
             "zero_xy": IDLE_ONLY,
             "zero_z": IDLE_ONLY,
+            "level": IDLE_ONLY,
+            "probe_4th": IDLE_ONLY,
             "spindle_toggle": ("Idle", "Run", "Pause", "Hold"),
             "run_pause": ("Idle", "Run", "Pause", "Hold"),
         }
@@ -629,6 +636,8 @@ if MACROPAD_SUPPORTED:
             "probe_z": "NEED IDLE",
             "zero_xy": "NEED IDLE",
             "zero_z": "NEED IDLE",
+            "level": "NEED IDLE",
+            "probe_4th": "NEED IDLE",
             "spindle_toggle": "NOT READY",
             "run_pause": "NOT READY",
         }
@@ -1174,6 +1183,56 @@ if MACROPAD_SUPPORTED:
             self._controller.autoCommand(margin=True)
             if self._update_ui_on_button_press:
                 self._update_ui_on_button_press("margin")
+
+        def _do_auto_level(self) -> None:
+            """
+            Run the auto-leveling grid over the loaded file's extents.
+
+            Same command Config and Run issues, minus the requirement to be starting
+            a job -- the grid genuinely needs the file bounds, so it still asks for a
+            loaded file rather than inventing an area.
+            """
+            if self._cnc.vars.get("lasermode"):
+                self._flash_label = "LASER MODE"
+                return
+            if not self._margin_bounds_ready():
+                self._flash_label = "NO FILE"
+                return
+
+            self._controller.autoCommand(leveling=True)
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("level")
+
+        def _do_probe_4th_axis(self) -> None:
+            """
+            Probe the 4th-axis headstock and set work Z to the rotation centreline.
+
+            Needs no loaded file: the firmware drives to the headstock itself and
+            offsets the result by coordinate.rotation_offset_z.
+            """
+            if self._cnc.vars.get("lasermode"):
+                self._flash_label = "LASER MODE"
+                return
+            if not self._has_4th_axis():
+                self._flash_label = "NO 4TH AXIS"
+                return
+
+            self._controller.probe4thAxisCommand()
+            if self._update_ui_on_button_press:
+                self._update_ui_on_button_press("probe_4th")
+
+        @staticmethod
+        def _has_4th_axis() -> bool:
+            """The A axis has to be present for the headstock to be where it is expected."""
+            if App is None:
+                return bool(CNC.has_4axis)
+            try:
+                app = App.get_running_app()
+            except Exception:
+                return bool(CNC.has_4axis)
+            if app is None:
+                return bool(CNC.has_4axis)
+            return bool(getattr(app, "has_4axis", False))
 
         def _do_probe_laser_toggle(self) -> None:
             """

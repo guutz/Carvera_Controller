@@ -541,7 +541,7 @@ def test_preview_shows_the_menu_while_only_a_modifier_is_down():
     press(pendant, GOTO)
 
     banner, hint = pendant._display_context()
-    assert (banner, plain(hint)) == ("GOTO", "MARGIN|MHOME SAFEZ WHOME")
+    assert (banner, plain(hint)) == ("GOTO", "MARGIN LEVEL|MHOME SAFEZ WHOME")
 
 
 def test_preview_shows_what_releasing_now_would_do():
@@ -659,12 +659,12 @@ def test_keys_that_would_complete_a_chord_are_offered():
     plan = pendant._led_plan()
 
     pointed = pendant._pointed_target(GOTO)
-    for key in (3, 6, 7, 8):  # GOTO's targets: all offered, none dark
+    for key in (3, 4, 6, 7, 8):  # GOTO's targets: all offered, none dark
         assert plan[key][0] != 0x000000, key
     # The pointer has to be the one bright thing, not merely the brightest of several.
-    others = [brightness(plan[k][0]) for k in (3, 6, 7, 8) if k != pointed]
+    others = [brightness(plan[k][0]) for k in (3, 4, 6, 7, 8) if k != pointed]
     assert brightness(plan[pointed][0]) > 3 * max(others)
-    for key in (4, 5, ACT, SET):  # nothing GOTO combines with
+    for key in (5, ACT, SET):  # nothing GOTO combines with
         assert plan[key][0] == 0x000000, key
 
 
@@ -922,7 +922,7 @@ def test_banner_and_hint_go_out_when_supported():
     pendant._refresh_display(pendant._daemon)
 
     assert pendant._daemon.banner_calls == ["GOTO"]
-    assert plain(pendant._daemon.hint_calls[0]) == "MARGIN|MHOME SAFEZ WHOME"
+    assert plain(pendant._daemon.hint_calls[0]) == "MARGIN LEVEL|MHOME SAFEZ WHOME"
 
 
 def test_fw1_falls_back_to_text_rows():
@@ -1297,11 +1297,12 @@ def test_hint_pointer_walks_the_targets_in_key_order(monkeypatch):
     press(pendant, GOTO)
 
     pointed = []
-    for step in range(5):
+    # One step past the number of targets, so the wrap is still covered.
+    for step in range(6):
         at_step(monkeypatch, step)
         pointed.append(pendant._pointed_target(GOTO))
 
-    assert pointed == [3, 6, 7, 8, 3]  # wraps
+    assert pointed == [3, 4, 6, 7, 8, 3]  # wraps
 
 
 def test_the_bracketed_label_matches_the_lit_key(monkeypatch):
@@ -1311,7 +1312,7 @@ def test_the_bracketed_label_matches_the_lit_key(monkeypatch):
     """
     pendant = make_pendant()
     press(pendant, GOTO)
-    hint_for_key = {3: "[MARGIN]", 6: "[MHOME]", 7: "[SAFEZ]", 8: "[WHOME]"}
+    hint_for_key = {3: "[MARGIN]", 4: "[LEVEL]", 6: "[MHOME]", 7: "[SAFEZ]", 8: "[WHOME]"}
 
     for step in range(4):
         at_step(monkeypatch, step)
@@ -1375,7 +1376,11 @@ def test_targets_are_lit_in_their_own_action_colours():
 def test_an_action_keeps_its_colour_wherever_it_is_bound():
     pendant = make_pendant()
 
-    assert pendant._completion_color(4) == pendant_module.MACROPAD_ACTION_COLORS["stop"]
+    assert pendant._completion_color(4) in (
+        pendant_module.MACROPAD_ACTION_COLORS["stop"],
+        pendant_module.MACROPAD_ACTION_COLORS["level"],
+        pendant_module.MACROPAD_ACTION_COLORS["probe_4th"],
+    )
     assert pendant._completion_color(3) in (
         pendant_module.MACROPAD_ACTION_COLORS["margin"],
         pendant_module.MACROPAD_ACTION_COLORS["run_pause"],
@@ -1578,3 +1583,72 @@ class TestMacroLabels:
     def test_falls_back_when_unset(self, monkeypatch):
         label, _hint = self._labels(monkeypatch, {})
         assert label == "MACRO 1"
+
+
+class TestAutoLevelAction:
+    def test_runs_the_same_command_config_and_run_issues(self, monkeypatch):
+        pendant = make_pendant(
+            cnc_vars={"xmin": 0.0, "xmax": 50.0, "ymin": 0.0, "ymax": 50.0, "worksize_x": 200.0, "worksize_y": 200.0}
+        )
+        calls = {}
+        monkeypatch.setattr(pendant._controller, "autoCommand", lambda **kw: calls.update(kw), raising=False)
+        pendant._do_auto_level()
+        assert calls == {"leveling": True}
+
+    def test_refuses_without_a_loaded_file(self, monkeypatch):
+        """Silent nothing is a bad pendant response; the grid spans the file extents."""
+        pendant = make_pendant(
+            cnc_vars={"xmin": 1e6, "xmax": -1e6, "ymin": 1e6, "ymax": -1e6, "worksize_x": 200.0, "worksize_y": 200.0}
+        )
+        calls = []
+        monkeypatch.setattr(pendant._controller, "autoCommand", lambda **kw: calls.append(kw), raising=False)
+        pendant._do_auto_level()
+        assert calls == []
+        assert pendant._flash_label == "NO FILE"
+
+    def test_refuses_in_laser_mode(self, monkeypatch):
+        pendant = make_pendant(
+            cnc_vars={
+                "lasermode": 1,
+                "xmin": 0.0,
+                "xmax": 50.0,
+                "ymin": 0.0,
+                "ymax": 50.0,
+                "worksize_x": 200.0,
+                "worksize_y": 200.0,
+            }
+        )
+        calls = []
+        monkeypatch.setattr(pendant._controller, "autoCommand", lambda **kw: calls.append(kw), raising=False)
+        pendant._do_auto_level()
+        assert calls == []
+        assert pendant._flash_label == "LASER MODE"
+
+
+class TestProbe4thAxisAction:
+    def test_does_not_need_a_loaded_file(self, monkeypatch):
+        """
+        The firmware drives to the headstock itself, so this must work with no file --
+        which is why it bypasses autoCommand, whose bounds guard would drop it.
+        """
+        pendant = make_pendant(
+            cnc_vars={"xmin": 1e6, "xmax": -1e6, "ymin": 1e6, "ymax": -1e6, "worksize_x": 200.0, "worksize_y": 200.0}
+        )
+        monkeypatch.setattr(pendant_module.MacroPadPendant, "_has_4th_axis", staticmethod(lambda: True))
+        calls = []
+        monkeypatch.setattr(pendant._controller, "probe4thAxisCommand", lambda: calls.append(1), raising=False)
+        pendant._do_probe_4th_axis()
+        assert calls == [1]
+
+    def test_refuses_without_a_4th_axis(self, monkeypatch):
+        pendant = make_pendant()
+        monkeypatch.setattr(pendant_module.MacroPadPendant, "_has_4th_axis", staticmethod(lambda: False))
+        calls = []
+        monkeypatch.setattr(pendant._controller, "probe4thAxisCommand", lambda: calls.append(1), raising=False)
+        pendant._do_probe_4th_axis()
+        assert calls == []
+        assert pendant._flash_label == "NO 4TH AXIS"
+
+    def test_confirms_before_running(self):
+        """It rewrites work Z, so it confirms like the other zeroing actions."""
+        assert pendant_module.MACROPAD_ACTIONS["probe_4th"][3] is True
