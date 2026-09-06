@@ -49,6 +49,7 @@ class CalibrationOperationFourthY(OperationsBase):
 
 
 class CalibrationOperationFourthZ(OperationsBase):
+    precondition = "Make sure the 4th axis is on and has a pin in the chuck"
     imagePath: str
 
     def __init__(self, title, requires_x, requires_y, invert_direction, image_path, **kwargs):
@@ -64,7 +65,7 @@ class CalibrationOperationFourthZ(OperationsBase):
         config[CalibrationParameterDefinitions.YAxisDistance.code] = ""
         config[CalibrationParameterDefinitions.SideProbeDepth.code] = ""
 
-        return "M469.5 " + self.config_to_gcode(config) + "\n Make sure 4th Axis in on has a pin in the chuck"
+        return "M469.5 " + self.config_to_gcode(config)
 
     def get_missing_config(self, config: dict[str, float]):
         if self.requires_x:
@@ -86,6 +87,7 @@ class CalibrationOperationFourthZ(OperationsBase):
 
 
 class CalibrationOperationAnchor1(OperationsBase):
+    precondition = "Make sure Anchor 1 and the 3 axis probe are installed"
     imagePath: str
 
     def __init__(self, title, requires_x, requires_y, invert_direction, image_path, **kwargs):
@@ -105,7 +107,7 @@ class CalibrationOperationAnchor1(OperationsBase):
         config[CalibrationParameterDefinitions.SideProbeDepth.code] = ""
         config[CalibrationParameterDefinitions.ClearanceY.code] = ""
 
-        return "M469.1" + self.config_to_gcode(config) + "\n Make sure Anchor 1 and 3 axis probe are installed"
+        return "M469.1" + self.config_to_gcode(config)
 
     def get_missing_config(self, config: dict[str, float]):
         if self.requires_x:
@@ -127,6 +129,7 @@ class CalibrationOperationAnchor1(OperationsBase):
 
 
 class CalibrationOperationAnchor2(OperationsBase):
+    precondition = "Make sure Anchor 2 and the 3 axis probe are installed"
     imagePath: str
 
     def __init__(self, title, requires_x, requires_y, invert_direction, image_path, **kwargs):
@@ -146,7 +149,7 @@ class CalibrationOperationAnchor2(OperationsBase):
         config[CalibrationParameterDefinitions.SideProbeDepth.code] = ""
         config[CalibrationParameterDefinitions.ClearanceY.code] = ""
 
-        return "M469.2" + self.config_to_gcode(config) + "\n Make sure Anchor 2 and 3 axis probe are installed"
+        return "M469.2" + self.config_to_gcode(config)
 
     def get_missing_config(self, config: dict[str, float]):
         if self.requires_x:

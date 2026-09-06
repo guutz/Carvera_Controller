@@ -3,6 +3,10 @@ from abc import abstractmethod
 
 class OperationsBase:
     title: str = ""
+    # Shown alongside the preview. Deliberately not part of generate()'s return
+    # value: that string is sent to the machine a line at a time, so prose in it
+    # arrives as a bogus command.
+    precondition: str = ""
 
     def __init__(self, value):
         self.title = value.title

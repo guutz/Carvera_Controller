@@ -202,6 +202,10 @@ class TestSingleAxis:
 
         return SingleAxisProbeOperationType[operation].value.generate(cfg).split("\n")
 
+    @classmethod
+    def _offset_line(cls, operation, cfg):
+        return next(line for line in cls._lines(operation, cfg) if line.startswith("G10"))
+
     def test_left_side_probes_toward_positive_x(self, on_z1):
         """'Left side (X+)' travels +X, so it finds the face at the lower X."""
         lines = self._lines("Left", {"X": "10", "D": "3"})
@@ -238,12 +242,12 @@ class TestSingleAxis:
         The ball stops one radius short of the face on the near side, so the
         offset written is on the far side of the trigger point.
         """
-        assert self._lines("Left", {"X": "10", "D": "3"})[-1] == "G10 L20 P0 X-1.5"
-        assert self._lines("Right", {"X": "10", "D": "3"})[-1] == "G10 L20 P0 X1.5"
+        assert self._offset_line("Left", {"X": "10", "D": "3"}) == "G10 L20 P0 X-1.5"
+        assert self._offset_line("Right", {"X": "10", "D": "3"}) == "G10 L20 P0 X1.5"
 
     def test_z_needs_no_tip_compensation(self, on_z1):
         """Tool length was set by the same ball touching the pad."""
-        assert self._lines("WorkpieceTop", {"Z": "20", "D": "3"})[-1] == "G10 L20 P0 Z0"
+        assert self._offset_line("WorkpieceTop", {"Z": "20", "D": "3"}) == "G10 L20 P0 Z0"
 
     def test_s0_measures_without_writing_the_offset(self, on_z1):
         lines = self._lines("Left", {"X": "10", "D": "3", "S": "0"})
@@ -270,6 +274,30 @@ class TestSingleAxis:
 
         assert SingleAxisProbeOperationType["WorkpieceTop"].value.get_missing_config({"Z": "20"}) is None
 
+    def test_ends_clear_of_the_work(self, on_z1):
+        """
+        ZProbe::read_probe halts on a move made while the probe reads triggered,
+        so a cycle that stops touching turns the next jog into a crash alarm.
+        """
+        lines = self._lines("Left", {"X": "10", "D": "3"})
+        moves = [line for line in lines if line.startswith("G91 G0 ")]
+        assert moves[-1] == "G91 G0 X-1"
+
+    def test_retracts_after_writing_the_offset(self, on_z1):
+        """The offset has to capture the trigger point, not the retracted one."""
+        lines = self._lines("Left", {"X": "10", "D": "3"})
+        offset_at = next(i for i, line in enumerate(lines) if line.startswith("G10"))
+        assert any(line.startswith("G91 G0 ") for line in lines[offset_at:])
+
+    def test_measure_only_still_retracts(self, on_z1):
+        """Staying triggered is a mechanical problem, not an offset one."""
+        lines = self._lines("Left", {"X": "10", "D": "3", "S": "0"})
+        assert lines[-2] == "G91 G0 X-1"
+
+    def test_leaves_the_machine_in_absolute_mode(self, on_z1):
+        for cfg in ({"X": "10", "D": "3"}, {"X": "10", "D": "3", "S": "0"}):
+            assert self._lines("Left", cfg)[-1] == "G90"
+
     def test_carvera_still_emits_the_community_code(self, on_carvera):
         assert self._lines("Left", {"X": "10", "D": "3"})[0].startswith("M466")
 
@@ -284,3 +312,32 @@ class TestSingleAxis:
         assert gcode.startswith("G38.2 ")
         assert "L" in note  # averaging is a firmware feature of M466
         assert "F" not in note.split("Ignored on this machine: ")[-1].split("\n")[0]
+
+
+class TestPreconditionsStayOutOfGcode:
+    """
+    Preconditions used to be concatenated onto the generated G-code. Now that
+    the preview sends one command per line, prose in that string would reach
+    the machine as its own bogus command.
+    """
+
+    @pytest.mark.parametrize("operation", ["FourthZ", "Anchor1", "Anchor2"])
+    def test_calibration_gcode_carries_no_prose(self, on_carvera, operation):
+        from carveracontroller.addons.probing.operations.Calibration.CalibrationOperationType import (
+            CalibrationOperationType,
+        )
+
+        gcode = CalibrationOperationType[operation].value.generate({"X": "5"})
+        assert "Make sure" not in gcode
+        for line in gcode.split("\n"):
+            assert not line.strip() or line.strip()[0] in "GM"
+
+    def test_the_instruction_still_reaches_the_preview(self, on_carvera):
+        from carveracontroller.addons.probing.operations.Calibration.CalibrationOperationType import (
+            CalibrationOperationType,
+        )
+        from carveracontroller.addons.probing.ProbingPopup import ProbingPopup
+
+        gcode, note = ProbingPopup._generate_for_machine(None, CalibrationOperationType["Anchor1"].value, {"X": "5"})
+        assert gcode.startswith("M469.1")
+        assert "Anchor 1" in note

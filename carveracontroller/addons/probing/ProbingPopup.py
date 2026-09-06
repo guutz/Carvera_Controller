@@ -171,8 +171,13 @@ class ProbingPopup(ModalView):
         except Z1UnsupportedOperation:
             return "", tr._("This machine's firmware has no equivalent for this probing operation.")
 
+        # Preconditions used to be appended to the G-code itself, which reaches
+        # the machine as a bogus command now that lines are sent individually.
+        precondition = getattr(operation, "precondition", "")
+        preamble = ("\n\n" + tr._(precondition)) if precondition else ""
+
         if not z1_probing_active():
-            return gcode, ""
+            return gcode, preamble
 
         if gcode.startswith("M480"):
             supported = Z1_M480_PARAMS
@@ -190,10 +195,10 @@ class ProbingPopup(ModalView):
         else:
             return "", tr._("This machine's firmware has no equivalent for this probing operation.")
 
-        note = ""
+        note = preamble
         ignored = ignored_parameters(cfg, supported)
         if ignored:
-            note = "\n\n" + tr._("Ignored on this machine: ") + ", ".join(ignored)
+            note += "\n\n" + tr._("Ignored on this machine: ") + ", ".join(ignored)
         note += "\n" + origin_note
         return gcode, note
 

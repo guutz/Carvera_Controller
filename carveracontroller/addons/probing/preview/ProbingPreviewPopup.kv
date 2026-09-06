@@ -1,5 +1,5 @@
 <ProbingPreviewPopup>:
-    size_hint: 0.5, 0.4
+    size_hint: 0.5, 0.5
     pos_hint: {"right": 0.75, "top": 0.7}
     auto_dismiss: False
     overlay_color: 0,0,0,0.3
@@ -14,21 +14,31 @@
                 padding: '15dp'
                 orientation: 'vertical'
                 Label:
-                    size_hint_y: 0.4
+                    size_hint_y: None
+                    height: '30dp'
                     id: lb_title
                     text: root.title
                     bold: True
                     halign: 'center'
                     valign: 'middle'
                     text_size: self.size
-                Label:
-                    id: lb_preview
-                    text: root.probe_preview_label
-                    halign: 'center'
-                    valign: 'middle'
-                    text_size: self.width, None
-                    size_hint_y: None
-                    height: self.texture_size[1]
+                # Scrolled, because the preview is no longer always one line: a
+                # generated script plus its notes overflowed a plain Label, and
+                # a Label sized to its texture grows past the top of the popup
+                # rather than clipping.
+                ScrollView:
+                    do_scroll_x: False
+                    bar_width: dp(4)
+                    bar_inactive_color: [.7,.7,.7,.5]
+                    scroll_type: ['bars', 'content']
+                    Label:
+                        id: lb_preview
+                        text: root.probe_preview_label
+                        halign: 'center'
+                        valign: 'top'
+                        text_size: self.width, None
+                        size_hint_y: None
+                        height: self.texture_size[1]
         BoxLayout:
             orientation: 'vertical'
             spacing: '5dp'

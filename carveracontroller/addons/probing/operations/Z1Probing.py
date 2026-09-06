@@ -189,9 +189,11 @@ def generate_single_axis(axis: str, negative: bool, config: dict) -> str:
     retract = _setting(config, "R", 0.0) or _machine_number("atc.probe.retract_mm", Z1_DEFAULT_RETRACT_MM)
     tip_radius = _setting(config, "D", 0.0) / 2.0
 
+    back_off = f"G91 G0 {axis}{-direction * retract:g}"
+
     lines = [
         f"G38.2 {axis}{travel:g} F{rate:g}",
-        f"G91 G0 {axis}{-direction * retract:g}",
+        back_off,
         "G90",
         f"G38.2 {axis}{travel:g} F{rate / 2:g}",
     ]
@@ -202,5 +204,13 @@ def generate_single_axis(axis: str, negative: bool, config: dict) -> str:
         # face sits at -direction * radius in the new work coordinates.
         offset = 0.0 if axis == "Z" else -direction * tip_radius
         lines.append(f"G10 L20 P0 {axis}{offset:g}")
+
+    # Leave the probe clear of the work. ZProbe::read_probe runs a motion guard
+    # that stops the motors and halts whenever the probe reads triggered during
+    # a move that is not itself a probe, so ending the cycle still touching
+    # turns the next jog into a "3D probe crash" alarm. The machine's own
+    # cycles retract here too (fill_OutCorner_scripts, after its G10 L20).
+    lines.append(back_off)
+    lines.append("G90")
 
     return "\n".join(lines)
