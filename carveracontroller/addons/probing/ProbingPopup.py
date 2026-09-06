@@ -100,7 +100,14 @@ class ProbingPopup(ModalView):
         return
 
     def refresh_probe_tip_diameter_hints(self):
-        hint = get_machine_config_hint("zprobe.probe_tip_diameter") or tr._("config")
+        # zprobe.probe_tip_diameter is a Community firmware config key and does
+        # not exist on a Z1, so "config" would point at a setting the machine
+        # has not got. Offer the firmware's own M480 default instead -- it is a
+        # starting point, not a measured value; pre-travel means the effective
+        # diameter is smaller than the ball.
+        hint = get_machine_config_hint("zprobe.probe_tip_diameter")
+        if not hint:
+            hint = tr._("2 = default") if z1_probing_active() else tr._("config")
         for settings in self._settings_panels:
             if settings and "ProbeTipDiameter" in settings.ids:
                 settings.ids.ProbeTipDiameter.hint_text = hint
