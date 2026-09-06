@@ -8196,6 +8196,10 @@ class Makera(RelativeLayout):
             "tool_change": tr._("- No tool change (M6)"),
             "feed": tr._("- No feed rate (F)"),
             "spindle_speed": tr._("- No spindle speed (M3 S...)"),
+            "relative_mode": tr._(
+                "- No G90/G91, and the machine is in relative mode (G91) — absolute moves would be treated as offsets"
+            ),
+            "unit_mismatch": tr._("- No G20/G21, and the machine's units are not this file's units"),
         }
         lines = [messages[key] for key in warning_keys if key in messages]
         if not lines:
@@ -8222,7 +8226,9 @@ class Makera(RelativeLayout):
             self.show_message_popup(tr._(f"Resume-at-line cannot run:\n\n{e}"), False)
             return
         commands_preview = "\n".join(commands)
-        warning_text = self._resume_playback_warning_text(self.controller.resume_playback_warnings(commands))
+        warning_text = self._resume_playback_warning_text(
+            self.controller.resume_playback_warnings(commands, document_unit=self.document_unit)
+        )
 
         self.confirm_popup.size_hint = (0.8, 0.8)
         self.confirm_popup.pos_hint = {"center_x": 0.5, "center_y": 0.5}

@@ -1236,7 +1236,7 @@ class Controller:
             warnings.append("zprobe_overwrites_z")
         return warnings
 
-    def resume_playback_warnings(self, commands):
+    def resume_playback_warnings(self, commands, document_unit=None):
         """
         Inspect resume-at-line command preview and return missing-state warning keys.
 
@@ -1244,6 +1244,18 @@ class Controller:
           - "tool_change": no M6 tool change in the recovery sequence
           - "feed": no G1 F feed rate restored
           - "spindle_speed": no M3 S spindle speed restored (skipped for laser/M321)
+          - "relative_mode": nothing restores G90/G91 and the machine is in G91
+          - "unit_mismatch": nothing restores G20/G21 and the machine's units are
+            not the file's
+
+        The last two compare the reconstruction against live machine state rather
+        than replacing it with live state. Restoring what the machine happens to be
+        in would be wrong: the preamble's job is to recreate the modal state the
+        *file* had established by the resume line, and a probe cycle or MDI command
+        in between can easily have left the machine somewhere else. But where the
+        file establishes nothing, the machine's current mode is what the job will
+        actually run under -- and that is worth saying out loud, because a file of
+        absolute moves resumed in G91 treats every coordinate as an offset.
         """
         if not commands:
             return ["tool_change", "feed", "spindle_speed"]
@@ -1257,6 +1269,20 @@ class Controller:
         # Laser mode does not use spindle S recovery
         if not re.search(r"\bM321\b", joined) and not re.search(r"\bM0*3\s+S\d", joined):
             warnings.append("spindle_speed")
+
+        # G90 -> absolute_mode 1, G91 -> 0 (Robot.cpp). Absent means "not reported
+        # yet", which is not evidence of anything, so it is not warned about.
+        if not re.search(r"\bG0*9[01]\b", joined):
+            absolute = CNC.vars.get("absolute_mode")
+            if absolute is not None and int(absolute) == 0:
+                warnings.append("relative_mode")
+
+        # G20 -> inch_mode 1, G21 -> 0.
+        if document_unit and not re.search(r"\bG0*2[01]\b", joined):
+            inch = CNC.vars.get("inch_mode")
+            # 999 is the "unknown" sentinel the status parser already special-cases.
+            if inch is not None and int(inch) != 999 and (document_unit == "in") != bool(int(inch)):
+                warnings.append("unit_mismatch")
         return warnings
 
     def playStartLineCommand(self, filename, start_line, preview=False, lines=None, has_ocodes=False):
