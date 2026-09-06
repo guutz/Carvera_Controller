@@ -185,3 +185,102 @@ class TestPreviewGuard:
         gcode, note = self._generate(OutsideCornerOperationType["TopLeft"].value, dict(BASE))
         assert gcode.startswith("M464")
         assert note == ""
+
+
+class TestSingleAxis:
+    """
+    The Z1 has no single-axis macro, so the cycle is generated from G38.2.
+    Direction matters twice over: the probe travels one way, and the tip
+    radius compensation goes the other.
+    """
+
+    @staticmethod
+    def _lines(operation, cfg):
+        from carveracontroller.addons.probing.operations.SingleAxis.SingleAxisProbeOperationType import (
+            SingleAxisProbeOperationType,
+        )
+
+        return SingleAxisProbeOperationType[operation].value.generate(cfg).split("\n")
+
+    def test_left_side_probes_toward_positive_x(self, on_z1):
+        """'Left side (X+)' travels +X, so it finds the face at the lower X."""
+        lines = self._lines("Left", {"X": "10", "D": "3"})
+        assert lines[0].startswith("G38.2 X10 ")
+
+    def test_right_side_probes_toward_negative_x(self, on_z1):
+        assert self._lines("Right", {"X": "10", "D": "3"})[0].startswith("G38.2 X-10 ")
+
+    def test_top_side_probes_toward_negative_y(self, on_z1):
+        assert self._lines("Top", {"Y": "10", "D": "3"})[0].startswith("G38.2 Y-10 ")
+
+    def test_bottom_side_probes_toward_positive_y(self, on_z1):
+        assert self._lines("Bottom", {"Y": "10", "D": "3"})[0].startswith("G38.2 Y10 ")
+
+    def test_workpiece_top_probes_downward(self, on_z1):
+        assert self._lines("WorkpieceTop", {"Z": "20"})[0].startswith("G38.2 Z-20 ")
+
+    def test_retract_backs_away_from_the_face(self, on_z1):
+        """Probing +X must retract -X, or the second tap starts already touching."""
+        assert self._lines("Left", {"X": "10", "D": "3"})[1] == "G91 G0 X-1"
+        assert self._lines("Right", {"X": "10", "D": "3"})[1] == "G91 G0 X1"
+
+    def test_relative_mode_is_handed_back(self, on_z1):
+        """G91 is modal; leaving it set would make the next command relative."""
+        assert "G90" in self._lines("Left", {"X": "10", "D": "3"})
+
+    def test_second_tap_is_slower_than_the_first(self, on_z1):
+        lines = self._lines("Left", {"X": "10", "D": "3", "F": "200"})
+        assert lines[0].endswith("F200")
+        assert lines[3].endswith("F100")
+
+    def test_tip_compensation_opposes_the_travel(self, on_z1):
+        """
+        The ball stops one radius short of the face on the near side, so the
+        offset written is on the far side of the trigger point.
+        """
+        assert self._lines("Left", {"X": "10", "D": "3"})[-1] == "G10 L20 P0 X-1.5"
+        assert self._lines("Right", {"X": "10", "D": "3"})[-1] == "G10 L20 P0 X1.5"
+
+    def test_z_needs_no_tip_compensation(self, on_z1):
+        """Tool length was set by the same ball touching the pad."""
+        assert self._lines("WorkpieceTop", {"Z": "20", "D": "3"})[-1] == "G10 L20 P0 Z0"
+
+    def test_s0_measures_without_writing_the_offset(self, on_z1):
+        lines = self._lines("Left", {"X": "10", "D": "3", "S": "0"})
+        assert not any(line.startswith("G10") for line in lines)
+
+    def test_tip_diameter_is_required_for_xy(self, on_z1):
+        """
+        zprobe.probe_tip_diameter does not exist on a Z1, so there is no
+        machine-side fallback and an uncompensated probe would be off by the
+        ball radius.
+        """
+        from carveracontroller.addons.probing.operations.SingleAxis.SingleAxisProbeOperationType import (
+            SingleAxisProbeOperationType,
+        )
+
+        missing = SingleAxisProbeOperationType["Left"].value.get_missing_config({"X": "10"})
+        assert missing is not None
+        assert missing.code == "D"
+
+    def test_tip_diameter_is_not_required_for_z(self, on_z1):
+        from carveracontroller.addons.probing.operations.SingleAxis.SingleAxisProbeOperationType import (
+            SingleAxisProbeOperationType,
+        )
+
+        assert SingleAxisProbeOperationType["WorkpieceTop"].value.get_missing_config({"Z": "20"}) is None
+
+    def test_carvera_still_emits_the_community_code(self, on_carvera):
+        assert self._lines("Left", {"X": "10", "D": "3"})[0].startswith("M466")
+
+    def test_preview_reports_firmware_only_parameters(self, on_z1):
+        from carveracontroller.addons.probing.operations.SingleAxis.SingleAxisProbeOperationType import (
+            SingleAxisProbeOperationType,
+        )
+        from carveracontroller.addons.probing.ProbingPopup import ProbingPopup
+
+        cfg = {"X": "10", "D": "3", "L": "3", "F": "200"}
+        gcode, note = ProbingPopup._generate_for_machine(None, SingleAxisProbeOperationType["Left"].value, cfg)
+        assert gcode.startswith("G38.2 ")
+        assert "L" in note  # averaging is a firmware feature of M466
+        assert "F" not in note.split("Ignored on this machine: ")[-1].split("\n")[0]

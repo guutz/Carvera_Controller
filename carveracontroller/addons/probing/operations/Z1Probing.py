@@ -47,6 +47,14 @@ from carveracontroller.CNC import CNC, Z1_PROBE_3D_TOOL_NUMBER
 # G-code letters M480 understands, in emission order.
 Z1_SUPPORTED_PARAMS = ("D", "X", "Y", "Z")
 
+# Probing-screen parameter codes each kind of generated output actually honours.
+# Anything else the user set is reported rather than dropped in silence.
+Z1_M480_PARAMS = frozenset({"D", "X", "Y", "E"})
+# The single-axis script is generated here, so F (feed), R (retract) and S
+# (whether to write the offset) are honoured. L (repeat/average), I (normally
+# closed) and Q (angle) are not: they are firmware features of M466.
+Z1_SINGLE_AXIS_PARAMS = frozenset({"X", "Y", "Z", "D", "F", "R", "S"})
+
 # Probing-screen parameter codes that map onto an M480 letter.
 #   D (tip diameter) and X/Y (probe distances) keep their letter.
 #   E ("how far below the top surface ... to probe on each side") is M480's Z.
@@ -70,6 +78,20 @@ Z1_INSIDE_CORNER_SUBCODES = {
 
 Z1_BORE_SUBCODE = "9"  # inside pocket, both axes
 Z1_BOSS_SUBCODE = "10"  # outside pocket, both axes
+
+# Single-axis probing has no Z1 macro, so it is generated as a short script of
+# the primitives the Z1 does have. These match the machine's own idiom in
+# fill_OutCorner_scripts: tap, retract, re-tap at half rate, set the offset.
+#
+# G38.2 takes a *delta* (ZProbe::probe_XYZ builds `float delta[3]`), so the
+# distance is unaffected by G90/G91, and its F is mm/min (divided by 60 on
+# arrival). The G91 used for the retract is handed back to G90 afterwards so a
+# later command is not silently relative.
+#
+# Defaults below are the Z1 firmware's own config defaults, used only when the
+# machine has not reported a value.
+Z1_DEFAULT_PROBE_RATE_MM_M = 100.0  # atc.probe.slow_rate_mm_m
+Z1_DEFAULT_RETRACT_MM = 1.0  # atc.probe.retract_mm
 
 
 class Z1UnsupportedOperation(Exception):
@@ -109,12 +131,76 @@ def generate_m480(subcode: str, config: dict) -> str:
     return f"M480.{subcode}" + ("" if not parts else " " + " ".join(parts))
 
 
-def ignored_parameters(config: dict) -> list[str]:
+def ignored_parameters(config: dict, supported=Z1_M480_PARAMS) -> list[str]:
     """
-    Parameter codes the user set that M480 has no equivalent for.
+    Parameter codes the user set that the generated command cannot honour.
 
     Returned so the preview can name them rather than let the operation appear
-    to honour settings it cannot.
+    to respect settings it does not.
     """
-    mapped = set(Z1_PARAM_SOURCES.values())
-    return sorted(code for code, value in config.items() if code not in mapped and str(value).strip())
+    return sorted(code for code, value in config.items() if code not in supported and str(value).strip())
+
+
+def _machine_number(key: str, fallback: float) -> float:
+    """A number from the machine's own config, or *fallback* if unavailable."""
+    from carveracontroller.addons.probing.operations.ConfigUtils import get_machine_config_hint
+
+    try:
+        return float(get_machine_config_hint(key))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _setting(config: dict, code: str, fallback: float) -> float:
+    try:
+        return float(str(config.get(code, "")).strip())
+    except (TypeError, ValueError):
+        return fallback
+
+
+def probe_tip_diameter_required(axis: str, config: dict) -> bool:
+    """
+    True when a tip diameter is needed but absent.
+
+    The Community firmware reads zprobe.probe_tip_diameter from machine config
+    and compensates internally. That key does not exist on a Z1, and the
+    compensation here is generated host-side, so an X/Y probe without a
+    diameter would put the work offset out by the ball radius. Z is exempt:
+    tool length is already set from the same ball touching the pad, so the
+    trigger point is the surface.
+    """
+    if axis == "Z":
+        return False
+    return _setting(config, "D", 0.0) <= 0.0
+
+
+def generate_single_axis(axis: str, negative: bool, config: dict) -> str:
+    """
+    Build a double-tap probe along one axis, ending with the work offset set.
+
+    *negative* is the direction of travel, matching the operation's own flag --
+    "Left side (X+)" probes toward +X and so finds the face at the lower X.
+    """
+    distance = abs(_setting(config, axis, 0.0))
+    travel = -distance if negative else distance
+    direction = -1.0 if negative else 1.0
+
+    rate = _setting(config, "F", 0.0) or _machine_number("atc.probe.slow_rate_mm_m", Z1_DEFAULT_PROBE_RATE_MM_M)
+    retract = _setting(config, "R", 0.0) or _machine_number("atc.probe.retract_mm", Z1_DEFAULT_RETRACT_MM)
+    tip_radius = _setting(config, "D", 0.0) / 2.0
+
+    lines = [
+        f"G38.2 {axis}{travel:g} F{rate:g}",
+        f"G91 G0 {axis}{-direction * retract:g}",
+        "G90",
+        f"G38.2 {axis}{travel:g} F{rate / 2:g}",
+    ]
+
+    # S0 measures without writing the offset; G38.2 still reports [PRB:...].
+    if str(config.get("S", "")).strip() != "0":
+        # The ball stops one radius short of the face, on the near side, so the
+        # face sits at -direction * radius in the new work coordinates.
+        offset = 0.0 if axis == "Z" else -direction * tip_radius
+        lines.append(f"G10 L20 P0 {axis}{offset:g}")
+
+    return "\n".join(lines)

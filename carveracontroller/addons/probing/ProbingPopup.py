@@ -26,7 +26,13 @@ from .operations.ProbeTip.ProbeTipOperationType import ProbeTipOperationType
 from .operations.ProbeTip.ProbeTipSettings import ProbeTipSettings
 from .operations.SingleAxis.SingleAxisProbeOperationType import SingleAxisProbeOperationType
 from .operations.SingleAxis.SingleAxisProbeSettings import SingleAxisProbeSettings
-from .operations.Z1Probing import Z1UnsupportedOperation, ignored_parameters, z1_probing_active
+from .operations.Z1Probing import (
+    Z1_M480_PARAMS,
+    Z1_SINGLE_AXIS_PARAMS,
+    Z1UnsupportedOperation,
+    ignored_parameters,
+    z1_probing_active,
+)
 from .preview.ProbingPreviewPopup import ProbingPreviewPopup
 
 logger = logging.getLogger(__name__)
@@ -161,16 +167,27 @@ class ProbingPopup(ModalView):
         if not z1_probing_active():
             return gcode, ""
 
-        if not gcode.startswith("M480"):
+        if gcode.startswith("M480"):
+            supported = Z1_M480_PARAMS
+            # M480 always writes the work offset and returns to it; the
+            # Community firmware's S option to probe without zeroing has no
+            # equivalent here.
+            origin_note = tr._("This sets the work origin and finishes at X0 Y0.")
+        elif gcode.startswith("G38."):
+            supported = Z1_SINGLE_AXIS_PARAMS
+            origin_note = (
+                tr._("This sets the work origin on this axis.")
+                if "G10 L20" in gcode
+                else tr._("This measures only and does not change the work origin.")
+            )
+        else:
             return "", tr._("This machine's firmware has no equivalent for this probing operation.")
 
         note = ""
-        ignored = ignored_parameters(cfg)
+        ignored = ignored_parameters(cfg, supported)
         if ignored:
             note = "\n\n" + tr._("Ignored on this machine: ") + ", ".join(ignored)
-        # M480 always writes the work offset; the Community firmware's S option
-        # to probe without zeroing has no equivalent.
-        note += "\n" + tr._("This sets the work origin and finishes at X0 Y0.")
+        note += "\n" + origin_note
         return gcode, note
 
     def show_preview(self, operation: OperationsBase, cfg):

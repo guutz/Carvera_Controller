@@ -34,7 +34,13 @@ class ProbingPreviewPopup(ModalView):
     def start_probing(self):
         if len(self.gcode) > 0:
             logger.debug("running gcode: " + self.gcode)
-            self.controller.executeCommand(self.gcode + "\n")
+            # One command per line. The Makera protocol frames a whole payload
+            # as a single CTRL_MULTI message, so a multi-line blob would arrive
+            # as one frame rather than as separate G-code lines. Operations that
+            # build a script (the Z1 single-axis probe) depend on this.
+            for line in self.gcode.splitlines():
+                if line.strip():
+                    self.controller.executeCommand(line + "\n")
         else:
             logger.error("no gcode")
 
