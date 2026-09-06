@@ -750,10 +750,33 @@ if MACROPAD_SUPPORTED:
                 if handler_name.startswith("macro:"):
                     macro_id = int(handler_name.split(":", 1)[1])
                     handler = lambda macro_id=macro_id: self.run_macro(macro_id)
+                    label, hint = self._macro_labels(macro_id, label, hint)
                 else:
                     handler = getattr(self, handler_name)
                 specs[name] = (label, hint, handler, confirms)
             return specs
+
+        # Banner and hint widths, matching the conventions in MACROPAD_ACTIONS.
+        MACRO_LABEL_CHARS = 8
+        MACRO_HINT_CHARS = 6
+
+        def _macro_labels(self, macro_id: int, default_label: str, default_hint: str) -> tuple[str, str]:
+            """
+            Show the macro's own name rather than "MACRO 3".
+
+            The name is already captured by the settings editor, and a pendant that
+            announces a number defeats the point of saying what is about to happen.
+            Falls back to the generic label for an unnamed or unparseable macro.
+            """
+            try:
+                raw = Config.get("carvera", f"pendant_macro_{macro_id}")
+                name = (json.loads(raw).get("name") or "").strip() if raw else ""
+            except Exception:
+                return default_label, default_hint
+            if not name:
+                return default_label, default_hint
+            upper = name.upper()
+            return upper[: self.MACRO_LABEL_CHARS], upper[: self.MACRO_HINT_CHARS]
 
         def _layout_search_paths(self) -> list[str]:
             """

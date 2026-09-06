@@ -1536,3 +1536,45 @@ def test_offered_keys_do_not_animate_against_the_pointer():
     offered = set(pendant._targets_for(ACT))
 
     assert {plan[key][1] for key in offered} == {"solid"}
+
+
+class TestMacroLabels:
+    """
+    A pendant that announces "MACRO 1" defeats the point of showing what is
+    about to happen, and the name is already captured by the settings editor.
+    """
+
+    @staticmethod
+    def _labels(monkeypatch, stored):
+        pendant = make_pendant()
+
+        def fake_get(section, key):
+            return stored.get(key)
+
+        monkeypatch.setattr(pendant_module.Config, "get", staticmethod(fake_get))
+        specs = pendant._action_specs()
+        label, hint, _handler, _confirms = specs["macro_1"]
+        return label, hint
+
+    def test_uses_the_macro_name(self, monkeypatch):
+        label, hint = self._labels(monkeypatch, {"pendant_macro_1": '{"name": "Probe 4th", "gcode": "M495 X0 Y0 O0"}'})
+        assert label == "PROBE 4T"
+        assert hint == "PROBE "
+
+    def test_falls_back_when_unnamed(self, monkeypatch):
+        label, hint = self._labels(monkeypatch, {"pendant_macro_1": '{"gcode": "M3"}'})
+        assert label == "MACRO 1"
+        assert hint == "MAC1"
+
+    def test_falls_back_on_blank_name(self, monkeypatch):
+        label, _hint = self._labels(monkeypatch, {"pendant_macro_1": '{"name": "   ", "gcode": "M3"}'})
+        assert label == "MACRO 1"
+
+    def test_falls_back_on_unparseable_setting(self, monkeypatch):
+        """A corrupt macro must not take the pendant down on connect."""
+        label, _hint = self._labels(monkeypatch, {"pendant_macro_1": "not json"})
+        assert label == "MACRO 1"
+
+    def test_falls_back_when_unset(self, monkeypatch):
+        label, _hint = self._labels(monkeypatch, {})
+        assert label == "MACRO 1"
