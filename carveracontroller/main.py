@@ -3470,6 +3470,7 @@ class Makera(RelativeLayout):
         # init camera live view
         self.camera_checked = False
         self.camera_probe = 0
+        self.camera_host = ""
         self.camera_stream = Z1Camera(
             on_frame=self._show_camera_frame,
             on_streaming=self._set_camera_streaming,
@@ -6704,6 +6705,7 @@ class Makera(RelativeLayout):
                     CNC.probe_3d_tool = PROBE_3D_TOOL_NUMBER
                     app.supports_camera = False
                     self.camera_checked = False
+                    self.camera_host = ""
                     self.camera_probe += 1  # discard the result of a probe still in flight
                     self.camera_stream.stop()
                     if self.gcode_viewer is not None:
@@ -6756,14 +6758,13 @@ class Makera(RelativeLayout):
                     # Reset manual disconnect flag since we're now connected
                     self.controller._manual_disconnect = False
 
-                    # Look for a camera, only one time per connection
-                    if not self.camera_checked and self.controller.connection_type == CONN_WIFI:
+                    # Look for a camera, only one time per connection. Not limited to
+                    # WiFi: the address is resolved on the probe thread, which can
+                    # discover it for a USB-attached machine.
+                    if not self.camera_checked:
                         self.camera_checked = True
                         self.camera_probe += 1
-                        host = self.controller.connection_address.split(":")[0]
-                        threading.Thread(
-                            target=self._detect_camera, args=(host, self.camera_probe), daemon=True
-                        ).start()
+                        threading.Thread(target=self._detect_camera, args=(self.camera_probe,), daemon=True).start()
 
                 self.status_drop_down.btn_unlock.disabled = app.state != "Alarm" and app.state != "Sleep"
                 if (CNC.vars["halt_reason"] in HALT_REASON and CNC.vars["halt_reason"] > 20) or app.state == "Sleep":
@@ -7814,6 +7815,7 @@ class Makera(RelativeLayout):
             self.handle_pendant_connected,
             self.handle_pendant_disconnected,
             self.handle_pendant_button_press,
+            toggle_camera=self.toggle_camera_stream,
         )
 
         if self.controller.jog_mode == Controller.JOG_MODE_CONTINUOUS:
@@ -8362,8 +8364,8 @@ class Makera(RelativeLayout):
             return
         if self.camera_stream.is_streaming():
             self.camera_stream.stop()
-        elif App.get_running_app().supports_camera:
-            self.camera_stream.start(self.controller.connection_address.split(":")[0])
+        elif App.get_running_app().supports_camera and self.camera_host:
+            self.camera_stream.start(self.camera_host)
 
     # -----------------------------------------------------------------------
     def _on_camera_splitter_collapsed(self, _splitter, collapsed):
@@ -8373,19 +8375,47 @@ class Makera(RelativeLayout):
             controls = self.ids.get("camera_controls")
             if controls is not None:
                 controls.adjust_open = False
-        elif App.get_running_app().supports_camera and not self.camera_stream.is_streaming():
-            self.camera_stream.start(self.controller.connection_address.split(":")[0])
+        elif App.get_running_app().supports_camera and self.camera_host and not self.camera_stream.is_streaming():
+            self.camera_stream.start(self.camera_host)
 
     # -----------------------------------------------------------------------
-    def _detect_camera(self, host, probe):
-        found = has_camera(host)
-        Clock.schedule_once(partial(self._on_camera_detected, probe, found), 0)
+    def _resolve_camera_host(self):
+        """
+        Address the camera answers on, or "" if there is not one.
+
+        Blocking; runs on the probe thread. The camera is served by the WiFi
+        module, so a USB connection has no address to offer -- connection_address
+        is a serial port. Machines broadcast themselves regardless of how the
+        controller is attached, so discovery supplies what the USB link cannot.
+        """
+        if self.controller.connection_type == CONN_WIFI:
+            return self.controller.connection_address.split(":")[0]
+
+        machines = MachineDetector.discover_machines()
+        if len(machines) == 1:
+            return machines[0]["ip"]
+        if machines:
+            # Nothing ties a broadcast to the machine on the other end of the
+            # serial port, and showing the wrong machine's camera is worse than
+            # showing none.
+            logger.info(
+                "Several machines announced themselves (%s); cannot tell which is on USB, so no camera",
+                ", ".join(m["machine"] for m in machines),
+            )
+        return ""
 
     # -----------------------------------------------------------------------
-    def _on_camera_detected(self, probe, found, *args):
+    def _detect_camera(self, probe):
+        host = self._resolve_camera_host()
+        found = bool(host) and has_camera(host)
+        Clock.schedule_once(partial(self._on_camera_detected, probe, host if found else "", found), 0)
+
+    # -----------------------------------------------------------------------
+    def _on_camera_detected(self, probe, host, found, *args):
         """Ignore a probe that a disconnect or a newer probe has superseded."""
         if probe != self.camera_probe:
             return
+        self.camera_host = host
         App.get_running_app().supports_camera = found
         splitter = self.ids.get("camera_splitter")
         if splitter is None:
@@ -8407,8 +8437,9 @@ class Makera(RelativeLayout):
         if value is None or value == app.camera_resolution:
             return
         app.camera_resolution = value
-        host = self.controller.connection_address.split(":")[0]
-        threading.Thread(target=set_resolution, args=(host, value), daemon=True).start()
+        if not self.camera_host:
+            return
+        threading.Thread(target=set_resolution, args=(self.camera_host, value), daemon=True).start()
 
     # -----------------------------------------------------------------------
     def _show_camera_frame(self, jpeg):

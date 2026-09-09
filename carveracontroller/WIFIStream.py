@@ -26,6 +26,48 @@ class MachineDetector:
         self.t = None
         self.tr = None
 
+    @staticmethod
+    def discover_machines(timeout=3.0):
+        """
+        Listen for machine broadcasts and return [{machine, ip, port, busy}].
+
+        Blocking, for callers already on a worker thread; query_for_machines and
+        check_for_responses are the Clock-driven pair used by the connect menu.
+        Machines announce themselves regardless of how the controller is attached,
+        so this is how a USB-connected machine's IP can be found -- the camera
+        lives on the WiFi module and needs an address the USB link cannot give.
+        """
+        found = {}
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.bind(("0.0.0.0", UDP_PORT))
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    data, _addr = sock.recvfrom(BUFFER_SIZE)
+                except (TimeoutError, OSError):
+                    continue
+                fields = data.decode("utf-8", "replace").split(",")
+                if len(fields) > 3 and fields[0] not in found:
+                    found[fields[0]] = {
+                        "machine": fields[0],
+                        "ip": fields[1],
+                        "port": int(fields[2]) if fields[2].isdigit() else 0,
+                        "busy": fields[3] == "1",
+                    }
+        except OSError as e:
+            # Port 3333 is already held when the connect menu is open. Not fatal.
+            logger.info("Machine discovery unavailable: %s", e)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        return list(found.values())
+
     def is_machine_busy(self, addr):
         """Tries to connect to the machine, if machine is available returns true else false"""
         try:
