@@ -956,6 +956,11 @@ if MACROPAD_SUPPORTED:
         def _targets_for(self, modifier: int) -> dict[int, _PendantTarget]:
             return self._targets.get(modifier, {})
 
+        @staticmethod
+        def _jog_step_unit(axis: str) -> str:
+            """A is rotary, so its step is degrees; calling it mm on the OLED is a lie."""
+            return "deg" if axis == "A" else "mm"
+
         def _stroke_jog_axis(self) -> str | None:
             """
             Axis to jog for the stroke in progress.
@@ -1221,9 +1226,22 @@ if MACROPAD_SUPPORTED:
             if self._update_ui_on_button_press:
                 self._update_ui_on_button_press("probe_4th")
 
-        @staticmethod
-        def _has_4th_axis() -> bool:
-            """The A axis has to be present for the headstock to be where it is expected."""
+        def _has_4th_axis(self) -> bool:
+            """
+            Whether this machine has a 4th axis fitted.
+
+            Not app.has_4axis: that is set by the G-code parser when it meets an A
+            word and means "the loaded program is 4-axis", so it is false with no
+            file open and false for a 3-axis job on a machine that has a rotary.
+
+            Nothing reports the hardware. The firmware knows -- Endstops.cpp sets
+            axis_is_on[A_AXIS] while homing -- but never puts it in the status
+            string, and MPos always carries A and B regardless. So the source of
+            truth is the user's own declaration, which is the pendant's A-axis
+            setting; a 4-axis program counts as a second yes.
+            """
+            if self._show_a_axis:
+                return True
             if App is None:
                 return bool(CNC.has_4axis)
             try:
@@ -1393,7 +1411,7 @@ if MACROPAD_SUPPORTED:
                 pos = self._safe_number(self._cnc.vars.get(f"w{axis.lower()}", 0), -1e6, 1e6)
                 return (
                     f"{axis}{pos:>{self.JOG_READOUT_WIDTH}.3f}",
-                    f"JOG {axis}  STEP {self.current_step_size:g}mm",
+                    f"JOG {axis}  STEP {self.current_step_size:g}{self._jog_step_unit(axis)}",
                 )
 
             if self._stroke_keys:

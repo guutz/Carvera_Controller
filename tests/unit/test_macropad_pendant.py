@@ -1634,7 +1634,7 @@ class TestProbe4thAxisAction:
         pendant = make_pendant(
             cnc_vars={"xmin": 1e6, "xmax": -1e6, "ymin": 1e6, "ymax": -1e6, "worksize_x": 200.0, "worksize_y": 200.0}
         )
-        monkeypatch.setattr(pendant_module.MacroPadPendant, "_has_4th_axis", staticmethod(lambda: True))
+        monkeypatch.setattr(pendant_module.MacroPadPendant, "_has_4th_axis", lambda self: True)
         calls = []
         monkeypatch.setattr(pendant._controller, "probe4thAxisCommand", lambda: calls.append(1), raising=False)
         pendant._do_probe_4th_axis()
@@ -1642,7 +1642,7 @@ class TestProbe4thAxisAction:
 
     def test_refuses_without_a_4th_axis(self, monkeypatch):
         pendant = make_pendant()
-        monkeypatch.setattr(pendant_module.MacroPadPendant, "_has_4th_axis", staticmethod(lambda: False))
+        monkeypatch.setattr(pendant_module.MacroPadPendant, "_has_4th_axis", lambda self: False)
         calls = []
         monkeypatch.setattr(pendant._controller, "probe4thAxisCommand", lambda: calls.append(1), raising=False)
         pendant._do_probe_4th_axis()
@@ -1652,3 +1652,79 @@ class TestProbe4thAxisAction:
     def test_confirms_before_running(self):
         """It rewrites work Z, so it confirms like the other zeroing actions."""
         assert pendant_module.MACROPAD_ACTIONS["probe_4th"][3] is True
+
+
+class TestFourthAxisDetection:
+    """
+    app.has_4axis is set by the G-code parser when it meets an A word, so it means
+    "the loaded program is 4-axis", not "this machine has a rotary fitted". Gating
+    the headstock probe on it refused the action for anyone who had the hardware
+    but no 4-axis file open.
+    """
+
+    @staticmethod
+    def _pendant(show_a_axis, file_is_4axis=False):
+        pendant = make_pendant()
+        pendant._show_a_axis = show_a_axis
+        pendant_module.CNC.has_4axis = file_is_4axis
+        return pendant
+
+    def test_the_pendant_setting_is_enough(self):
+        """Hardware presence is not reported by anything, so the user declares it."""
+        assert self._pendant(show_a_axis=True)._has_4th_axis()
+
+    def test_a_4_axis_file_also_counts(self):
+        assert self._pendant(show_a_axis=False, file_is_4axis=True)._has_4th_axis()
+
+    def test_neither_means_no(self):
+        assert not self._pendant(show_a_axis=False, file_is_4axis=False)._has_4th_axis()
+
+
+class TestFourthAxisJog:
+    """
+    MACROPAD_JOG_AXES has always included "A"; nothing bound it. These cover the
+    path end to end so a layout that maps a key to A actually jogs the rotary.
+    """
+
+    @staticmethod
+    def _pendant_with_a_jog():
+        pendant = make_pendant(cnc_vars={"wa": 12.345})
+        # Key 5 as the A jog key, as a custom layout would set it.
+        pendant._jog_keys = {0: "X", 1: "Y", 2: "Z", 5: "A"}
+        return pendant
+
+    def test_a_key_bound_to_a_jogs_the_rotary(self):
+        pendant = self._pendant_with_a_jog()
+        press(pendant, 5)
+        pendant._handle_encoder_delta(pendant._daemon, 2)
+        assert pendant._controller.calls == [("jog", "A0.2")]
+
+    def test_the_readout_shows_the_a_position(self):
+        pendant = self._pendant_with_a_jog()
+        press(pendant, 5)
+        banner, hint = pendant._display_context()
+        assert banner.startswith("A")
+        assert "12.345" in banner
+
+    def test_the_step_is_labelled_in_degrees(self):
+        """A rotary step is not millimetres."""
+        pendant = self._pendant_with_a_jog()
+        press(pendant, 5)
+        _banner, hint = pendant._display_context()
+        assert "deg" in hint
+        assert "mm" not in hint
+
+    def test_linear_axes_are_still_millimetres(self):
+        pendant = self._pendant_with_a_jog()
+        press(pendant, 0)
+        _banner, hint = pendant._display_context()
+        assert "mm" in hint
+
+    def test_an_a_jog_layout_validates(self):
+        """The validator has to accept A, and still keep chords off the jog keys."""
+        layout = {
+            "version": 1,
+            "jog": {"0": "X", "1": "Y", "2": "Z", "5": "A"},
+            "modifiers": {"9": {"name": "GOTO", "targets": {"3": "margin"}}},
+        }
+        pendant_module.validate_macropad_layout(layout)

@@ -200,8 +200,8 @@
     },
     {
         "type": "bool",
-        "title": "MacroPad: Show 4th Axis On Screen",
-        "desc": "Add an A axis row to the pendant readout. The display only has six rows, so enabling this drops the feed/spindle row.",
+        "title": "MacroPad: Machine Has A 4th Axis",
+        "desc": "Add an A axis row to the pendant readout, and enable the 4th-axis actions. The display only has six rows, so enabling this drops the feed/spindle row.",
         "section": "carvera",
         "key": "macropad_show_a_axis",
         "default": "false",
