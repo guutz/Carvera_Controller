@@ -18,11 +18,13 @@
     "modifiers with a different meaning in each. Every action needs two controls at once,",
     "so a key bound nowhere simply does nothing.",
     "",
-    "Keep chord targets off the jog keys. A stroke of {jog key + modifier} would be",
-    "reachable by brushing a modifier while reaching for a jog key, and for something",
-    "like zeroing the work origin that is too easy an accident -- confirm-twice only",
-    "helps if you notice the prompt. With no overlap such a stroke spells nothing and",
-    "is completely inert.",
+    "A chord target may share its key with jogging, but only if it confirms. Holding a",
+    "jog key and brushing a modifier on the way out spells that chord, so without a",
+    "confirmation step the action fires by accident -- which is how zeroing the work",
+    "origin got triggered twice. Confirming turns that brush into a prompt you can",
+    "ignore, and the prompt lapses on its own after a few seconds. The layout is",
+    "rejected if a non-confirming action is bound to a jog key; add \"confirm\": true",
+    "to the binding, or move it to a key that is not used for jogging.",
     "",
     "Each target value is an action name from the list below. A few actions confirm by",
     "default (press the key twice); override per binding with the long form:",
@@ -47,7 +49,8 @@
   "jog": {
     "0": "X",
     "1": "Y",
-    "2": "Z"
+    "2": "Z",
+    "5": "A"
   },
   "modifiers": {
     "9": {
@@ -65,7 +68,10 @@
       "targets": {
         "3": "run_pause",
         "4": "stop",
-        "5": "spindle_toggle",
+        "5": {
+          "action": "spindle_toggle",
+          "confirm": true
+        },
         "6": "probe_z",
         "7": "macro_1",
         "8": "probe_laser"

@@ -54,6 +54,7 @@ def test_shipped_layout_matches_the_documented_default_keys():
         MacroPadPendant.KEY_JOG_X: "X",
         MacroPadPendant.KEY_JOG_Y: "Y",
         MacroPadPendant.KEY_JOG_Z: "Z",
+        MacroPadPendant.KEY_JOG_A: "A",
     }
 
 
@@ -250,3 +251,42 @@ def test_search_paths_prefer_user_dir_then_shipped():
     paths = pendant._layout_search_paths()
 
     assert paths[-1] == os.path.join(os.path.dirname(pendant_module.__file__), MacroPadPendant.LAYOUT_FILENAME)
+
+
+class TestJogKeyOverlapMustConfirm:
+    """
+    Overlap between a jog key and a chord target is allowed -- a full pad has no
+    spare key for the rotary otherwise -- but only where a brush arms a prompt
+    instead of acting. The validator enforces that rather than trusting it.
+    """
+
+    @staticmethod
+    def _layout(binding):
+        return {
+            "version": 1,
+            "jog": {"0": "X", "5": "A"},
+            "modifiers": {"10": {"name": "ACT", "targets": {"5": binding}}},
+        }
+
+    def test_rejects_an_immediate_action_on_a_jog_key(self):
+        with pytest.raises(ValueError, match="must confirm"):
+            pendant_module.validate_macropad_layout(self._layout("spindle_toggle"))
+
+    def test_accepts_it_when_the_binding_opts_into_confirming(self):
+        pendant_module.validate_macropad_layout(self._layout({"action": "spindle_toggle", "confirm": True}))
+
+    def test_accepts_an_action_that_confirms_by_default(self):
+        pendant_module.validate_macropad_layout(self._layout("zero_z"))
+
+    def test_rejects_an_action_that_opts_out_of_confirming(self):
+        """A per-binding confirm:false must not be able to defeat the rule."""
+        with pytest.raises(ValueError, match="must confirm"):
+            pendant_module.validate_macropad_layout(self._layout({"action": "zero_z", "confirm": False}))
+
+    def test_keys_that_are_not_jog_keys_are_unaffected(self):
+        layout = {
+            "version": 1,
+            "jog": {"0": "X"},
+            "modifiers": {"10": {"name": "ACT", "targets": {"5": "spindle_toggle"}}},
+        }
+        pendant_module.validate_macropad_layout(layout)

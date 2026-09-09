@@ -18,6 +18,7 @@ SET = MacroPadPendant.KEY_SET
 JOG_X = MacroPadPendant.KEY_JOG_X
 JOG_Y = MacroPadPendant.KEY_JOG_Y
 JOG_Z = MacroPadPendant.KEY_JOG_Z
+JOG_A = MacroPadPendant.KEY_JOG_A
 
 
 class FakeDaemon:
@@ -304,7 +305,6 @@ def test_strokes_do_not_leak_into_each_other():
         ((GOTO, 8), ("w_home",), "w_home"),
         ((ACT, 3), ("run_pause",), "start_pause"),
         ((ACT, 4), ("abort",), "stop"),
-        ((ACT, 5), ("spindle", True), "spindle_on_off"),
         ((ACT, 6), ("probe_z",), "probe_z"),
         ((ACT, 8), ("probe_laser", True), "probe_laser"),
     ],
@@ -316,6 +316,21 @@ def test_each_chord_fires_its_action(chord, expected_call, expected_action):
 
     assert expected_call in pendant._controller.calls
     assert expected_action in pendant._button_presses
+
+
+def test_spindle_confirms_because_it_shares_the_a_jog_key():
+    """
+    ACT+5 sits on the rotary jog key, so it is brush-reachable and must arm rather
+    than act. One stroke prompts; repeating it runs.
+    """
+    pendant = make_pendant(cnc_vars={"curspindle": 0, **LOADED_FILE})
+
+    stroke(pendant, ACT, 5)
+    assert ("spindle", True) not in pendant._controller.calls
+
+    stroke(pendant, ACT, 5)
+    assert ("spindle", True) in pendant._controller.calls
+    assert "spindle_on_off" in pendant._button_presses
 
 
 def test_macro_chord_runs_macro_1():
@@ -676,7 +691,8 @@ def test_idle_shows_modifiers_breathing_and_axes_steady():
     for key in pendant._modifier_keys:
         assert plan[key][1] == "breathe_slow"
     assert plan[JOG_X] == (MacroPadPendant.AXIS_COLOR_IDLE["X"], "solid")
-    for key in (3, 4, 5, 6, 7, 8):
+    assert plan[JOG_A] == (MacroPadPendant.AXIS_COLOR_IDLE["A"], "solid")
+    for key in (3, 4, 6, 7, 8):
         assert plan[key][0] == 0x000000
 
 
@@ -1190,19 +1206,24 @@ def test_older_firmware_never_sleeps_the_screen(monkeypatch):
 # --- jog keys are never part of a chord ----------------------------------------------------------
 
 
-def test_no_chord_uses_a_jog_key():
+def test_chords_sharing_a_jog_key_always_confirm():
     """
-    The invariant behind the fix for brushing a modifier while reaching for a jog key.
+    What makes the jog-key overlap tolerable.
 
-    If any chord shared a key with jogging, that stroke would be reachable by accident --
-    and for zeroing the work origin, confirm-twice only helps if you notice the prompt.
-    With no overlap the stroke spells nothing and cannot act at all.
+    Holding a jog key and brushing a modifier on the way out spells that chord --
+    the reported accident, which fired ZERO XY twice. Overlap is allowed so the
+    rotary can have a jog key on a full pad, but only where a single brush arms a
+    prompt instead of acting. Anything on a jog key that acts immediately is the
+    original bug again.
     """
     pendant = make_pendant()
+    jog_keys = set(pendant._jog_keys)
 
-    for chord in pendant._chords:
-        overlap = chord & set(pendant._jog_keys)
-        assert not overlap, f"chord {sorted(chord)} shares jog key(s) {sorted(overlap)}"
+    for chord, target in pendant._chords.items():
+        if chord & jog_keys:
+            assert target.needs_confirm, (
+                f"chord {sorted(chord)} shares a jog key but '{target.action_name}' acts immediately"
+            )
 
 
 @pytest.mark.parametrize("jog_key", [JOG_X, JOG_Y, JOG_Z])

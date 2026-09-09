@@ -514,6 +514,19 @@ def validate_macropad_layout(raw: dict) -> None:
                     f"'{name}' key {target} uses unknown action '{action}'; "
                     f"known actions: {', '.join(sorted(MACROPAD_ACTIONS))}"
                 )
+            # A target that shares its key with jogging is reachable by brushing a
+            # modifier while holding that key -- the reported accident. Confirming
+            # makes a single brush arm a prompt instead of acting, which is what
+            # makes the overlap tolerable, so it is required rather than hoped for.
+            if target in jog_keys:
+                confirms = MACROPAD_ACTIONS[action][3]
+                if isinstance(binding, dict) and "confirm" in binding:
+                    confirms = bool(binding["confirm"])
+                if not confirms:
+                    raise ValueError(
+                        f"'{name}' key {target} is also a jog key, so '{action}' must confirm; "
+                        f'set it explicitly with {{"action": "{action}", "confirm": true}}'
+                    )
 
 
 class _PendantTarget(NamedTuple):
@@ -603,14 +616,16 @@ if MACROPAD_SUPPORTED:
         KEY_JOG_X = 0
         KEY_JOG_Y = 1
         KEY_JOG_Z = 2
+        KEY_JOG_A = 5  # rotary; shares its key with the ACT menu, which is why that confirms
         KEY_GOTO = 9
         KEY_ACT = 10
         KEY_SET = 11
 
         LAYOUT_FILENAME = "macropad_layout.json"
 
-        AXIS_COLOR_IDLE = {"X": 0x200000, "Y": 0x002000, "Z": 0x000020}
-        AXIS_COLOR_HELD = {"X": 0xFF0000, "Y": 0x00FF00, "Z": 0x0000FF}
+        # A is the rotary axis; amber keeps it clearly apart from the three linear ones.
+        AXIS_COLOR_IDLE = {"X": 0x200000, "Y": 0x002000, "Z": 0x000020, "A": 0x201400}
+        AXIS_COLOR_HELD = {"X": 0xFF0000, "Y": 0x00FF00, "Z": 0x0000FF, "A": 0xFFA000}
 
         # Machine states each action needs. Absent = always allowed. Kept here rather than
         # in the layout file: it is a property of the action, not of where you bind it.
