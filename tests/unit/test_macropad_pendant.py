@@ -1749,36 +1749,3 @@ class TestFourthAxisJog:
             "modifiers": {"9": {"name": "GOTO", "targets": {"3": "margin"}}},
         }
         pendant_module.validate_macropad_layout(layout)
-
-
-class TestCameraAction:
-    @staticmethod
-    def _pendant(supports_camera, monkeypatch, toggle=None):
-        pendant = make_pendant()
-        pendant._toggle_camera = toggle
-        monkeypatch.setattr(
-            pendant_module,
-            "App",
-            SimpleNamespace(get_running_app=lambda: SimpleNamespace(supports_camera=supports_camera)),
-        )
-        return pendant
-
-    def test_toggles_the_panel(self, monkeypatch):
-        calls = []
-        pendant = self._pendant(True, monkeypatch, toggle=lambda: calls.append(1))
-        pendant._do_toggle_camera()
-        assert calls == [1]
-
-    def test_says_so_when_no_camera_was_found(self, monkeypatch):
-        """Silent nothing is a bad pendant response."""
-        calls = []
-        pendant = self._pendant(False, monkeypatch, toggle=lambda: calls.append(1))
-        pendant._do_toggle_camera()
-        assert calls == []
-        assert pendant._flash_label == "NO CAMERA"
-
-    def test_survives_a_pendant_built_without_the_callback(self, monkeypatch):
-        """Older construction sites pass positionally and omit it."""
-        pendant = self._pendant(True, monkeypatch, toggle=None)
-        pendant._do_toggle_camera()
-        assert pendant._flash_label == "NO CAMERA"

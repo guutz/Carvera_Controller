@@ -93,7 +93,6 @@ class Pendant:
         report_disconnection: Callable[[], None],
         update_ui_on_button_press: Callable[[str], None] = None,
         update_ui_on_jog_stop: Callable[[], None] = None,
-        toggle_camera: Callable[[], None] = None,
     ) -> None:
         self._controller = controller
         self._cnc = cnc
@@ -108,7 +107,6 @@ class Pendant:
         self._report_disconnection = report_disconnection
         self._update_ui_on_button_press = update_ui_on_button_press
         self._update_ui_on_jog_stop = update_ui_on_jog_stop
-        self._toggle_camera = toggle_camera
         self._jog_mode = Controller.JOG_MODE_STEP
 
     def close(self) -> None:
@@ -426,7 +424,6 @@ MACROPAD_ACTIONS: dict[str, tuple[str, str, str, bool]] = {
     "spindle_toggle": ("SPINDLE", "SPIN", "_do_spindle_toggle", False),
     "probe_z": ("PROBE Z", "PROBE", "_do_probe_z", False),
     "probe_laser": ("LASER", "LASER", "_do_probe_laser_toggle", False),
-    "camera": ("CAMERA", "CAM", "_do_toggle_camera", False),
     "level": ("LEVEL", "LEVEL", "_do_auto_level", False),
     # Sets work Z from the headstock, so it confirms like the other zeroing actions.
     "probe_4th": ("PROBE 4A", "PRB4A", "_do_probe_4th_axis", True),
@@ -449,7 +446,6 @@ MACROPAD_ACTION_COLORS: dict[str, int] = {
     "stop": 0xFF2000,
     "spindle_toggle": 0xFFA000,
     "probe_z": 0x00FFC0,
-    "camera": 0xC0C0C0,
     "level": 0x00C0A0,
     "probe_4th": 0xC000FF,
     "probe_laser": 0xFF00FF,
@@ -1270,24 +1266,6 @@ if MACROPAD_SUPPORTED:
             if app is None:
                 return bool(CNC.has_4axis)
             return bool(getattr(app, "has_4axis", False))
-
-        def _do_toggle_camera(self) -> None:
-            """
-            Show or hide the camera panel on the app's screen.
-
-            The pendant's own display cannot carry video, so this drives the panel
-            rather than showing anything here.
-            """
-            app = App.get_running_app() if App is not None else None
-            if app is not None and not getattr(app, "supports_camera", False):
-                self._flash_label = "NO CAMERA"
-                return
-            if self._toggle_camera is None:
-                self._flash_label = "NO CAMERA"
-                return
-            self._toggle_camera()
-            if self._update_ui_on_button_press:
-                self._update_ui_on_button_press("camera")
 
         def _do_probe_laser_toggle(self) -> None:
             """

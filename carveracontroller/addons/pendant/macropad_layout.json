@@ -40,7 +40,6 @@
     "  spindle_toggle  spindle on/off",
     "  probe_z         probe Z (or open the probing screen)",
     "  probe_laser     toggle the wired probe's laser crosshair (M494)",
-    "  camera          show or hide the camera panel on the app's screen",
     "  level           auto-level the loaded file's area (M495)",
     "  probe_4th       probe the 4th-axis headstock, set work Z to the rotation centreline",
     "  zero_xy         set work X and Y zero here  (confirms)",
@@ -83,8 +82,7 @@
       "targets": {
         "3": "zero_xy",
         "5": "zero_z",
-        "4": "probe_4th",
-        "6": "camera"
+        "4": "probe_4th"
       }
     }
   }

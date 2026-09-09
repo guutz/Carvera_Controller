@@ -7815,7 +7815,6 @@ class Makera(RelativeLayout):
             self.handle_pendant_connected,
             self.handle_pendant_disconnected,
             self.handle_pendant_button_press,
-            toggle_camera=self.toggle_camera_stream,
         )
 
         if self.controller.jog_mode == Controller.JOG_MODE_CONTINUOUS:
