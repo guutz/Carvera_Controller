@@ -503,3 +503,32 @@ fast-forward to that branch.
 **Update, 2026-10-20:** the user confirmed; `z1-usb-macropad` was fast-forwarded
 to the merge and pushed to `fork`. The scratch branch is deleted. The branch is
 now 0 behind `origin/develop`.
+
+---
+
+## Cut simulation: native module and tool headers
+
+*Added 2026-10-20 by the same controller session.*
+
+- **The stock cut simulation needs a C extension that `poetry install` does not
+  build.** Without it: *"Cut simulation is unavailable because the native carve
+  module is not built."* Build with `poetry run python scripts/build_native.py`
+  (in-place into `addons/stock/simulator/native/lib/`, gitignored; re-run when
+  upstream changes the `.c`/`.h`). Windows needs MSVC Build Tools ("Desktop
+  development with C++"), and must be run with the same Python the app uses.
+  This is very likely the cause of the three `test_simulation_available_*`
+  failures listed in the merge section — **not yet confirmed** by building it
+  here and re-running them.
+- **Tool shapes come only from CAM comments at the top of the file.** Parsers in
+  `addons/cam/parsers/`: MakeraStudio, Fusion 360 (Makera post), FreeCAD (Makera
+  post, `(@FC|TOOL|...)`). FreeCAD's stock `smoothie` post writes none. The
+  community FreeCAD 1.1 post is in `Carvera-Community/Carvera_Community_Profiles`
+  under `CAM_Post_Processors/Freecad/1.1PostProcessor/makera_legacy_post.py`.
+  The user's own generators now write `@FC` headers — see
+  `satnogs-rotator-control/CLAUDE.md`.
+- **Upstream bug, unfixed:** `carver_select._truncate_profile_to_cut` trims the
+  cutting profile to the flute by dropping whole vertices, never interpolating.
+  Any V-bit or chamfer whose cone ends above its stated flute length loses the
+  cone, and the **tip radius stands in for the whole flute** — under-simulating
+  the cut width. Interpolating the radius at `cut_z` would fix it. The user's
+  generators sidestep it by rounding the V-bit diameter down.
