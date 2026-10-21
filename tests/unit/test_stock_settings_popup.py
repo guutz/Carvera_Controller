@@ -14,7 +14,23 @@ from carveracontroller.addons.stock.ui.StockSettingsPopup import (
 )
 
 
-def test_reset_for_loaded_file_uses_snapshot_not_ui():
+def test_refresh_simulation_hint_when_native_carve_missing(monkeypatch):
+    import carveracontroller.addons.stock.simulator.native as native
+
+    monkeypatch.setattr(native, "native_enabled", lambda: False)
+    popup = StockSettingsPopup.__new__(StockSettingsPopup)
+    popup.simulation_available = True
+    popup.simulation_hint = ""
+
+    popup._refresh_simulation_availability()
+
+    assert popup.simulation_available is False
+    assert "native carve module is not built" in popup.simulation_hint
+
+
+def test_reset_for_loaded_file_discards_prior_session():
+    from carveracontroller.addons.stock.stock_defaults import default_settings
+
     popup = StockSettingsPopup.__new__(StockSettingsPopup)
     custom = {
         "shape": {"kind": "rectangular", "width_mm": 150, "length_mm": 80, "height_mm": 20},
@@ -28,7 +44,7 @@ def test_reset_for_loaded_file_uses_snapshot_not_ui():
         "show_stock": True,
         "simulate_cut": True,
         "mesh_while_playing": False,
-        "voxel_resolution": "high",
+        "carver_resolution": "high",
         "checkpoint_level": "medium",
         "carver_mode": "voxel",
         "material": "pcb",
@@ -39,37 +55,13 @@ def test_reset_for_loaded_file_uses_snapshot_not_ui():
 
     out = popup.reset_for_loaded_file()
 
-    assert out["shape"]["width_mm"] == 150
-    assert out["origin"]["xy_corner"] == "BL"
-    assert out["origin"]["offset_x_mm"] == 1.5
-    assert out["origin"]["offset_y_mm"] == -2.0
-    assert out["origin"]["offset_z_mm"] == 0.25
-    assert out["voxel_resolution"] == "high"
-    assert out["checkpoint_level"] == "medium"
-    assert out["carver_mode"] == "voxel"
-    assert out["material"] == "pcb"
+    assert out == default_settings()
     assert out["show_stock"] is False
     assert out["simulate_cut"] is False
-    assert out["mesh_while_playing"] is False
+    assert out["mesh_while_playing"] is True
+    assert out["material"] == "beige"
     assert popup._settings_snapshot == out
     assert written == [out]
-
-
-def test_reset_for_loaded_file_defaults_missing_material_to_beige():
-    popup = StockSettingsPopup.__new__(StockSettingsPopup)
-    custom = {
-        "shape": {"kind": "rectangular", "width_mm": 50, "length_mm": 40, "height_mm": 5},
-        "origin": {"xy_corner": "BL", "z_reference": "top"},
-        "show_stock": True,
-        "simulate_cut": True,
-    }
-    popup._settings_snapshot = dict(custom)
-    popup._write_settings_to_ui = lambda _s: None
-
-    out = popup.reset_for_loaded_file()
-
-    assert out["material"] == "beige"
-    assert out["show_stock"] is False
 
 
 def test_carver_mode_from_settings_defaults_auto():
@@ -144,7 +136,7 @@ def test_carver_spinner_filters_incompatible_modes():
     popup.rotary_mode = False
     popup.simulation_available = True
     popup._carver_mode_pairs = _carver_mode_pairs()
-    popup._voxel_resolution_pairs = [("Low", "low")]
+    popup._carver_resolution_pairs = [("Low", "low")]
     spinner = type("S", (), {"values": [], "text": ""})()
     popup.ids = {"spn_carver_mode": spinner}
     popup._viewer_tools = lambda: (None, 1.0)
@@ -184,75 +176,8 @@ def test_carver_spinner_filters_incompatible_modes():
     assert not any("Heightmap" in lab for lab in labels)
 
 
-def test_reset_for_loaded_file_preserves_cylindrical_shape():
-    popup = StockSettingsPopup.__new__(StockSettingsPopup)
-    custom = {
-        "shape": {"kind": "cylindrical", "diameter_mm": 75, "height_mm": 15},
-        "origin": {"xy_corner": "center", "z_reference": "bottom"},
-        "show_stock": True,
-        "simulate_cut": True,
-        "voxel_resolution": "medium",
-        "checkpoint_level": "high",
-    }
-    popup._settings_snapshot = dict(custom)
-    written = []
-    popup._write_settings_to_ui = lambda s: written.append(dict(s))
-
-    out = popup.reset_for_loaded_file()
-
-    assert out["shape"]["kind"] == "cylindrical"
-    assert out["shape"]["diameter_mm"] == 75
-    assert out["shape"]["height_mm"] == 15
-    assert out["show_stock"] is False
-    assert out["simulate_cut"] is False
-    assert written == [out]
-
-
-def test_reset_for_loaded_file_preserves_mesh_while_playing():
-    popup = StockSettingsPopup.__new__(StockSettingsPopup)
-    custom = {
-        "shape": {"kind": "rectangular", "width_mm": 50, "length_mm": 40, "height_mm": 5},
-        "origin": {"xy_corner": "BL", "z_reference": "top"},
-        "show_stock": True,
-        "simulate_cut": True,
-        "mesh_while_playing": True,
-        "voxel_resolution": "low",
-        "checkpoint_level": "low",
-    }
-    popup._settings_snapshot = dict(custom)
-    popup._write_settings_to_ui = lambda _s: None
-
-    out = popup.reset_for_loaded_file()
-
-    assert out["mesh_while_playing"] is True
-    assert out["show_stock"] is False
-    assert out["simulate_cut"] is False
-
-
-def test_reset_for_loaded_file_when_toggles_already_off():
-    popup = StockSettingsPopup.__new__(StockSettingsPopup)
-    custom = {
-        "shape": {"kind": "rectangular", "width_mm": 50, "length_mm": 40, "height_mm": 5},
-        "origin": {"xy_corner": "TR", "z_reference": "bottom"},
-        "show_stock": False,
-        "simulate_cut": False,
-        "voxel_resolution": "low",
-        "checkpoint_level": "low",
-    }
-    popup._settings_snapshot = dict(custom)
-    written = []
-    popup._write_settings_to_ui = lambda s: written.append(dict(s))
-
-    out = popup.reset_for_loaded_file()
-
-    assert out["shape"]["length_mm"] == 40
-    assert out["show_stock"] is False
-    assert out["simulate_cut"] is False
-    assert written == [out]
-    assert popup._settings_snapshot == out
-
-
 def test_reset_for_loaded_file_overwrites_shape_and_origin():
+    from carveracontroller.addons.stock.stock_defaults import default_settings
     from carveracontroller.addons.stock.stock_origin import StockOrigin
     from carveracontroller.addons.stock.stock_shape import RectangularStock
 
@@ -262,9 +187,11 @@ def test_reset_for_loaded_file_overwrites_shape_and_origin():
         "origin": {"xy_corner": "center", "z_reference": "bottom", "offset_x_mm": 9.0},
         "show_stock": True,
         "simulate_cut": True,
-        "mesh_while_playing": True,
-        "voxel_resolution": "high",
+        "mesh_while_playing": False,
+        "carver_resolution": "high",
         "checkpoint_level": "medium",
+        "carver_mode": "voxel",
+        "material": "pcb",
     }
     popup._settings_snapshot = dict(custom)
     written = []
@@ -272,19 +199,22 @@ def test_reset_for_loaded_file_overwrites_shape_and_origin():
 
     shape = RectangularStock(width_mm=100.0, length_mm=50.0, height_mm=10.0)
     origin = StockOrigin(xy_corner="bl", z_reference="top", offset_x_mm=0.0, offset_y_mm=1.5)
-    out = popup.reset_for_loaded_file(shape=shape, origin=origin)
+    out = popup.reset_for_loaded_file(shape=shape, origin=origin, show_stock=True, simulate_cut=True)
 
+    defaults = default_settings()
     assert out["shape"]["kind"] == "rectangular"
     assert out["shape"]["width_mm"] == 100.0
     assert out["shape"]["length_mm"] == 50.0
     assert out["origin"]["xy_corner"] == "bl"
     assert out["origin"]["z_reference"] == "top"
     assert out["origin"]["offset_y_mm"] == 1.5
-    assert out["voxel_resolution"] == "high"
-    assert out["checkpoint_level"] == "medium"
+    assert out["carver_resolution"] == defaults["carver_resolution"]
+    assert out["checkpoint_level"] == defaults["checkpoint_level"]
+    assert out["carver_mode"] == defaults["carver_mode"]
+    assert out["material"] == defaults["material"]
     assert out["mesh_while_playing"] is True
-    assert out["show_stock"] is False
-    assert out["simulate_cut"] is False
+    assert out["show_stock"] is True
+    assert out["simulate_cut"] is True
     assert written == [out]
     assert popup._settings_snapshot == out
 
@@ -294,16 +224,11 @@ def test_reset_for_loaded_file_can_show_stock_without_simulation():
     from carveracontroller.addons.stock.stock_shape import RectangularStock
 
     popup = StockSettingsPopup.__new__(StockSettingsPopup)
-    custom = {
+    popup._settings_snapshot = {
         "shape": {"kind": "cylindrical", "diameter_mm": 75, "height_mm": 15},
-        "origin": {"xy_corner": "center", "z_reference": "bottom", "offset_x_mm": 9.0},
-        "show_stock": False,
         "simulate_cut": True,
-        "mesh_while_playing": True,
-        "voxel_resolution": "high",
-        "checkpoint_level": "medium",
+        "mesh_while_playing": False,
     }
-    popup._settings_snapshot = dict(custom)
     written = []
     popup._write_settings_to_ui = lambda s: written.append(dict(s))
 
@@ -313,8 +238,35 @@ def test_reset_for_loaded_file_can_show_stock_without_simulation():
 
     assert out["show_stock"] is True
     assert out["simulate_cut"] is False
+    assert out["mesh_while_playing"] is True
     assert written == [out]
     assert popup._settings_snapshot == out
+
+
+def test_reset_for_loaded_file_simulate_cut_requires_visible_stock():
+    popup = StockSettingsPopup.__new__(StockSettingsPopup)
+    popup._settings_snapshot = {}
+    popup._write_settings_to_ui = lambda _s: None
+
+    out = popup.reset_for_loaded_file(simulate_cut=True)
+
+    assert out["show_stock"] is False
+    assert out["simulate_cut"] is False
+
+
+@pytest.mark.parametrize(
+    ("show_stock", "preference", "available", "expected"),
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_should_auto_simulate_cut_requires_every_gate(show_stock, preference, available, expected):
+    from carveracontroller.addons.stock.stock_defaults import should_auto_simulate_cut
+
+    assert should_auto_simulate_cut(show_stock, preference, available) is expected
 
 
 @pytest.mark.parametrize("text", ["nan", "NaN", "inf", "Infinity", "1e999"])
@@ -493,7 +445,7 @@ def test_write_settings_skips_detached_z_ref_spinner():
     popup._shape_pairs = [("Rectangular", "rectangular"), ("Cylinder", "rotary_cylindrical")]
     popup._corner_pairs = [("X min (left end)", "BL")]
     popup._z_pairs = [("Axis center (Z0 = A axis)", "center")]
-    popup._voxel_resolution_pairs = [("Low", "low")]
+    popup._carver_resolution_pairs = [("Low", "low")]
     popup._checkpoint_level_pairs = [("Low", "low")]
     popup._fit_event = None
     popup._schedule_fit_popup_height = lambda *_a: None
@@ -521,7 +473,7 @@ def test_write_settings_skips_detached_z_ref_spinner():
         "spn_shape": _FieldStub("Cylinder"),
         "spn_corner": _FieldStub("X min (left end)"),
         "spn_z_ref": proxy,
-        "spn_voxel_resolution": _FieldStub("Low"),
+        "spn_carver_resolution": _FieldStub("Low"),
         "spn_checkpoint_level": _FieldStub("Low"),
         "chk_show_stock": _FieldStub(active=False),
         "chk_simulate": _FieldStub(active=False),
@@ -540,7 +492,7 @@ def test_write_settings_skips_detached_z_ref_spinner():
             "origin": {"xy_corner": "BL", "z_reference": "center"},
             "show_stock": False,
             "simulate_cut": False,
-            "voxel_resolution": "low",
+            "carver_resolution": "low",
             "checkpoint_level": "low",
         }
     )
@@ -557,7 +509,7 @@ def test_write_settings_skips_detached_length_field():
     popup._shape_pairs = [("Rectangular", "rectangular"), ("Cylinder", "cylindrical")]
     popup._corner_pairs = [("BL", "BL")]
     popup._z_pairs = [("Top", "top")]
-    popup._voxel_resolution_pairs = [("Low", "low")]
+    popup._carver_resolution_pairs = [("Low", "low")]
     popup._checkpoint_level_pairs = [("Low", "low")]
     popup._fit_event = None
     popup._schedule_fit_popup_height = lambda *_a: None
@@ -585,7 +537,7 @@ def test_write_settings_skips_detached_length_field():
         "spn_shape": _FieldStub("Cylinder"),
         "spn_corner": _FieldStub("BL"),
         "spn_z_ref": _FieldStub("Top"),
-        "spn_voxel_resolution": _FieldStub("Low"),
+        "spn_carver_resolution": _FieldStub("Low"),
         "spn_checkpoint_level": _FieldStub("Low"),
         "chk_show_stock": _FieldStub(active=False),
         "chk_simulate": _FieldStub(active=False),
@@ -605,7 +557,7 @@ def test_write_settings_skips_detached_length_field():
             "origin": {"xy_corner": "BL", "z_reference": "top"},
             "show_stock": False,
             "simulate_cut": False,
-            "voxel_resolution": "low",
+            "carver_resolution": "low",
             "checkpoint_level": "low",
         }
     )
@@ -711,7 +663,7 @@ def test_on_apply_and_close_commits_snapshot_only_on_success(monkeypatch):
         "origin": {"xy_corner": "bl", "z_reference": "top"},
         "show_stock": False,
         "simulate_cut": False,
-        "voxel_resolution": "low",
+        "carver_resolution": "low",
         "checkpoint_level": "low",
     }
     new = dict(old)
@@ -759,7 +711,7 @@ def test_on_apply_and_close_keeps_snapshot_when_viewer_missing(monkeypatch):
         "origin": {"xy_corner": "bl", "z_reference": "top"},
         "show_stock": False,
         "simulate_cut": False,
-        "voxel_resolution": "low",
+        "carver_resolution": "low",
         "checkpoint_level": "low",
     }
     popup._settings_snapshot = dict(old)
@@ -777,41 +729,41 @@ def test_on_apply_and_close_keeps_snapshot_when_viewer_missing(monkeypatch):
     assert dismissed == []
 
 
-def test_voxel_resolution_pairs_without_bounds_omit_precision():
+def test_carver_resolution_pairs_without_bounds_omit_precision():
     from carveracontroller.addons.stock.simulator.carver_select import BACKEND_HEIGHTMAP
-    from carveracontroller.addons.stock.ui.StockSettingsPopup import _voxel_resolution_pairs
+    from carveracontroller.addons.stock.ui.StockSettingsPopup import _carver_resolution_pairs
 
-    pairs = _voxel_resolution_pairs(BACKEND_HEIGHTMAP)
+    pairs = _carver_resolution_pairs(BACKEND_HEIGHTMAP)
     labels = [lab for lab, _ in pairs]
     assert labels == ["Low (faster)", "Medium", "High (finer)"]
     assert all("/ axis" not in lab for lab in labels)
 
 
-def test_voxel_resolution_pairs_show_actual_cell_size():
+def test_carver_resolution_pairs_show_actual_cell_size():
     from carveracontroller.addons.stock.simulator.carver_select import BACKEND_HEIGHTMAP, BACKEND_VOXEL
     from carveracontroller.addons.stock.stock_geometry import StockBounds
-    from carveracontroller.addons.stock.ui.StockSettingsPopup import _voxel_resolution_pairs
+    from carveracontroller.addons.stock.ui.StockSettingsPopup import _carver_resolution_pairs
 
     bounds = StockBounds(0, 0, 0, 42, 42, 1)
-    hm = [lab for lab, _ in _voxel_resolution_pairs(BACKEND_HEIGHTMAP, bounds)]
-    assert "0.21 mm/cell" in hm[0]
-    assert "0.084 mm/cell" in hm[1]
+    hm = [lab for lab, _ in _carver_resolution_pairs(BACKEND_HEIGHTMAP, bounds)]
+    assert "0.10 mm/cell" in hm[0]
+    assert "0.06 mm/cell" in hm[1]
     assert "0.05 mm/cell" in hm[2]
     assert hm[1] != hm[2]
     assert all("/ axis" not in lab for lab in hm)
 
-    vx = [lab for lab, _ in _voxel_resolution_pairs(BACKEND_VOXEL, bounds)]
+    vx = [lab for lab, _ in _carver_resolution_pairs(BACKEND_VOXEL, bounds)]
     assert "mm/voxel" in vx[0]
     assert "/ axis" not in vx[0]
 
 
-def test_voxel_resolution_pairs_cylindrical_names_od():
+def test_carver_resolution_pairs_cylindrical_names_od():
     from carveracontroller.addons.stock.simulator.carver_select import BACKEND_CYLINDRICAL
     from carveracontroller.addons.stock.stock_geometry import StockBounds
-    from carveracontroller.addons.stock.ui.StockSettingsPopup import _voxel_resolution_pairs
+    from carveracontroller.addons.stock.ui.StockSettingsPopup import _carver_resolution_pairs
 
     bounds = StockBounds(0, -25, -25, 80, 25, 25)
-    cyl = [lab for lab, _ in _voxel_resolution_pairs(BACKEND_CYLINDRICAL, bounds)]
+    cyl = [lab for lab, _ in _carver_resolution_pairs(BACKEND_CYLINDRICAL, bounds)]
     assert "mm along X" in cyl[0]
     assert "mm at OD" in cyl[0]
     assert "mm/cell" not in cyl[0]

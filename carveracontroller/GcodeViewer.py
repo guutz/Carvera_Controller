@@ -64,12 +64,12 @@ from .addons.stock.simulator.carver_select import DEFAULT_CARVER_MODE, normalize
 from .addons.stock.simulator.mesh_format import VERTEX_FORMAT as CARVED_VERTEX_FORMAT
 from .addons.stock.simulator.simulation_quality import (
     CHECKPOINT_SLOTS_BY_LEVEL,
+    DEFAULT_CARVER_RESOLUTION,
     DEFAULT_CHECKPOINT_LEVEL,
-    DEFAULT_VOXEL_RESOLUTION,
     format_cell_size_mm,
     format_diameter_mm,
+    normalize_carver_resolution,
     normalize_checkpoint_level,
-    normalize_voxel_resolution,
 )
 from .addons.stock.stock_aabb_mesh import (
     STOCK_VERTEX_FORMAT,
@@ -179,6 +179,12 @@ def rotate_mat_by_x_axis_angle(angle_in_degree):
     return mat_rot_x
 
 
+def rotate_point_then_center(point, center, rotation):
+    """Rotate a viewer-space point around the WCS origin, then center the scene."""
+    rotated = rotation.transform_point(point[0], point[1], point[2])
+    return [rotated[0] - center[0], rotated[1] - center[1], rotated[2] - center[2]]
+
+
 #####function
 def vec3_add(v1, v2):
     return [v1[0] + v2[0], v1[1] + v2[1], v1[2] + v2[2]]
@@ -218,6 +224,14 @@ def bbox_max_side_length(min_pt, max_pt):
     if m <= 0.0 or not isfinite(m):
         return 0.0
     return m
+
+
+def bbox_diagonal(min_pt, max_pt):
+    """Length of the bounding-box diagonal, or 0 if empty/invalid."""
+    d = hypot(max_pt[0] - min_pt[0], max_pt[1] - min_pt[1], max_pt[2] - min_pt[2])
+    if d <= 0.0 or not isfinite(d):
+        return 0.0
+    return d
 
 
 def vec3_distance(v1, v2):
@@ -264,6 +278,7 @@ VERTEX_FLOAT_NUM = 11
 # Marks a touch this widget took on touch_down, so drags belonging to the
 # controls floating over it are not also treated as orbit or pan.
 TOUCH_CLAIMED = "gcode_viewer_claimed"
+SIM_CARVING_HOLD_S = 0.2
 
 COLOR_SCHEME_BY_TYPE = 0
 COLOR_SCHEME_BY_TOOL = 1
@@ -298,6 +313,44 @@ def feed_mm_min_for_move(is_rapid, feed_value=None):
         except (TypeError, ValueError):
             pass
     return DEFAULT_FEED_MM_MIN
+
+
+def _linedata_tool(line):
+    """Return the integer tool id from a parsed coordinate row, or None."""
+    if line is None or len(line) <= 6:
+        return None
+    try:
+        return int(line[6])
+    except (TypeError, ValueError):
+        return None
+
+
+def bridge_toolpath_vertices(lines, prev_line=None):
+    """Insert extra vertices so discrete line-strip attributes do not interpolate."""
+    dataarrs = []
+    last_line = prev_line
+    last_color = prev_line[4] if prev_line is not None else -1
+    for line in lines:
+        color = line[4]
+        tool = _linedata_tool(line)
+        last_tool = _linedata_tool(last_line)
+
+        if last_line is not None and tool is not None and last_tool is not None and tool != last_tool:
+            snap = last_line.copy()
+            snap[6] = tool
+            dataarrs.append(snap)
+
+        if last_color >= 0 and color >= 0 and color != last_color:
+            copyline = line.copy()
+            copyline[4] = last_color
+            dataarrs.append(copyline)
+            dataarrs.append(line)
+        else:
+            dataarrs.append(line)
+
+        last_line = line
+        last_color = color
+    return dataarrs
 
 
 def _percentile_from_sorted(sorted_vals, percentile):
@@ -381,6 +434,10 @@ def speed_colormap_rgb(t):
 
 GRID_QUAD_MIN_SIZE = 10.0
 CONFIG_GRID_VISIBLE_KEY = "gcode_viewer_show_grid"
+CONFIG_GHOST_PATHS_KEY = "gcode_viewer_ghost_paths"
+PATH_GHOST_ALPHA = 0.08
+PATH_GHOST_RECENT_ALPHA = 1.0
+PATH_GHOST_RECENT_PART_FRACTION = 3.0
 VIEW_CUBE_SIZE = dp(96)
 VIEW_CUBE_MARGIN = dp(10)
 VIEW_CUBE_TOOLBAR_INSET = dp(48)
@@ -639,7 +696,7 @@ class GCodeViewer(Widget):
     g_wheel_data = 0
     lines_center = [0, 0, 0]
 
-    display_count = 0
+    display_count = 0.0
     total_line_count = 0
     add_dir = 1
     dynamic_display = BooleanProperty(True)
@@ -657,6 +714,9 @@ class GCodeViewer(Widget):
     sim_progress = NumericProperty(0.0)
     sim_checkpoints = ListProperty([])
     sim_hud_text = StringProperty("")
+    sim_hud_visible = BooleanProperty(False)
+    sim_carving = BooleanProperty(False)
+    sim_mesh_visible = BooleanProperty(True)
     stock_visible = BooleanProperty(False)
     bed_visible = BooleanProperty(False)
 
@@ -764,7 +824,6 @@ class GCodeViewer(Widget):
         self.carvedmesh["laser_enabled"] = 0.0
         self.carvedmesh["laser_mode"] = 0.0
         self.carvedmesh["use_two_tone"] = 0.0
-        self.carvedmesh["use_height_tint"] = 1.0
         self.carvedmesh["cylindrical_skin"] = 0.0
         self.carvedmesh["metallic"] = 0.0
         self.carvedmesh["interior_metallic"] = 0.0
@@ -822,6 +881,8 @@ class GCodeViewer(Widget):
         self._proj_matrix = Matrix()
         self.m_viewMatrix = Matrix()
         self._grid_visible = Config.getboolean("carvera", CONFIG_GRID_VISIBLE_KEY, fallback=True)
+        self._path_ghosted = Config.getboolean("carvera", CONFIG_GHOST_PATHS_KEY, fallback=False)
+        self._apply_path_alpha_uniform()
         self._viewer_meshes_active = False
 
         self.viewcubemesh["texture0"] = VIEW_CUBE_TEXTURE_UNIT
@@ -835,6 +896,7 @@ class GCodeViewer(Widget):
         self.z_bucket_bits = VISIBILITY_ALL_BUCKET_BITS
         self._tool_filter_ids = []
         self._tool_filter_bits = 0
+        self._path_bridge_prev = None
 
         self._apply_color_scheme_uniform()
         self._update_feed_range_uniforms()
@@ -845,12 +907,13 @@ class GCodeViewer(Widget):
         self.stock_shape: StockShape | None = None
         self.stock_visible = False
         self.simulate_cut = False
-        self.stock_mesh_while_playing = False
+        self.stock_mesh_while_playing = True
+        self.sim_mesh_visible = True
         # Keep the translucent AABB up after pause until the worker flush
         # patches GPU chunks; otherwise the last meshed shell (often uncut)
         # is shown for a frame.
         self._defer_carved_stock = False
-        self.stock_voxel_resolution = DEFAULT_VOXEL_RESOLUTION
+        self.stock_carver_resolution = DEFAULT_CARVER_RESOLUTION
         self.stock_checkpoint_level = DEFAULT_CHECKPOINT_LEVEL
         self.stock_carver_mode = DEFAULT_CARVER_MODE
         self.stock_material = DEFAULT_MATERIAL
@@ -859,10 +922,12 @@ class GCodeViewer(Widget):
         self._sim_progress_trigger = Clock.create_trigger(self._flush_sim_progress, 0)
         self._sim_checkpoints_trigger = Clock.create_trigger(self._flush_sim_checkpoints, 0)
         self._pending_checkpoint_vertices: list[int] = []
+        self._sim_carving_hold = None
         self._stock_simulator = StockSimulator(
             on_meshes_ready=self._on_stock_meshes_ready,
             on_progress=self._on_stock_progress,
             on_checkpoints=self._on_stock_checkpoints,
+            on_activity=self._on_stock_activity,
         )
         self.bind(dynamic_display=self._on_dynamic_display_changed)
 
@@ -1093,18 +1158,23 @@ class GCodeViewer(Widget):
         self.canvas.remove(self.axiszmesh)
         self.axiszmesh.clear()
         self._remove_view_cube_from_canvas()
-        self.display_count = 0
+        self.display_count = 0.0
+        self.cur_line_index = 0
         self._sim_carved_vertex = 0
         self._sim_progress_vertex = 0
         self.sim_progress = 0.0
         self.sim_checkpoints = []
         self.sim_hud_text = ""
+        self.sim_hud_visible = False
+        self.sim_carving = False
+        self.sim_mesh_visible = True
         self.stock_visible = False
         self.bed_visible = False
         self.simulate_cut = False
         self._defer_carved_stock = False
         self._viewer_meshes_active = False
         self._stock_rotation_mat = self._identity_mat
+        self._cancel_sim_carving_hold()
         if self._stock_simulator is not None:
             # Keep bounds/shape/quality, but pause carving until the new file finishes loading.
             self._stock_simulator.clear_toolpath()
@@ -1125,6 +1195,7 @@ class GCodeViewer(Widget):
         """Drop leftover path vertices so a new file cannot inherit the previous load."""
         self.clear_before_new_load = False
         self.meshmanager.clear()
+        self._path_bridge_prev = None
         self.total_distance = 0.0
         self.total_line_count = 0
 
@@ -1133,6 +1204,7 @@ class GCodeViewer(Widget):
             self.clear_before_new_load = False
 
             self.meshmanager.clear()
+            self._path_bridge_prev = None
 
     def _tool_number_at_index(self, vertex_idx):
         """Return the active tool number (int) at a given vertex index, or None."""
@@ -1196,31 +1268,11 @@ class GCodeViewer(Widget):
     def load_array(self, tmpdataarrs, is_end=True):
         self.clear_loaded_memery()
 
-        dataarrs = []
-        # Insert bridging segments when feed/rapid colors change
-        last_color = -1
-        last_line = -1
-        for line in tmpdataarrs:
-            color = line[4]
-
-            need_regenerate = False
-            if color >= 0 and last_color >= 0:
-                if color != last_color:
-                    need_regenerate = True
-
-            if need_regenerate:
-                replace_str = last_color
-                copyline = line.copy()
-                copyline[4] = last_color
-
-                dataarrs.append(copyline)
-                dataarrs.append(line)
-
-            else:
-                dataarrs.append(line)
-
-            last_line = line
-            last_color = color
+        dataarrs = bridge_toolpath_vertices(tmpdataarrs, prev_line=getattr(self, "_path_bridge_prev", None))
+        if tmpdataarrs:
+            self._path_bridge_prev = tmpdataarrs[-1].copy()
+        if is_end:
+            self._path_bridge_prev = None
 
         if is_end:
             self.clear_before_new_load = True
@@ -1273,8 +1325,10 @@ class GCodeViewer(Widget):
             with self.canvas:
                 with self.linemesh:
                     self.cb = Callback(self.setup_gl_context)
+                    Callback(self._setup_path_gl)
                     for mesh in self.meshmanager.meshes:
                         Mesh(fmt=ff, vertices=mesh[0], indices=mesh[1], mode="line_strip")
+                    Callback(self._reset_path_gl)
 
                     self.cb = Callback(None)
 
@@ -1339,6 +1393,7 @@ class GCodeViewer(Widget):
 
             # rendering line meshes
             self.linemesh["display_count"] = -1.0
+            self._apply_path_alpha_uniform()
             self.reset_visibility_filters()
 
             self.pointermesh["offset"] = (-self.lines_center[0], -self.lines_center[1], -self.lines_center[2])
@@ -1444,24 +1499,28 @@ class GCodeViewer(Widget):
         self.off_y = offy
         self._scene_dirty = True
 
+    def _apply_display_distance(self, distance: float) -> None:
+        """Move the preview playhead to ``distance`` without notifying the file list."""
+        self.display_count = float(distance)
+        self._scene_dirty = True
+        if not self.lengths:
+            return
+        cur_display_distance = float(self.display_count)
+        line_index = binary_find_left(self.lengths, cur_display_distance)
+        line_ratio = 0.0
+        if line_index < len(self.lengths) - 1 and self.lengths[line_index + 1] > self.lengths[line_index]:
+            line_ratio = (cur_display_distance - self.lengths[line_index]) / (
+                self.lengths[line_index + 1] - self.lengths[line_index]
+            )
+        self.cur_line_index = line_index + line_ratio
+        self._sync_stock_simulation(self.cur_line_index)
+
     # set displaying limit
     def set_pos_by_distance(self, distance):
         if distance > self.get_total_distance():
             print("distance is out of bounds")
             return
-        self.display_count = float(distance)
-        self._scene_dirty = True
-        # Sync cur_line_index to display_count so get_cur_pos_index() returns the correct line
-        if self.lengths:
-            cur_display_distance = float(self.display_count)
-            line_index = binary_find_left(self.lengths, cur_display_distance)
-            line_ratio = 0.0
-            if line_index < len(self.lengths) - 1 and self.lengths[line_index + 1] > self.lengths[line_index]:
-                line_ratio = (cur_display_distance - self.lengths[line_index]) / (
-                    self.lengths[line_index + 1] - self.lengths[line_index]
-                )
-            self.cur_line_index = line_index + line_ratio
-            self._sync_stock_simulation(int(self.cur_line_index))
+        self._apply_display_distance(distance)
         # Trigger frame callback to update line highlighting
         if self.frame_callback is not None:
             cur_distance, linenumber = self.get_cur_pos_index()
@@ -1770,8 +1829,7 @@ class GCodeViewer(Widget):
 
     def show_all(self):
         self.dynamic_display = False
-        self.display_count = self.get_total_distance()
-        self._scene_dirty = True
+        self._apply_display_distance(self.get_total_distance())
 
     def restore_default_view(self):
         self.m_xLookAt = 0
@@ -1912,10 +1970,15 @@ class GCodeViewer(Widget):
     def simulation_available(self) -> bool:
         """True when cut simulation can run for the loaded file.
 
-        Mill jobs need CAM tool geometry in ``tool_table``. Laser-only files
-        have no mill headers, so an empty table is still enough when the parsed
-        path uses only the laser (probe tools ignored).
+        The native carve extension must be built. Mill jobs also need CAM tool
+        geometry in ``tool_table``. Laser-only files have no mill headers, so an
+        empty table is still enough when the parsed path uses only the laser
+        (probe tools ignored).
         """
+        from carveracontroller.addons.stock.simulator.native import native_enabled
+
+        if not native_enabled():
+            return False
         if self.tool_table:
             return True
         return self._path_is_laser_only()
@@ -1952,9 +2015,9 @@ class GCodeViewer(Widget):
         bounds: StockBounds | None,
         visible: bool = True,
         simulate_cut: bool = False,
-        voxel_resolution: str = DEFAULT_VOXEL_RESOLUTION,
+        carver_resolution: str = DEFAULT_CARVER_RESOLUTION,
         checkpoint_level: str = DEFAULT_CHECKPOINT_LEVEL,
-        mesh_while_playing: bool = False,
+        mesh_while_playing: bool = True,
         carver_mode: str = DEFAULT_CARVER_MODE,
         shape: StockShape | None = None,
         material: str = DEFAULT_MATERIAL,
@@ -1975,7 +2038,7 @@ class GCodeViewer(Widget):
         stock_visible = bool(visible) and bounds is not None
         want_sim = bool(simulate_cut) and self.simulation_available() and stock_visible
         mesh_while = bool(mesh_while_playing)
-        voxel_res = normalize_voxel_resolution(voxel_resolution)
+        carver_res = normalize_carver_resolution(carver_resolution)
         ckpt = normalize_checkpoint_level(checkpoint_level)
         carver = normalize_carver_mode(carver_mode)
         material = normalize_stock_material(material)
@@ -1985,7 +2048,7 @@ class GCodeViewer(Widget):
             and new_shape == self.stock_shape
             and want_sim == self.simulate_cut
             and mesh_while == self.stock_mesh_while_playing
-            and voxel_res == self.stock_voxel_resolution
+            and carver_res == self.stock_carver_resolution
             and ckpt == self.stock_checkpoint_level
             and carver == self.stock_carver_mode
         )
@@ -1994,8 +2057,12 @@ class GCodeViewer(Widget):
         self.stock_shape = new_shape
         self.stock_visible = stock_visible
         self.simulate_cut = want_sim
+        if not want_sim:
+            self.sim_mesh_visible = True
+            self._cancel_sim_carving_hold()
+            self.sim_carving = False
         self.stock_mesh_while_playing = mesh_while
-        self.stock_voxel_resolution = voxel_res
+        self.stock_carver_resolution = carver_res
         self.stock_checkpoint_level = ckpt
         self.stock_carver_mode = carver
         self.stock_material = material
@@ -2027,29 +2094,32 @@ class GCodeViewer(Widget):
 
         carver = str(stats.get("carver") or "voxel")
         if carver == "heightmap":
-            grid_line = tr._("Heightmap: %dx%d - %smm/cell") % (
+            grid_line = tr._("Heightmap: %dx%d") % (
                 int(stats.get("grid_nx", 0)),
                 int(stats.get("grid_ny", 0)),
-                cell_txt,
             )
+            resolution_line = tr._("Resolution: %smm/cell") % cell_txt
         elif carver == "cylindrical":
-            grid_line = tr._("Cylindrical: %dx%d - %s mm along X and at Ø%s") % (
+            grid_line = tr._("Cylindrical: %dx%d") % (
                 int(stats.get("grid_nx", 0)),
                 int(stats.get("grid_ny", 0)),
+            )
+            resolution_line = tr._("Resolution: %s mm along X and at Ø%s") % (
                 cell_txt,
                 format_diameter_mm(float(stats["stock_diameter_mm"])),
             )
         else:
-            grid_line = tr._("Grid: %dx%dx%d - %smm/voxel") % (
+            grid_line = tr._("Grid: %dx%dx%d") % (
                 int(stats["grid_nx"]),
                 int(stats["grid_ny"]),
                 int(stats["grid_nz"]),
-                cell_txt,
             )
+            resolution_line = tr._("Resolution: %smm/voxel") % cell_txt
 
         return "\n".join(
             [
                 grid_line,
+                resolution_line,
                 tr._("Checkpoints: %.0f%% - %d/%d slots")
                 % (
                     head_pct,
@@ -2061,6 +2131,51 @@ class GCodeViewer(Widget):
 
     def _refresh_sim_hud(self, *_args) -> None:
         self.sim_hud_text = self._format_sim_hud_text()
+        self.sim_hud_visible = bool(self.simulate_cut)
+
+    def _cancel_sim_carving_hold(self) -> None:
+        ev = getattr(self, "_sim_carving_hold", None)
+        if ev is not None:
+            ev.cancel()
+            self._sim_carving_hold = None
+
+    def _end_sim_carving(self, *_args) -> None:
+        self._sim_carving_hold = None
+        self.sim_carving = False
+
+    def _on_stock_activity(self, active: bool) -> None:
+        """Worker/UI busy flag — hop onto the Kivy clock with a generation stamp."""
+        sim = self._stock_simulator
+        gen = sim.generation if sim else -1
+
+        def _apply(_dt, active=active, gen=gen):
+            if self._stock_simulator is None or self._stock_simulator.generation != gen:
+                return
+            if active:
+                self._cancel_sim_carving_hold()
+                self.sim_carving = True
+            elif bool(self.simulate_cut) and self._sim_carving_hold is None:
+                self._sim_carving_hold = Clock.schedule_once(self._end_sim_carving, SIM_CARVING_HOLD_S)
+            else:
+                self._cancel_sim_carving_hold()
+                self.sim_carving = False
+
+        Clock.schedule_once(_apply, 0)
+
+    def set_sim_mesh_visible(self, visible: bool) -> None:
+        """Show or hide the carved stock without resetting occupancy.
+
+        Hiding leaves the same preview shell used when stock is shown and
+        simulation is off. Showing rebuilds that shell as edge lines over the
+        carved mesh.
+        """
+        visible = bool(visible)
+        if visible == bool(getattr(self, "sim_mesh_visible", True)):
+            return
+        self.sim_mesh_visible = visible
+        self._rebuild_stock_mesh()
+        self._ensure_stock_on_canvas()
+        self._scene_dirty = True
 
     def _vertex_to_path_percent(self, vertex: int) -> float:
         total = self.get_total_distance() if self.lengths else 0.0
@@ -2251,6 +2366,8 @@ class GCodeViewer(Widget):
         pause, ``_defer_carved_stock`` keeps that AABB until the flush
         patches GPU chunks so the stale uncut shell is not flashed.
         """
+        if not bool(getattr(self, "sim_mesh_visible", True)):
+            return False
         if self._defer_carved_stock:
             return False
         return bool(self.simulate_cut) and ((not self.dynamic_display) or bool(self.stock_mesh_while_playing))
@@ -2379,7 +2496,6 @@ class GCodeViewer(Widget):
         self.carvedmesh["surface_color"] = list(style.surface_rgb)
         self.carvedmesh["interior_color"] = list(style.resolved_interior_rgb())
         self.carvedmesh["use_two_tone"] = 1.0 if style.two_tone else 0.0
-        self.carvedmesh["use_height_tint"] = 1.0 if style.use_height_tint else 0.0
         self.carvedmesh["metallic"] = float(style.metallic)
         self.carvedmesh["interior_metallic"] = float(style.resolved_interior_metallic())
         self.carvedmesh["roughness"] = float(style.roughness)
@@ -2527,23 +2643,25 @@ class GCodeViewer(Widget):
         self._clear_carved_meshes()
         if not self.simulate_cut or self.stock_bounds_mm is None:
             self._stock_simulator.disable()
+            self._cancel_sim_carving_hold()
+            self.sim_carving = False
             self._sim_hud_trigger()
             return
         self._publish_toolpath_to_simulator()
         self._stock_simulator.reset(
             self.stock_bounds_mm,
             enable=True,
-            resolution_level=self.stock_voxel_resolution,
+            resolution_level=self.stock_carver_resolution,
             checkpoint_slots=CHECKPOINT_SLOTS_BY_LEVEL[self.stock_checkpoint_level],
             shape=self.stock_shape,
             carver_mode=self.stock_carver_mode,
         )
         self._sync_play_mesh_policy(rebuild=False)
         if self.lengths and self.raw_positions:
-            target = int(getattr(self, "cur_line_index", 0) or 0)
+            target = float(getattr(self, "cur_line_index", 0) or 0)
             self._stock_simulator.set_display_vertex(target)
             if not self.dynamic_display:
-                self._stock_simulator.submit_idle_precompute(target)
+                self._stock_simulator.submit_idle_precompute(int(target))
         self._sim_hud_trigger()
 
     def _on_stock_progress(self, vertex: int) -> None:
@@ -2589,10 +2707,10 @@ class GCodeViewer(Widget):
             self._defer_carved_stock = True
         self._sync_play_mesh_policy()
         if (not playing) and self.simulate_cut and self.raw_positions:
-            target = int(getattr(self, "cur_line_index", 0) or 0)
+            target = float(getattr(self, "cur_line_index", 0) or 0)
             self._stock_simulator.set_display_vertex(target)
             self._stock_simulator.request_mesh_flush()
-            self._stock_simulator.submit_idle_precompute(target)
+            self._stock_simulator.submit_idle_precompute(int(target))
         self._scene_dirty = True
 
     def _on_stock_checkpoints(self, vertices: list[int]) -> None:
@@ -2642,10 +2760,11 @@ class GCodeViewer(Widget):
             speeds=self.raw_spindle_speeds,
         )
 
-    def _sync_stock_simulation(self, current_vertex: int) -> None:
+    def _sync_stock_simulation(self, current_vertex: float) -> None:
+        """Carve stock up to the playhead, including the in-progress move."""
         if not self.simulate_cut or not self.raw_positions:
             return
-        self._stock_simulator.set_display_vertex(max(0, int(current_vertex)))
+        self._stock_simulator.set_display_vertex(max(0.0, float(current_vertex)))
 
     # repeat this function every 1/60 s
     def _on_frame_tick(self, _):
@@ -2670,6 +2789,7 @@ class GCodeViewer(Widget):
                 self.display_count = self.display_count + self.add_dir
 
         self.linemesh["display_count"] = float(self.display_count)
+        self._apply_path_alpha_uniform()
 
         # which segment we are located
         cur_display_distance = float(self.display_count)
@@ -2691,7 +2811,7 @@ class GCodeViewer(Widget):
         line_index_withratio = line_index + line_ratio
 
         self.cur_line_index = line_index_withratio
-        self._sync_stock_simulation(int(line_index_withratio))
+        self._sync_stock_simulation(line_index_withratio)
 
         self._update_pointer_tool_mesh(int(line_index_withratio))
 
@@ -2719,23 +2839,21 @@ class GCodeViewer(Widget):
         if pointer_updated_pos < len(self.positions):
             base_start = int(line_index_withratio)
             ratio = line_index_withratio - base_start
-            offset = 0.0
 
-            last_pos = vec3_sub(self.meshmanager.get_vertex_position(int(line_index_withratio)), self.lines_center)
+            last_world_pos = self.meshmanager.get_vertex_position(int(line_index_withratio))
+            self.pointermesh["offset"] = vec3_sub(last_world_pos, self.lines_center)
 
             if self.is_4_axis:
                 last_angle = self.angles_of_vertices[int(pointer_updated_pos / 3)]
 
             if ratio > 0.0 and pointer_updated_pos + 5 < len(self.positions):
-                next_pos = vec3_sub(
-                    self.meshmanager.get_vertex_position(int(line_index_withratio) + 1), self.lines_center
-                )
-                lerp_pos = [
-                    next_pos[0] * ratio + (1.0 - ratio) * last_pos[0],
-                    next_pos[1] * ratio + (1.0 - ratio) * last_pos[1],
-                    next_pos[2] * ratio + (1.0 - ratio) * last_pos[2],
+                next_world_pos = self.meshmanager.get_vertex_position(int(line_index_withratio) + 1)
+                lerp_world_pos = [
+                    next_world_pos[0] * ratio + (1.0 - ratio) * last_world_pos[0],
+                    next_world_pos[1] * ratio + (1.0 - ratio) * last_world_pos[1],
+                    next_world_pos[2] * ratio + (1.0 - ratio) * last_world_pos[2],
                 ]
-                self.pointermesh["offset"] = lerp_pos
+                self.pointermesh["offset"] = vec3_sub(lerp_world_pos, self.lines_center)
 
                 if self.is_4_axis:
                     next_angle = self.angles_of_vertices[int(pointer_updated_pos / 3) + 1]
@@ -2746,27 +2864,16 @@ class GCodeViewer(Widget):
                         rot = rotate_mat_by_x_axis_angle(-lerp_angle)
                         self.linemesh["rotation_mat"] = rot
                         self._set_stock_rotation_mat(rot)
-                        len_to_center = len_2d(
-                            [lerp_pos[1], lerp_pos[2]], [-self.lines_center[1], -self.lines_center[2]]
-                        )
-                        rot_point = self.linemesh["rotation_mat"].transform_point(lerp_pos[0], lerp_pos[1], lerp_pos[2])
-
-                        self.pointermesh["offset"] = rot_point
+                        self.pointermesh["offset"] = rotate_point_then_center(lerp_world_pos, self.lines_center, rot)
             else:
                 if self.is_4_axis:
                     if not self.rotate_line_or_knife:
                         self.pointermesh["rotation"] = rotate_mat_by_x_axis_angle(last_angle)
                     else:
                         rot = rotate_mat_by_x_axis_angle(-last_angle)
-                        self.linemesh["view_mat"] = self.linemesh["view_mat"].multiply(rot)
+                        self.linemesh["rotation_mat"] = rot
                         self._set_stock_rotation_mat(rot)
-
-                        len_to_center = len_3d(last_pos, [-self.lines_center[0], -self.lines_center[1], 0])
-                        self.pointermesh["offset"] = [
-                            -self.lines_center[0],
-                            -self.lines_center[1],
-                            len_to_center - self.lines_center[2],
-                        ]
+                        self.pointermesh["offset"] = rotate_point_then_center(last_world_pos, self.lines_center, rot)
 
         self.pointermesh["modelview_mat"] = self.m_viewMatrix
 
@@ -2896,6 +3003,85 @@ class GCodeViewer(Widget):
 
     def is_grid_visible(self):
         return self._grid_visible
+
+    def _path_fade_now(self):
+        """Playhead distance used for Ghost recency; full-path (-1) fades toward the end."""
+        total = 0.0
+        lengths = getattr(self, "lengths", None)
+        if lengths:
+            total = float(lengths[-1])
+        now = float(getattr(self, "display_count", 0.0) or 0.0)
+        mesh = getattr(self, "linemesh", None)
+        if mesh is not None:
+            try:
+                shader_now = float(mesh["display_count"])
+            except (KeyError, TypeError, ValueError):
+                shader_now = now
+            if shader_now < 0.0:
+                return total
+        if now < 0.0:
+            return total
+        if total > 0.0:
+            return min(max(now, 0.0), total)
+        return max(now, 0.0)
+
+    def _path_part_diagonal_scaled(self):
+        """Toolpath AABB diagonal in the same scaled units as display_count / lengths."""
+        manager = getattr(self, "meshmanager", None)
+        if manager is None:
+            return 0.0
+        min_pt = getattr(manager, "min_pt", None)
+        max_pt = getattr(manager, "max_pt", None)
+        if min_pt is None or max_pt is None:
+            return 0.0
+        diag = bbox_diagonal(min_pt, max_pt)
+        if diag <= 0.0:
+            return 0.0
+        scale = float(getattr(manager, "position_scale", 0.0) or 0.0)
+        if scale <= 0.0:
+            scale = float(getattr(self, "move_scale_by_positon", 0.0) or 0.0)
+        if scale <= 0.0:
+            return 0.0
+        return diag * scale
+
+    def _path_ghost_span(self, now):
+        """Ghost recency length: one part-diagonal of travel, never longer than the playhead."""
+        part = self._path_part_diagonal_scaled() * PATH_GHOST_RECENT_PART_FRACTION
+        if now > 0.0 and part > 0.0:
+            return float(min(part, now))
+        return 1e-6
+
+    def _apply_path_alpha_uniform(self):
+        if getattr(self, "linemesh", None) is None:
+            return
+        ghost = bool(getattr(self, "_path_ghosted", False))
+        now = self._path_fade_now()
+        self.linemesh["path_alpha"] = PATH_GHOST_ALPHA if ghost else 1.0
+        self.linemesh["path_alpha_recent"] = PATH_GHOST_RECENT_ALPHA if ghost else 1.0
+        self.linemesh["path_fade_now"] = float(now)
+        self.linemesh["path_fade_span"] = float(self._path_ghost_span(now) if ghost else 1.0)
+
+    def _setup_path_gl(self, *_args):
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        # Ghosted lines must not stamp depth, otherwise overlapping wraps and stock stay hidden.
+        glDepthMask(GL_FALSE if self._path_ghosted else GL_TRUE)
+
+    def _reset_path_gl(self, *_args):
+        glDepthMask(GL_TRUE)
+
+    def set_path_ghosted(self, enabled=True):
+        enabled = bool(enabled)
+        if enabled == self._path_ghosted:
+            return
+        self._path_ghosted = enabled
+        Config.set("carvera", CONFIG_GHOST_PATHS_KEY, "1" if enabled else "0")
+        Config.write()
+        self._apply_path_alpha_uniform()
+        self._scene_dirty = True
+
+    def is_path_ghosted(self):
+        return self._path_ghosted
 
     def _ortho_zoom_factor(self):
         """Ortho zoom is r/PROJ_NEAR larger than perspective for the same apparent

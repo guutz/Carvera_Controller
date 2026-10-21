@@ -183,13 +183,14 @@ def kivy_app():
     from carveracontroller.translation import tr
 
     # Replicate main() startup sequence (main.py:6470-6494)
-    translation.init(None)
+    translation.init("en")
     load_constants()
     set_config_defaults(tr.lang)
     load_app_configs()
 
     # Suppress hardware access and network requests AFTER config sections exist
     Config.set("carvera", "show_update", "0")
+    Config.set("carvera", "tutorial_completed", "1")
     Config.set("carvera", "address", "")
     Config.set("carvera", "pendant_type", "None")
 

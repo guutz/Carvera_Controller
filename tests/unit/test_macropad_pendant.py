@@ -93,6 +93,9 @@ class FakeController:
         self.calls.append(("start", move, feed))
         self.continuous_jog_active = True
 
+    def continuousJogBusy(self):
+        return self.continuous_jog_active
+
     def stopContinuousJog(self):
         self.calls.append(("stop",))
         self.continuous_jog_active = False
@@ -1749,3 +1752,22 @@ class TestFourthAxisJog:
             "modifiers": {"9": {"name": "GOTO", "targets": {"3": "margin"}}},
         }
         pendant_module.validate_macropad_layout(layout)
+
+
+def test_continuous_jog_recovers_from_a_lost_stop_ack():
+    """
+    The firmware acks a continuous-jog stop with ^Y. If that ack is lost,
+    continuous_jog_active stays True; Controller.continuousJogBusy() expires it
+    after CONTINUOUS_JOG_STOP_TIMEOUT, and is the only thing that does since
+    upstream dropped the firmware-message handler. Gating on the bare flag would
+    leave the pendant unable to jog again.
+    """
+    pendant = make_pendant(jog_mode=Controller.JOG_MODE_CONTINUOUS)
+    pendant._controller.continuous_jog_active = True  # stale: the ack never came
+    pendant._controller.continuousJogBusy = lambda: False  # ...and it has expired
+    starts = []
+    pendant._controller.startContinuousJog = lambda move, feed: starts.append(move)
+
+    pendant._handle_continuous_jog("X", 1)
+
+    assert starts == ["X1"]

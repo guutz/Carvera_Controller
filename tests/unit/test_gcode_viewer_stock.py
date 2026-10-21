@@ -21,6 +21,18 @@ def _viewer(**kwargs) -> GCodeViewer:
     return viewer
 
 
+def test_show_all_moves_playhead_to_end_of_new_path():
+    viewer = _viewer(lengths=[0.0, 10.0, 25.0], cur_line_index=99.0, display_count=1.0, dynamic_display=True)
+
+    viewer.show_all()
+
+    assert viewer.dynamic_display is False
+    assert viewer.display_count == 25.0
+    assert viewer.cur_line_index == pytest.approx(2.0)
+    viewer._stock_simulator.set_display_vertex.assert_called_once_with(pytest.approx(2.0))
+    assert viewer._scene_dirty is True
+
+
 def test_carved_stock_hidden_while_deferred_after_pause():
     viewer = _viewer(dynamic_display=False, _defer_carved_stock=True)
     assert viewer._carved_stock_visible() is False
@@ -211,6 +223,18 @@ def test_pcb_surface_eps_thinner_than_isolation_and_cell():
     assert eps < 0.05
 
 
+def test_chamfer_shadow_lift_skips_rotary_shells():
+    """Mid-range normal Z is the cylinder shoulder; only rectangular chamfers get the lift."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "carveracontroller" / "shaders" / "carved_stock.glsl").read_text()
+    start = src.index("A steep chamfer")
+    block = src[start : src.index("float is_surface")]
+    assert "cylindrical_skin < 0.5" in block
+    assert "1.0 - smoothstep(0.60, 0.85, up)" in block
+    assert "smoothstep(0.85" not in block
+
+
 def test_two_tone_skin_uses_stock_local_space_not_rotated_z():
     """Foil/skin must follow the stock face under A rotation; rotary caps stay core."""
     from pathlib import Path
@@ -256,7 +280,7 @@ def test_format_sim_hud_cylindrical_names_od():
     }
     text = viewer._format_sim_hud_text()
     assert "Cylindrical: 800x472" in text
-    assert "0.38 mm along X and at Ø50" in text
+    assert "Resolution: 0.38 mm along X and at Ø50" in text
     assert "mm/cell" not in text
 
 
@@ -273,7 +297,7 @@ def test_format_sim_hud_heightmap_keeps_mm_per_cell():
         "checkpoint_head_vertex": 0,
     }
     text = viewer._format_sim_hud_text()
-    assert "Heightmap: 200x200 - 0.21mm/cell" in text
+    assert "Heightmap: 200x200\nResolution: 0.21mm/cell" in text
 
 
 def test_simulation_available_with_cam_tool_table():
@@ -314,6 +338,14 @@ def test_simulation_unavailable_empty_path_without_tool_table():
     assert viewer.simulation_available() is False
 
 
+def test_simulation_unavailable_without_native_carve(monkeypatch):
+    import carveracontroller.addons.stock.simulator.native as native
+
+    monkeypatch.setattr(native, "native_enabled", lambda: False)
+    viewer = _viewer(tool_table={1: object()}, raw_tools=[])
+    assert viewer.simulation_available() is False
+
+
 def test_set_stock_material_only_skips_simulation_restart():
     from carveracontroller.addons.stock.stock_geometry import StockBounds
     from carveracontroller.addons.stock.stock_material import DEFAULT_MATERIAL, MATERIAL_PCB
@@ -327,7 +359,7 @@ def test_set_stock_material_only_skips_simulation_restart():
         stock_visible=True,
         simulate_cut=True,
         stock_mesh_while_playing=False,
-        stock_voxel_resolution="low",
+        stock_carver_resolution="low",
         stock_checkpoint_level="medium",
         stock_carver_mode="auto",
         stock_material=DEFAULT_MATERIAL,
@@ -344,7 +376,7 @@ def test_set_stock_material_only_skips_simulation_restart():
         bounds,
         visible=True,
         simulate_cut=True,
-        voxel_resolution="low",
+        carver_resolution="low",
         checkpoint_level="medium",
         mesh_while_playing=False,
         carver_mode="auto",
@@ -370,7 +402,7 @@ def test_set_stock_resolution_change_restarts_simulation():
         stock_visible=True,
         simulate_cut=True,
         stock_mesh_while_playing=False,
-        stock_voxel_resolution="low",
+        stock_carver_resolution="low",
         stock_checkpoint_level="medium",
         stock_carver_mode="auto",
         stock_material="beige",
@@ -387,7 +419,7 @@ def test_set_stock_resolution_change_restarts_simulation():
         bounds,
         visible=True,
         simulate_cut=True,
-        voxel_resolution="high",
+        carver_resolution="high",
         checkpoint_level="medium",
         mesh_while_playing=False,
         carver_mode="auto",
@@ -396,3 +428,81 @@ def test_set_stock_resolution_change_restarts_simulation():
     )
 
     viewer._restart_stock_simulation.assert_called_once()
+
+
+def test_carved_stock_hidden_when_sim_mesh_hidden():
+    viewer = _viewer(sim_mesh_visible=False, dynamic_display=False, _defer_carved_stock=False)
+    assert viewer._carved_stock_visible() is False
+
+
+def test_set_sim_mesh_visible_hides_without_restarting():
+    viewer = _viewer(simulate_cut=True, sim_mesh_visible=True)
+    viewer._rebuild_stock_mesh = MagicMock()
+    viewer._ensure_stock_on_canvas = MagicMock()
+    viewer._restart_stock_simulation = MagicMock()
+
+    GCodeViewer.set_sim_mesh_visible(viewer, False)
+
+    assert viewer.simulate_cut is True
+    assert viewer.sim_mesh_visible is False
+    viewer._rebuild_stock_mesh.assert_called_once()
+    viewer._ensure_stock_on_canvas.assert_called_once()
+    viewer._restart_stock_simulation.assert_not_called()
+    viewer._stock_simulator.disable.assert_not_called()
+    viewer._stock_simulator.reset.assert_not_called()
+    assert viewer._scene_dirty is True
+
+
+def test_set_sim_mesh_visible_show_rebuilds_without_restarting():
+    viewer = _viewer(simulate_cut=True, sim_mesh_visible=False)
+    viewer._rebuild_stock_mesh = MagicMock()
+    viewer._ensure_stock_on_canvas = MagicMock()
+    viewer._restart_stock_simulation = MagicMock()
+
+    GCodeViewer.set_sim_mesh_visible(viewer, True)
+
+    assert viewer.simulate_cut is True
+    assert viewer.sim_mesh_visible is True
+    viewer._rebuild_stock_mesh.assert_called_once()
+    viewer._ensure_stock_on_canvas.assert_called_once()
+    viewer._restart_stock_simulation.assert_not_called()
+    viewer._stock_simulator.disable.assert_not_called()
+
+
+def test_ensure_stock_on_canvas_hide_keeps_carved_meshes():
+    viewer = _viewer(
+        simulate_cut=True,
+        sim_mesh_visible=False,
+        stock_visible=True,
+        _viewer_meshes_active=True,
+    )
+    viewer.stockmesh = object()
+    viewer.carvedmesh = object()
+    viewer.gridmesh = object()
+    viewer.canvas = MagicMock()
+    viewer.canvas.children = [viewer.gridmesh]
+    viewer._clear_carved_meshes = MagicMock()
+    viewer._raise_view_cube_to_top = MagicMock()
+
+    GCodeViewer._ensure_stock_on_canvas(viewer)
+
+    viewer._clear_carved_meshes.assert_not_called()
+    viewer.canvas.insert.assert_called_once_with(1, viewer.stockmesh)
+
+
+def test_set_activity_emits_only_on_change():
+    import threading
+
+    from carveracontroller.addons.stock.simulator.worker import StockSimulator
+
+    events = []
+    sim = StockSimulator.__new__(StockSimulator)
+    sim._lock = threading.RLock()
+    sim._activity = False
+    sim._on_activity = events.append
+
+    StockSimulator._set_activity(sim, True)
+    StockSimulator._set_activity(sim, True)
+    StockSimulator._set_activity(sim, False)
+
+    assert events == [True, False]

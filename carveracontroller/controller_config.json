@@ -113,6 +113,14 @@
     },
     {
         "type": "bool",
+        "title": "Auto-Correct MDI Command Case",
+        "desc": "Automatically correct the case of commands entered in the MDI when they match a known command, including parameters defined for that command. For example, 'g0 x10 f1' becomes 'G0 X10 F1'. Firmware commands are case-sensitive.",
+        "section": "carvera",
+        "key": "mdi_auto_correct_case",
+        "default": "1"
+    },
+    {
+        "type": "bool",
         "title": "Allow MDI Commands When Machine Running",
         "desc": "This could allow for dangerous movements, or firmware corruption if MDI commands are used while file uploads are occuring. Use this functionality with caution.",
         "section": "carvera",
@@ -137,8 +145,8 @@
     },
     {
         "type": "bool",
-        "title": "Invert Y-Axis Jogging Buttons and Keyboard Controls",
-        "desc": "When enabled, the up arrow key will move the spindle up (away from user) relative to the work bed and the down arrow key will move the spindle down (towards the user)",
+        "title": "Invert Y-Axis Jogging Buttons",
+        "desc": "When enabled, the upper jogging button shortcut move the spindle away from the user and the lower button move it towards the user. To invert the keyboard controls, use the Keyboard Shortcuts settings.",
         "section": "carvera",
         "key": "invert_y_axis_jogging",
         "default": "false"
@@ -235,10 +243,10 @@
     {
         "type": "bool",
         "title": "Auto lights on connect",
-        "desc": "Turn the enclosure light on when connecting and off when disconnecting or closing the app. On Community Firmware, also sets the LED bar to blue on connect and off on disconnect",
+        "desc": "Turn the enclosure light on when connecting and off when disconnecting or closing the app",
         "section": "carvera",
         "key": "auto_lights_on_connect",
-        "default": "1"
+        "default": "0"
     },
     {
         "type": "options",

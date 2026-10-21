@@ -90,6 +90,8 @@ def build_pyinstaller_args(
         "usb",
         "--hiddenimport",
         "usb.backend.libusb1",
+        "--hiddenimport",
+        "carveracontroller.addons.stock.simulator.native.lib._stock_carve",
     ]
 
     logger.info(f"Add bundled package assets: {PACKAGE_PATH}")
@@ -605,6 +607,8 @@ def main():
 
     ######### Run PyInstaller for all os expcept those that don't use it #########
     if os_name not in ("ios", "pypi", "android"):
+        logger.info("Compiling native stock carve extension")
+        subprocess.run([sys.executable, str(BUILD_PATH / "build_native.py")], check=True)
         build_args = build_pyinstaller_args(
             os=os_name,
             output_filename=output_filename,

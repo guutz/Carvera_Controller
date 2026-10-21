@@ -22,7 +22,9 @@ from carveracontroller.addons.beds.materials import (
     normalize_bed_material,
 )
 from carveracontroller.addons.beds.mesh_loader import read_obj_metadata
+from carveracontroller.addons.beds.placement import default_origin_xy
 from carveracontroller.addons.beds.store import resolve_mesh_path
+from carveracontroller.CNC import CNC
 from carveracontroller.translation import tr
 from carveracontroller.ui.LocalFilePicker import open_local_file_picker
 
@@ -162,14 +164,22 @@ class BedEditorPopup(ModalView):
             return
         catalog_id = self._id_from_spinner(self.ids.spn_model, self._model_pairs)
         self._sync_custom_ui()
-        if catalog_id and catalog_id != CUSTOM_CATALOG_ID:
-            plate = plate_by_id(catalog_id)
-            if plate is not None:
-                self._set_spinner_by_id(self.ids.spn_material, self._material_pairs, plate.default_material)
-                if not (self.ids.ti_name.text or "").strip():
-                    self.ids.ti_name.text = plate.label
+        plate = plate_by_id(catalog_id) if catalog_id and catalog_id != CUSTOM_CATALOG_ID else None
+        if plate is not None:
+            self._set_spinner_by_id(self.ids.spn_material, self._material_pairs, plate.default_material)
+            if not (self.ids.ti_name.text or "").strip():
+                self.ids.ti_name.text = plate.label
         else:
             self._set_spinner_by_id(self.ids.spn_material, self._material_pairs, DEFAULT_MATERIAL)
+        x, y = default_origin_xy(
+            float(CNC.vars.get("anchor1_x") or 0.0),
+            float(CNC.vars.get("anchor1_y") or 0.0),
+            float(CNC.vars.get("anchor_width") or 15.0),
+            0.0 if plate is None or plate.offset_x_mm is None else plate.offset_x_mm,
+            0.0 if plate is None or plate.offset_y_mm is None else plate.offset_y_mm,
+        )
+        self.ids.txt_mcs_x.text = _format_mm(x)
+        self.ids.txt_mcs_y.text = _format_mm(y)
         self._refresh_thickness_hint()
 
     def _sync_custom_ui(self) -> None:

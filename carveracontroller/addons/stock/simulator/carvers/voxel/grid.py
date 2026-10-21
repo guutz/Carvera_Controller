@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from carveracontroller.addons.stock.simulator.simulation_quality import (
-    DEFAULT_VOXEL_RESOLUTION,
+    DEFAULT_CARVER_RESOLUTION,
     MAX_CELL_SIZE_MM,
     MIN_CELL_SIZE_MM,
     VOXEL_TARGET_BY_LEVEL,
@@ -27,7 +27,7 @@ MAX_VOXEL_SIZE_MM = MAX_CELL_SIZE_MM["voxel"]
 
 def pick_voxel_size_mm(
     bounds: StockBounds,
-    target: int = VOXEL_TARGET_BY_LEVEL[DEFAULT_VOXEL_RESOLUTION],
+    target: int = VOXEL_TARGET_BY_LEVEL[DEFAULT_CARVER_RESOLUTION],
 ) -> float:
     """Choose a voxel size so the longest stock axis has roughly ``target`` voxels."""
     return pick_cell_size_mm(bounds, carver="voxel", target=target)
@@ -81,6 +81,10 @@ class ChunkedVoxelGrid:
 
         # Lazily populated: missing key == CHUNK_FULL (untouched solid stock).
         self._chunks: dict[tuple[int, int, int], object] = {}
+        # Cached solid voxel counts for materialised arrays (avoids arr.sum() on
+        # every carve-batch first touch). Value is (count, id(arr)) so a replaced
+        # array (delta restore / new buffer) invalidates automatically.
+        self._solid_counts: dict[tuple[int, int, int], tuple[int, int]] = {}
         # Interior chunks are entirely in-bounds; share one mask. Edge chunks cache.
         cs = self.chunk_size
         self._full_valid = np.ones((cs, cs, cs), dtype=bool)
@@ -88,6 +92,7 @@ class ChunkedVoxelGrid:
 
     def reset(self) -> None:
         self._chunks.clear()
+        self._solid_counts.clear()
 
     def snapshot_non_full(self) -> tuple[dict[tuple[int, int, int], object], int]:
         """Copy EMPTY / array chunks only (missing key ⇒ FULL).
@@ -111,11 +116,16 @@ class ChunkedVoxelGrid:
     def restore_non_full(self, chunks: dict[tuple[int, int, int], object]) -> None:
         """Replace grid contents from a :meth:`snapshot_non_full` payload."""
         self._chunks.clear()
+        self._solid_counts.clear()
         for key, state in chunks.items():
             if state is CHUNK_EMPTY:
                 self._chunks[key] = CHUNK_EMPTY
             elif isinstance(state, np.ndarray):
-                self._chunks[key] = state.copy()
+                arr = state.copy()
+                self._chunks[key] = arr
+                # Recompute once at restore so later carve batches never see a
+                # stale count from a previous timeline.
+                self._solid_counts[key] = (int(arr.sum()), id(arr))
             # Ignore unexpected FULL entries — absence already means FULL.
 
     def copy_chunks(self, keys: set[tuple[int, int, int]]) -> ChunkedVoxelGrid:
@@ -210,12 +220,35 @@ class ChunkedVoxelGrid:
             arr = np.zeros((self.chunk_size, self.chunk_size, self.chunk_size), dtype=np.uint8)
             arr[self._valid_mask(coord)] = 1
             self._chunks[key] = arr
+            self._solid_counts[key] = (self._valid_count(coord), id(arr))
             return arr
         return state  # type: ignore[return-value]
 
     def release_unmodified_full(self, coord: ChunkCoord) -> None:
         """Drop a just-materialised FULL chunk that was never carved (missing ⇒ FULL)."""
-        self._chunks.pop(coord.as_tuple(), None)
+        key = coord.as_tuple()
+        self._chunks.pop(key, None)
+        self._solid_counts.pop(key, None)
+
+    def cached_solid_count(self, coord: ChunkCoord | tuple[int, int, int], arr: np.ndarray) -> int:
+        """Return the solid count for ``arr``, computing and caching it once if needed."""
+        key = coord.as_tuple() if isinstance(coord, ChunkCoord) else coord
+        arr_id = id(arr)
+        cached = self._solid_counts.get(key)
+        if cached is not None and cached[1] == arr_id:
+            return int(cached[0])
+        n = int(arr.sum())
+        self._solid_counts[key] = (n, arr_id)
+        return n
+
+    def note_solid_count(self, coord: ChunkCoord | tuple[int, int, int], solid: int) -> None:
+        """Record the solid count returned by a carve pass (or collapse)."""
+        key = coord.as_tuple() if isinstance(coord, ChunkCoord) else coord
+        state = self._chunks.get(key)
+        if isinstance(state, np.ndarray):
+            self._solid_counts[key] = (int(solid), id(state))
+        else:
+            self._solid_counts.pop(key, None)
 
     def _chunk_fully_in_bounds(self, coord: ChunkCoord) -> bool:
         """True when every local voxel of ``coord`` lies inside ``nx/ny/nz``."""
@@ -259,19 +292,25 @@ class ChunkedVoxelGrid:
         """Collapse a fully-empty or fully-solid-in-bounds chunk to a sentinel."""
         key = coord.as_tuple()
         n = int(arr.sum()) if solid_count is None else int(solid_count)
+        # Always refresh the cache: callers like shape seeding overwrite the
+        # array after materialise, so a prior FULL count would be stale.
+        self._solid_counts[key] = (n, id(arr))
         if n == 0:
             self._chunks[key] = CHUNK_EMPTY
+            self._solid_counts.pop(key, None)
             return
         n_valid = self._valid_count(coord)
         if n < n_valid:
             return
         if self._chunk_fully_in_bounds(coord):
             self._chunks[key] = CHUNK_FULL
+            self._solid_counts.pop(key, None)
             return
         valid = self._valid_mask(coord)
         if valid.any() and not arr[~valid].any():
             # All in-bounds voxels solid and no stray padding solid → FULL.
             self._chunks[key] = CHUNK_FULL
+            self._solid_counts.pop(key, None)
 
     def chunk_world_origin(self, coord: ChunkCoord) -> tuple[float, float, float]:
         """World-space min corner of the chunk's voxel (0,0,0)."""

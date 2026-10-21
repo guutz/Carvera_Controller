@@ -40,7 +40,6 @@ class StockMaterialStyle:
     surface_rgb: Rgb
     fill_alpha: float
     edge_rgba: Rgba
-    use_height_tint: bool
     preview_rgb: Rgb | None = None
     interior_rgb: Rgb | None = None
     surface_thickness_mm: float = 0.1
@@ -79,7 +78,6 @@ _STYLES: dict[str, StockMaterialStyle] = {
         surface_rgb=(DEFAULT_COLOR[0], DEFAULT_COLOR[1], DEFAULT_COLOR[2]),
         fill_alpha=STOCK_FILL_COLOR[3],
         edge_rgba=STOCK_EDGE_COLOR,
-        use_height_tint=True,
         preview_rgb=(STOCK_FILL_COLOR[0], STOCK_FILL_COLOR[1], STOCK_FILL_COLOR[2]),
         surface_thickness_mm=0.0,
         roughness=0.92,
@@ -89,7 +87,6 @@ _STYLES: dict[str, StockMaterialStyle] = {
         surface_rgb=(0.85, 0.55, 0.22),
         fill_alpha=0.38,
         edge_rgba=(0.65, 0.40, 0.15, 0.90),
-        use_height_tint=False,
         interior_rgb=(0.52, 0.48, 0.28),
         surface_thickness_mm=0.035,
         metallic=1.0,
@@ -102,7 +99,6 @@ _STYLES: dict[str, StockMaterialStyle] = {
         surface_rgb=(0.52, 0.34, 0.18),
         fill_alpha=0.36,
         edge_rgba=(0.62, 0.42, 0.22, 0.90),
-        use_height_tint=False,
         roughness=0.80,
     ),
     MATERIAL_ACRYLIC: StockMaterialStyle(
@@ -110,7 +106,6 @@ _STYLES: dict[str, StockMaterialStyle] = {
         surface_rgb=(0.62, 0.78, 0.86),
         fill_alpha=0.16,
         edge_rgba=(0.75, 0.88, 0.94, 0.70),
-        use_height_tint=False,
         roughness=0.12,
     ),
     MATERIAL_ACRYLIC_BICOLOR: StockMaterialStyle(
@@ -118,7 +113,6 @@ _STYLES: dict[str, StockMaterialStyle] = {
         surface_rgb=(0.96, 0.96, 0.97),
         fill_alpha=0.22,
         edge_rgba=(0.88, 0.88, 0.90, 0.80),
-        use_height_tint=False,
         interior_rgb=(0.05, 0.05, 0.06),
         surface_thickness_mm=0.05,
         roughness=0.12,
@@ -129,7 +123,6 @@ _STYLES: dict[str, StockMaterialStyle] = {
         surface_rgb=(0.68, 0.70, 0.72),
         fill_alpha=0.32,
         edge_rgba=(0.88, 0.90, 0.92, 0.90),
-        use_height_tint=False,
         metallic=1.0,
         roughness=0.48,
     ),
@@ -138,7 +131,6 @@ _STYLES: dict[str, StockMaterialStyle] = {
         surface_rgb=(0.72, 0.40, 0.16),
         fill_alpha=0.32,
         edge_rgba=(0.90, 0.55, 0.22, 0.90),
-        use_height_tint=False,
         metallic=1.0,
         roughness=0.50,
     ),

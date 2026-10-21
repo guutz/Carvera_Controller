@@ -6,14 +6,6 @@ import quicklz
 # import os
 # os.environ["KIVY_METRICS_DENSITY"] = '1'
 
-CONFIG_FILES_TO_BACK_UP = [
-    "/sd/cartesian_nm.grid",
-    "/sd/config.default",
-    "/sd/config.txt",
-    "/sd/custom_tool_slots.txt",
-    "/sd/flex_compensation.dat",
-]
-
 MACHINE_CONFIG_FILES = {
     "C1": "config_c1.json",
     "CA1": "config_ca1.json",
@@ -91,7 +83,21 @@ from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.config import Config
 from kivy.factory import Factory
-from kivy.graphics import Color, Ellipse, InstructionGroup, Line, PopMatrix, PushMatrix, Rectangle, Rotate, Translate
+from kivy.graphics import (
+    Color,
+    Ellipse,
+    InstructionGroup,
+    Line,
+    PopMatrix,
+    PushMatrix,
+    Rectangle,
+    Rotate,
+    StencilPop,
+    StencilPush,
+    StencilUnUse,
+    StencilUse,
+    Translate,
+)
 from kivy.metrics import Metrics, dp
 from kivy.properties import (
     BooleanProperty,
@@ -145,6 +151,7 @@ from carveracontroller.addons.beds.store import (
 from carveracontroller.addons.beds.ui.BedSettingsPopup import BedSettingsPopup
 from carveracontroller.addons.cam import CamMetadata, extract_cam_metadata
 from carveracontroller.addons.facing.FacingWizardPopup import FacingWizardPopup
+from carveracontroller.addons.keyboard_shortcuts import SettingKeyboardShortcuts, ShortcutManager
 from carveracontroller.addons.pendant import (
     SUPPORTED_PENDANTS,
     OverrideController,
@@ -156,16 +163,59 @@ from carveracontroller.addons.probing.ProbingPopup import ProbingPopup
 from carveracontroller.addons.stock.stock_defaults import (
     bounds_from_settings,
     carver_mode_from_settings,
+    carver_resolution_from_settings,
     checkpoint_level_from_settings,
     default_settings,
     material_from_settings,
     mesh_while_playing_from_settings,
     shape_from_settings,
-    voxel_resolution_from_settings,
+    should_auto_simulate_cut,
 )
 from carveracontroller.addons.stock.stock_estimate import auto_stock_for_loaded_file, header_stock_usable
 from carveracontroller.addons.stock.ui.StockSettingsPopup import StockSettingsPopup
+from carveracontroller.documentation import resolve_documentation_url
 from carveracontroller.serial_listeners import dispatch_serial_line
+from carveracontroller.timelapse import format_timelapse_status, timelapse_is_recording
+from carveracontroller.ui.config_run import CoordPopup
+from carveracontroller.ui.file_browser import FileBrowserPopup
+from carveracontroller.ui.file_browser.sources import (
+    LOCATION_DEVICE,
+    is_job_file,
+    is_machine_video_path,
+    listing_has_directory,
+    local_child_path,
+    local_sibling_path,
+    machine_child_entry_path,
+    machine_listing_callback_matches,
+    machine_location_places,
+    machine_ls_is_superseded,
+    machine_path_key,
+    mkdir_local,
+    remove_local_path,
+    rename_local_path,
+)
+from carveracontroller.ui.file_browser.thumbnail import (
+    is_gcode_path,
+    machine_cache_key,
+    thumbnail_cache_for_app,
+)
+from carveracontroller.ui.tutorial.session import demo_is_active, tutorial_blocks_motion
+from carveracontroller.ui.tutorial.tour import Tutorial, apply_demo_readout
+from carveracontroller.ui.updates import UpgradePopup
+from carveracontroller.updater import (
+    EspOtaCancelled,
+    EspOtaError,
+    check_updates,
+    fetch_firmware_bin,
+    firmware_install_plan,
+    firmware_one_click_supported,
+    snapshot_with_prereleases,
+    upload_esp_ota,
+)
+from carveracontroller.updater.backup import matching_backup_paths
+from carveracontroller.updater.config import CACHE_SUBDIR, CONFIG_INCLUDE_PRERELEASES
+from carveracontroller.updater.download import DownloadCancelled, DownloadError
+from carveracontroller.updater.platform import detect_platform
 
 
 # Custom Property to monitor CNC.vars["sw_light"] changes
@@ -197,7 +247,6 @@ from functools import partial
 
 from kivy.core.text import LabelBase
 from kivy.core.window import Window
-from kivy.network.urlrequest import UrlRequest
 from kivy.resources import resource_add_path
 
 from .WIFIStream import MachineDetector
@@ -243,7 +292,7 @@ from .addons.camera.Z1Camera import (
     has_camera,
     set_resolution,
 )
-from .addons.intellisense.engine import highlight_mdi_line
+from .addons.intellisense.engine import correct_command_case, highlight_mdi_line
 from .addons.intellisense.ui import (
     IntellisenseExplainRowMixin,
     handle_mdi_intellisense_key,
@@ -398,6 +447,10 @@ class MDITextInput(TextInput):
 
     def keyboard_on_key_down(self, window, keycode, text, modifiers):
         key = keycode[0] if isinstance(keycode, (tuple, list)) else keycode
+        app = App.get_running_app()
+        manager = getattr(getattr(app, "root", None), "shortcut_manager", None)
+        if manager is not None and manager.handle_mdi_keydown(self, key, modifiers, text):
+            return True
         if handle_mdi_intellisense_key(self, key, modifiers):
             return True
         if self._handle_navigation_key(key, modifiers):
@@ -405,12 +458,8 @@ class MDITextInput(TextInput):
         return super().keyboard_on_key_down(window, keycode, text, modifiers)
 
     def _handle_navigation_key(self, key, modifiers):
-        ENTER_KEY = 13
         UP_ARROW_KEY = 273
         DOWN_ARROW_KEY = 274
-        if self.focus and "ctrl" in modifiers and key == ENTER_KEY:
-            self.send_mdi_command()
-            return True
         if self.focus and key == UP_ARROW_KEY:
             cursor_is_at_top_left = self.cursor_index() == 0
             can_move_backward_in_history = len(self.past_mdi_commands) > 0 and self.active_past_mdi_index > 0
@@ -445,13 +494,18 @@ class MDITextInput(TextInput):
 
         return False
 
+    def record_sent_command(self, command):
+        command = (command or "").strip()
+        if not command:
+            return
+        self.past_mdi_commands.append(command)
+        self.active_past_mdi_index = len(self.past_mdi_commands)
+
     def send_mdi_command(self):
         cmd_to_send = self.text.strip()
         if not cmd_to_send:
             return
         hide_mdi_intellisense()
-        self.past_mdi_commands.append(cmd_to_send)
-        self.active_past_mdi_index = len(self.past_mdi_commands)
         app = App.get_running_app()
         app.root.send_cmd()
 
@@ -688,15 +742,27 @@ class ReconnectionPopup(ModalView):
         self.wait_time = 10
         self.cancel_callback = None
         self.reconnect_callback = None
+        # Button press. Auto-retry uses reconnect_callback and stays quiet.
+        self.manual_reconnect_callback = None
+        # Returns True while a connect attempt is still opening.
+        self.in_progress = None
 
-    def start_countdown(self, max_attempts, wait_time, reconnect_callback, cancel_callback):
-        """Start auto-reconnect countdown mode"""
+    def start_countdown(
+        self, max_attempts, wait_time, reconnect_callback, cancel_callback, in_progress=None, manual_callback=None
+    ):
+        """Start auto-reconnect countdown mode.
+
+        ``reconnect_callback`` is the quiet auto-retry. ``manual_callback`` is
+        the Reconnect now button and reports why a try failed.
+        """
         self.auto_reconnect_mode = True
         self.max_attempts = max_attempts
         self.current_attempt = 0
         self.wait_time = wait_time
         self.reconnect_callback = reconnect_callback
+        self.manual_reconnect_callback = manual_callback or reconnect_callback
         self.cancel_callback = cancel_callback
+        self.in_progress = in_progress
         self.countdown = wait_time
         self.update_display()
 
@@ -704,6 +770,8 @@ class ReconnectionPopup(ModalView):
         """Show manual reconnect mode (no countdown)"""
         self.auto_reconnect_mode = False
         self.reconnect_callback = reconnect_callback
+        self.manual_reconnect_callback = reconnect_callback
+        self.in_progress = None
         self.update_display()
 
     def update_display(self):
@@ -723,17 +791,26 @@ class ReconnectionPopup(ModalView):
         if self.countdown > 0:
             self.countdown -= 1
             self.update_display()
-        else:
+            return
+
+        if self.in_progress is not None and self.in_progress():
+            # USB open runs on a worker. Counting this tick would burn an
+            # attempt that returned immediately, and the last tick would
+            # declare failure while that open is still in flight.
             self.countdown = self.wait_time
-            self.current_attempt += 1
-            if self.current_attempt <= self.max_attempts:
-                if self.reconnect_callback:
-                    self.reconnect_callback()
-                # Only call cancel_callback after the last attempt has been made
-                if self.current_attempt >= self.max_attempts:
-                    self.dismiss()
-                    if self.cancel_callback:
-                        self.cancel_callback()
+            self.update_display()
+            return
+
+        self.countdown = self.wait_time
+        self.current_attempt += 1
+        if self.current_attempt <= self.max_attempts:
+            if self.reconnect_callback:
+                self.reconnect_callback()
+            # Only call cancel_callback after the last attempt has been made
+            if self.current_attempt >= self.max_attempts:
+                self.dismiss()
+                if self.cancel_callback:
+                    self.cancel_callback()
 
     def cancel_reconnect(self):
         self.dismiss()
@@ -741,9 +818,10 @@ class ReconnectionPopup(ModalView):
             self.cancel_callback()
 
     def reconnect(self):
-        """Handle reconnect button press"""
-        if self.reconnect_callback:
-            self.reconnect_callback()
+        """Handle reconnect button press. Surfaces connection errors."""
+        callback = self.manual_reconnect_callback or self.reconnect_callback
+        if callback:
+            callback()
         self.dismiss()
 
     def on_dismiss(self):
@@ -777,6 +855,100 @@ class ProgressPopup(ModalView):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+
+class BatchProgressPopup(ModalView):
+    """Two-bar progress for a multi-file upload or download."""
+
+    file_text = StringProperty("")
+    file_value = NumericProperty(0)
+    batch_text = StringProperty("")
+    batch_value = NumericProperty(0)
+
+    def __init__(self, **kwargs):
+        self.cancel = lambda *_args: None
+        super().__init__(**kwargs)
+
+
+def batch_percents(completed_bytes, file_size, file_percent, total_bytes):
+    """Return (current file percent, batch percent) using byte sizes."""
+    file_percent = min(100.0, max(0.0, float(file_percent)))
+    done = completed_bytes + max(0, file_size) * file_percent / 100.0
+    if total_bytes <= 0:
+        return file_percent, 0.0
+    batch = min(100.0, max(0.0, 100.0 * done / total_bytes))
+    return file_percent, batch
+
+
+def format_byte_count(num_bytes):
+    n = max(0, int(num_bytes))
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+def transfer_confirm_message(paths, existing, folders, kind):
+    """Return (title, body) when a multi-file transfer needs confirmation.
+
+    ``paths`` are the files that will transfer. ``existing`` and ``folders``
+    are display names. ``kind`` is ``"upload"`` or ``"download"``. Returns
+    None when the transfer can start immediately.
+    """
+    if not existing and not folders:
+        return None
+    paragraphs = []
+    if existing:
+        if len(paths) == 1:
+            paragraphs.append(tr._("Confirm to overwrite file:") + " \n '%s'?" % existing[0])
+        else:
+            preview = "\n".join(existing[:5])
+            if len(existing) > 5:
+                preview += "\n..."
+            if kind == "upload":
+                header = tr._("Confirm to overwrite %d files that already exist on the machine?") % len(existing)
+                others_text = tr._("%d other selected files will also be uploaded.")
+            else:
+                header = tr._("Confirm to overwrite %d files that already exist on this device?") % len(existing)
+                others_text = tr._("%d other selected files will also be downloaded.")
+            block = header + "\n\n" + preview
+            others = len(paths) - len(existing)
+            if others:
+                block += "\n\n" + others_text % others
+            paragraphs.append(block)
+    if folders:
+        preview = "\n".join(folders[:5])
+        if len(folders) > 5:
+            preview += "\n..."
+        if kind == "upload":
+            header = (
+                tr._("1 selected folder will not be uploaded.")
+                if len(folders) == 1
+                else tr._("%d selected folders will not be uploaded.") % len(folders)
+            )
+            continue_text = (
+                tr._("Continue uploading 1 file?")
+                if len(paths) == 1
+                else tr._("Continue uploading %d files?") % len(paths)
+            )
+        else:
+            header = (
+                tr._("1 selected folder will not be downloaded.")
+                if len(folders) == 1
+                else tr._("%d selected folders will not be downloaded.") % len(folders)
+            )
+            continue_text = (
+                tr._("Continue downloading 1 file?")
+                if len(paths) == 1
+                else tr._("Continue downloading %d files?") % len(paths)
+            )
+        block = header + "\n\n" + preview
+        if not existing:
+            block += "\n\n" + continue_text
+        paragraphs.append(block)
+    title = tr._("File Already Exists") if existing else tr._("Folders are not transferred")
+    return title, "\n\n".join(paragraphs)
 
 
 class GCodeLineContextMenu(FloatLayout):
@@ -1074,11 +1246,6 @@ class PickFilePopup(FloatLayout):
             self.on_cancel()
 
 
-class UpgradePopup(ModalView):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-
 class AutoLevelPopup(ModalView):
     execute = False
 
@@ -1169,381 +1336,6 @@ class AutoLevelPopup(ModalView):
         else:
             app = App.get_running_app()
             Clock.schedule_once(partial(app.root.show_message_popup, error_message, False), 0)
-
-
-class FilePopup(ModalView):
-    firmware_mode = BooleanProperty(False)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-    def load_remote_page(self):
-        self.popup_manager.transition.direction = "right"
-        self.popup_manager.transition.duration = 0.3
-        self.popup_manager.current = "remote_page"
-        app = App.get_running_app()
-        if app.state == "Idle":
-            self.remote_rv.current_dir()
-
-    # -----------------------------------------------------------------------
-    def load_remote_root(self):
-        self.remote_rv.child_dir("")
-
-    # -----------------------------------------------------------------------
-    def update_local_buttons(self):
-        has_select = False
-        app = App.get_running_app()
-        for key in self.local_rv.view_adapter.views:
-            if (
-                self.local_rv.view_adapter.views[key].selected
-                and not self.local_rv.view_adapter.views[key].selected_dir
-            ):
-                has_select = True
-                break
-        self.btn_view.disabled = not has_select or self.firmware_mode
-        self.btn_upload.disabled = not has_select or app.state != "Idle"
-
-    # -----------------------------------------------------------------------
-    def update_remote_buttons(self):
-        selected_files = self.remote_rv.get_selected_files()
-        selected_infos = self.remote_rv.get_selected_file_infos()
-        has_select = len(selected_files) > 0
-        single_select = len(selected_files) == 1
-        select_dir = single_select and selected_infos[0].get("is_dir", False)
-        self.btn_delete.disabled = not has_select
-        self.btn_rename.disabled = not single_select
-        self.btn_select.disabled = (not single_select) or select_dir
-
-
-def background_image_model(name):
-    """Return the machine model a built-in background belongs to, or None if unknown."""
-    if name.startswith("CA1") or name.startswith("Air "):
-        return "CA1"
-    if name.startswith("C1"):
-        return "C1"
-    if name.startswith("Z1"):
-        return "Z1"
-    return None
-
-
-def filter_background_images(builtin_names, custom_names, model):
-    """Built-ins matching `model`, then unprefixed custom images (always shown)."""
-    matching = [name for name in builtin_names if background_image_model(name) == model]
-    matching.sort(key=str.casefold)
-    custom = sorted(custom_names, key=str.casefold)
-    return matching + custom
-
-
-def select_background_image(saved, matching):
-    """Pick a spinner value. persist is False when falling back so a mismatched saved setting is kept."""
-    values = ["None"] + list(matching)
-    if saved in values:
-        return saved, True
-    if matching:
-        return matching[0], False
-    return "None", False
-
-
-class CoordPopup(ModalView):
-    config = {}
-    mode = StringProperty()
-    vacuummode = ObjectProperty()
-    extoutmode = ObjectProperty()
-    autoblowmode = ObjectProperty()
-    autobedcleanmode = ObjectProperty()
-    ionizermode = ObjectProperty()
-    origin_popup = ObjectProperty()
-    zprobe_popup = ObjectProperty()
-    auto_level_popup = ObjectProperty()
-    setx_popup = ObjectProperty()
-    sety_popup = ObjectProperty()
-    setz_popup = ObjectProperty()
-    seta_popup = ObjectProperty()
-    settool_popup = ObjectProperty()
-    change_tool_popup = ObjectProperty()
-    MoveA_popup = ObjectProperty()
-
-    def __init__(self, config, **kwargs):
-        self.config = config
-        self.origin_popup = OriginPopup(self)
-        self.zprobe_popup = ZProbePopup(self)
-        self.auto_level_popup = AutoLevelPopup(self)
-        self.setx_popup = SetXPopup(self)
-        self.sety_popup = SetYPopup(self)
-        self.setz_popup = SetZPopup(self)
-        self.seta_popup = SetAPopup(self)
-        self.settool_popup = SetToolPopup(self)
-        self.change_tool_popup = ChangeToolPopup(self)
-        self.MoveA_popup = MoveAPopup(self)
-        self.mode = "Run"  # 'Margin' / 'ZProbe' / 'Leveling'
-        super().__init__(**kwargs)
-        self.user_play_file_image_dir = Config.get("carvera", "custom_bkg_img_dir")
-        self.custom_background_image_files = []
-        self.builtin_background_image_files = []
-        self._suppress_background_image_config_write = False
-
-        default_bkg_images = os.path.join(os.path.dirname(__file__), "data/play_file_image_backgrounds")
-
-        if os.path.exists(self.user_play_file_image_dir):
-            self.custom_background_image_files = [
-                f.replace(".png", "") for f in os.listdir(self.user_play_file_image_dir) if f.endswith(".png")
-            ]
-
-        for f in os.listdir(default_bkg_images):
-            if f.endswith(".png"):
-                self.builtin_background_image_files.append(f.replace(".png", ""))
-
-        Clock.schedule_once(self.populate_spinner, 0)
-        app = App.get_running_app()
-        if app is not None:
-            app.bind(model=self._on_machine_model_changed)
-
-    def _on_machine_model_changed(self, _instance, _value):
-        self.populate_spinner()
-
-    def populate_spinner(self, dt=None):
-        if "background_image_spinner" not in self.ids:
-            return
-        app = App.get_running_app()
-        model = app.model if app is not None else ""
-        matching = filter_background_images(
-            self.builtin_background_image_files, self.custom_background_image_files, model
-        )
-        saved_image = Config.get("carvera", "background_image")
-        selected, persist = select_background_image(saved_image, matching)
-        spinner = self.ids.background_image_spinner
-        self._suppress_background_image_config_write = not persist
-        try:
-            spinner.values = ["None"] + matching
-            if spinner.text != selected:
-                spinner.text = selected
-            else:
-                self.update_background_image(selected)
-        finally:
-            self._suppress_background_image_config_write = False
-
-    def update_background_image(self, filename):
-        if not self._suppress_background_image_config_write:
-            Config.set("carvera", "background_image", filename)
-            Config.write()
-
-        if filename != "None":
-            old_source = os.path.join(os.path.dirname(__file__), "data/play_file_image_backgrounds", filename)
-            new_source = os.path.join(self.user_play_file_image_dir, filename)
-            cnc_workspace = self.ids.cnc_workspace
-            if os.path.isfile(new_source + ".png"):
-                cnc_workspace.update_background_image(new_source + ".png")
-            elif os.path.isfile(old_source + ".png"):
-                cnc_workspace.update_background_image(old_source + ".png")
-            else:
-                cnc_workspace.update_background_image("None")
-        else:
-            cnc_workspace = self.ids.cnc_workspace
-            cnc_workspace.update_background_image("None")
-
-    def open_bkg_img_dir(self):
-        app = App.get_running_app()
-        folder_path = app.ids.coord_popup.user_play_file_image_dir
-
-        # Ensure the folder exists
-        if not os.path.exists(folder_path):
-            logger.warning(f"Folder '{folder_path}' does not exist!")
-            return
-
-        # Open based on OS
-        if platform.system() == "Windows":
-            os.startfile(folder_path)
-        elif platform.system() == "Darwin":  # macOS
-            subprocess.Popen(["open", folder_path])
-        else:  # Linux
-            subprocess.Popen(["xdg-open", folder_path])
-
-        folder_path = os.path.join(os.path.dirname(__file__), "data/play_file_image_backgrounds")
-
-        # Ensure the folder exists
-        if not os.path.exists(folder_path):
-            logger.warning(f"Folder '{folder_path}' does not exist!")
-            return
-
-        # Open based on OS
-        if platform.system() == "Windows":
-            os.startfile(folder_path)
-        elif platform.system() == "Darwin":  # macOS
-            subprocess.Popen(["open", folder_path])
-        else:  # Linux
-            subprocess.Popen(["xdg-open", folder_path])
-
-    def set_config(self, key1, key2, value):
-        self.config[key1][key2] = value
-        self.cnc_workspace.draw()
-
-    def load_config(self):
-        self.cnc_workspace.load_config(self.config)
-        Clock.schedule_once(self.cnc_workspace.draw, 0)
-
-        # init origin popup
-        origin_anchor = self.config["origin"]["anchor"]
-        if origin_anchor == 2 and not App.get_running_app().has_anchor2:
-            origin_anchor = 1
-            self.config["origin"]["anchor"] = 1
-        self.origin_popup.cbx_anchor1.active = origin_anchor == 1
-        self.origin_popup.cbx_anchor2.active = origin_anchor == 2
-        self.origin_popup.cbx_4axis_origin.active = origin_anchor == 3
-        self.origin_popup.cbx_current_position.active = origin_anchor == 4
-        self.origin_popup.txt_x_offset.text = str(self.config["origin"]["x_offset"])
-        self.origin_popup.txt_y_offset.text = str(self.config["origin"]["y_offset"])
-
-        self.load_origin_label()
-
-        if CNC.vars["vacuummode"] == 1:
-            self.vacuummode = True
-        else:
-            self.vacuummode = False
-
-        if CNC.vars["extoutmode"] == 1:
-            self.extoutmode = True
-        else:
-            self.extoutmode = False
-
-        if CNC.vars["autoblowmode"] == 1:
-            self.autoblowmode = True
-        else:
-            self.autoblowmode = False
-
-        if CNC.vars["autobedcleanmode"] == 1:
-            self.autobedcleanmode = True
-        else:
-            self.autobedcleanmode = False
-
-        if CNC.vars["ionizermode"] == 1:
-            self.ionizermode = True
-        else:
-            self.ionizermode = False
-
-        # Apply leveling before Z probe so turning both off does not warn.
-        self.cbx_margin.active = self.config["margin"]["active"]
-        self.cbx_leveling.active = self.config["leveling"]["active"]
-        self.cbx_zprobe.active = self.config["zprobe"]["active"]
-        # init zprobe popup
-        self.zprobe_popup.cbx_origin1.active = self.config["zprobe"]["origin"] == 1
-        self.zprobe_popup.cbx_origin2.active = self.config["zprobe"]["origin"] == 2
-        self.zprobe_popup.txt_x_offset.text = str(self.config["zprobe"]["x_offset"])
-        self.zprobe_popup.txt_y_offset.text = str(self.config["zprobe"]["y_offset"])
-
-        self.load_zprobe_label()
-
-        self.auto_level_popup.sp_x_points.text = str(self.config["leveling"]["x_points"])
-        self.auto_level_popup.sp_y_points.text = str(self.config["leveling"]["y_points"])
-        self.auto_level_popup.sp_height.text = str(self.config["leveling"]["height"])
-
-        self.load_leveling_label()
-
-    def load_origin_label(self):
-        app = App.get_running_app()
-        if app.has_4axis:
-            self.lb_origin.text = "(%g, %g) " % (
-                round(CNC.vars["wcox"] - CNC.vars["anchor1_x"] - CNC.vars["rotation_offset_x"], 4),
-                round(CNC.vars["wcoy"] - CNC.vars["anchor1_y"] - CNC.vars["rotation_offset_y"], 4),
-            ) + tr._("from Headstock")
-        else:
-            laser_x = CNC.vars["laser_module_offset_x"] if CNC.vars["lasermode"] else 0.0
-            laser_y = CNC.vars["laser_module_offset_y"] if CNC.vars["lasermode"] else 0.0
-            if self.config["origin"]["anchor"] == 2 and app.has_anchor2:
-                self.lb_origin.text = "(%g, %g) " % (
-                    round(CNC.vars["wcox"] + laser_x - CNC.vars["anchor1_x"] - CNC.vars["anchor2_offset_x"], 4),
-                    round(CNC.vars["wcoy"] + laser_y - CNC.vars["anchor1_y"] - CNC.vars["anchor2_offset_y"], 4),
-                ) + tr._("from Anchor2")
-            else:
-                self.lb_origin.text = "(%g, %g) " % (
-                    round(CNC.vars["wcox"] + laser_x - CNC.vars["anchor1_x"], 4),
-                    round(CNC.vars["wcoy"] + laser_y - CNC.vars["anchor1_y"], 4),
-                ) + tr._("from Anchor1")
-        self.lb_origin.text = CNC.wcs_names[CNC.vars["active_coord_system"]] + ": " + self.lb_origin.text
-
-    def load_zprobe_label(self):
-        app = App.get_running_app()
-        if app.has_4axis:
-            self.lb_zprobe.text = "(%g, %g) " % (
-                round(CNC.vars["anchor1_x"] + CNC.vars["rotation_offset_x"] - 3, 4),
-                round(CNC.vars["anchor1_y"] + CNC.vars["rotation_offset_y"], 4),
-            ) + tr._("Fixed Pos")
-        else:
-            self.lb_zprobe.text = (
-                "(%g, %g) " % (round(self.config["zprobe"]["x_offset"], 4), round(self.config["zprobe"]["y_offset"], 4))
-                + tr._("from")
-                + " %s" % (tr._("Work Origin") if self.config["zprobe"]["origin"] == 1 else tr._("Path Origin"))
-            )
-
-    def load_leveling_label(self):
-        self.lb_leveling.text = (
-            tr._("X Points: ")
-            + "%d " % (self.config["leveling"]["x_points"])
-            + tr._("Y Points: ")
-            + "%d " % (self.config["leveling"]["y_points"])
-            + tr._("Height: ")
-            + "%d" % (self.config["leveling"]["height"])
-        )
-
-        any_offsets_set = False
-        for offset_type in ["xn_offset", "xp_offset", "yn_offset", "yp_offset"]:
-            if self.config["leveling"][offset_type] != 0:
-                any_offsets_set = True
-
-        if any_offsets_set:
-            self.lb_leveling.text += (
-                tr._(" Offsets: ")
-                + tr._(" -X: ")
-                + "%g " % (round(self.config["leveling"]["xn_offset"], 4))
-                + tr._(" +X: ")
-                + "%g " % (round(self.config["leveling"]["xp_offset"], 4))
-                + tr._(" -Y: ")
-                + "%g " % (round(self.config["leveling"]["yn_offset"], 4))
-                + tr._(" +Y: ")
-                + "%g " % (round(self.config["leveling"]["yp_offset"], 4))
-            )
-
-    def _zprobe_controls_allowed(self):
-        app = App.get_running_app()
-        lasering = bool(app and getattr(app, "lasering", False))
-        return self.mode in ("Run", "ZProbe", "Leveling") and not lasering
-
-    def on_zprobe_checkbox(self, active):
-        app = App.get_running_app()
-        has_4axis = bool(app and getattr(app, "has_4axis", False))
-        allowed = self._zprobe_controls_allowed()
-        self.lb_zprobe.disabled = not active or not allowed
-        self.btn_zprobe.disabled = not active or has_4axis or not allowed
-        self.set_config("zprobe", "active", active)
-        if not active and self.cbx_leveling.active:
-            self._warn_zprobe_disabled_during_leveling()
-        self.toggle_config()
-
-    def on_leveling_checkbox(self, active):
-        app = App.get_running_app()
-        has_4axis = bool(app and getattr(app, "has_4axis", False))
-        leveling_allowed = self.mode in ("Run", "Leveling") and not has_4axis
-        self.lb_leveling.disabled = not active or not leveling_allowed
-        self.btn_leveling.disabled = not active or not leveling_allowed
-        self.set_config("leveling", "active", active)
-        if active:
-            self.cbx_zprobe.active = True
-            self.set_config("zprobe", "active", True)
-        self.toggle_config()
-
-    def _warn_zprobe_disabled_during_leveling(self):
-        app = App.get_running_app()
-        if app is None or getattr(app, "root", None) is None:
-            return
-        message = tr._(
-            "Auto Leveling without Auto Z Probe will use the current Z zero. "
-            "Probe Z first or leave Auto Z Probe enabled, or job height may be wrong."
-        )
-        Clock.schedule_once(partial(app.root.show_message_popup, message, False), 0)
-
-    def toggle_config(self):
-        # upldate main status
-        app = App.get_running_app()
-        app.root.update_coord_config()
 
 
 class DiagnosePopup(ModalView):
@@ -1981,6 +1773,14 @@ class MakeraConfigPanel(SettingsWithSidebar):
         self.register_type("colorpicker", custom_widgets.SettingColorPicker)
         self.register_type("gamepad_bindings", SettingGamepadBindings)
         self.register_type("macropad_layout", SettingMacroPadLayout)
+        self.register_type("keyboard_shortcuts", SettingKeyboardShortcuts)
+        self.interface.content.bind(current_uid=self._reset_panel_scroll)
+
+    @staticmethod
+    def _reset_panel_scroll(content, _uid):
+        # ContentPanel reuses one ScrollView for every settings page. Without
+        # resetting it, a tall page opens at the previous page's scroll offset.
+        Clock.schedule_once(lambda _dt: setattr(content, "scroll_y", 1), 0)
 
     def create_json_panel(self, title, config, filename=None, data=None):
         panel = super().create_json_panel(title, config, filename, data)
@@ -2106,6 +1906,7 @@ class GcodeViewerDisplayMenuButton(ButtonBehavior, BoxLayout):
 class GcodeViewerDisplayDropDown(ToolTipDropDown):
     show_grid = BooleanProperty(True)
     ortho_projection = BooleanProperty(False)
+    show_ghost = BooleanProperty(False)
     show_stock = BooleanProperty(False)
     show_bed = BooleanProperty(False)
 
@@ -2135,6 +1936,7 @@ class IconButton(BoxLayout, ToolTipButton):
 class TransparentButton(BoxLayout, ToolTipButton):
     icon = StringProperty("fresk.png")
     active = BooleanProperty(False)
+    recording = BooleanProperty(False)
 
 
 class TransparentGrayButton(BoxLayout, ToolTipButton):
@@ -2190,11 +1992,19 @@ class CNCWorkspace(Widget):
         self._sync_workspace_aspect()
         if abs(old_aspect - self.workspace_aspect) > 1e-4:
             return
-        if self.x <= 100:
+        # Skip until the preview has a real size and load_config has run.
+        # Screen x is not a signal: a centered dialog can sit near the left edge.
+        if self.width < 2 or self.height < 2 or "origin" not in self.config:
             return
         self.canvas.clear()
         zoom = self.width / CNC.vars["worksize_x"]
         with self.canvas:
+            # The bed drawing uses absolute coordinates and can extend past the
+            # preview. Keep the origin, work area, probe, and leveling marks inside it.
+            StencilPush()
+            Color(1, 1, 1, 1)
+            Rectangle(pos=self.pos, size=self.size)
+            StencilUse()
             # background
             Color(50 / 255, 50 / 255, 50 / 255, 1)
             if self.bg_image == "" or self.bg_image == "None":
@@ -2353,6 +2163,8 @@ class CNCWorkspace(Widget):
                             pos=((CNC.vars["xmin"] + x) * zoom - 5, (CNC.vars["ymin"] + y) * zoom - 5), size=(10, 10)
                         )
                 PopMatrix()
+            StencilUnUse()
+            StencilPop()
 
     def on_draw(self, obj, value):
         self.draw()
@@ -2677,397 +2489,6 @@ class GCodeRow(IntellisenseExplainRowMixin, RecycleDataViewBehavior, BoxLayout):
 Factory.register("GCodeRow", cls=GCodeRow)
 
 
-class SelectableBoxLayout(RecycleDataViewBehavior, BoxLayout):
-    """Add selection support to the Label"""
-
-    index = None
-    selected = BooleanProperty(False)
-    selected_dir = BooleanProperty(False)
-    selectable = BooleanProperty(True)
-
-    def refresh_view_attrs(self, rv, index, data):
-        """Catch and handle the view changes"""
-        self.index = index
-        return super().refresh_view_attrs(rv, index, data)
-
-    def on_touch_down(self, touch):
-        """Add selection on touch down"""
-        if super().on_touch_down(touch):
-            return True
-        if self.collide_point(*touch.pos) and self.selectable:
-            rv = self.parent.recycleview
-            if getattr(rv, "multi_select_enabled", False) and self.touch_has_desktop_modifier(touch):
-                self.select_with_desktop_modifiers(rv, touch)
-                return True
-            if touch.is_double_tap:
-                if rv.data[self.index]["is_dir"]:
-                    rv.child_dir(rv.data[self.index]["filename"])
-                else:
-                    rv.dispatch("on_double_tap")
-                return True
-            if getattr(rv, "multi_select_enabled", False):
-                self.select_with_desktop_modifiers(rv, touch)
-                return True
-            return self.parent.select_with_touch(self.index, touch)
-
-    def touch_desktop_modifiers(self, touch):
-        modifiers = set()
-        for source in (
-            getattr(touch, "modifiers", None),
-            getattr(Window, "modifiers", None),
-            getattr(Window, "_modifiers", None),
-        ):
-            if callable(source):
-                source = source()
-            if source:
-                modifiers.update(source)
-        return modifiers
-
-    def touch_has_desktop_modifier(self, touch):
-        modifiers = self.touch_desktop_modifiers(touch)
-        return bool({"ctrl", "control", "meta", "shift"} & modifiers)
-
-    def select_with_desktop_modifiers(self, rv, touch):
-        layout = self.parent
-        modifiers = self.touch_desktop_modifiers(touch)
-        ctrl_down = bool({"ctrl", "control", "meta"} & modifiers)
-        shift_down = "shift" in modifiers
-
-        if shift_down and rv.last_selected_index >= 0:
-            if not ctrl_down:
-                layout.clear_selection()
-            start = min(rv.last_selected_index, self.index)
-            end = max(rv.last_selected_index, self.index)
-            for index in range(start, end + 1):
-                layout.select_node(index)
-        elif ctrl_down:
-            if self.index in layout.selected_nodes:
-                layout.deselect_node(self.index)
-            else:
-                layout.select_node(self.index)
-            rv.last_selected_index = self.index
-        else:
-            layout.clear_selection()
-            layout.select_node(self.index)
-            rv.last_selected_index = self.index
-
-        rv.update_selected_files_from_layout(current_index=self.index)
-        rv.dispatch("on_select")
-
-    def apply_selection(self, rv, index, is_selected):
-        """Respond to the selection of items in the view."""
-        self.selected = is_selected
-        if self.selected:
-            if rv.data[self.index]["is_dir"]:
-                self.selected_dir = True
-            else:
-                self.selected_dir = False
-            rv.set_curr_selected_file(rv.data[self.index]["filename"], rv.data[self.index]["intsize"])
-        if not getattr(rv, "multi_select_enabled", False):
-            rv.update_selected_files_from_layout(current_index=self.index if self.selected else None)
-            rv.dispatch("on_select")
-
-
-# -----------------------------------------------------------------------
-# Data Recycle View
-# -----------------------------------------------------------------------
-class DataRV(RecycleView):
-    curr_dir = ""
-    curr_dir_name = StringProperty("")
-
-    base_dir = ""
-    base_dir_win = ""
-
-    curr_sort_key = StringProperty("date")
-    curr_sort_reverse = BooleanProperty(True)
-    curr_sort_str = ListProperty(["", " ↓", ""])
-
-    curr_path_list = ListProperty([])
-    curr_full_path_list = []
-    curr_file_list_buff = []
-
-    default_sort_reverse = {"name": False, "date": True, "size": False}
-    search_event = None
-
-    curr_selected_file = StringProperty("")
-    curr_selected_filesize = NumericProperty(0)
-    curr_selected_is_dir = BooleanProperty(False)
-    curr_selected_files = ListProperty([])
-    curr_selected_file_infos = ListProperty([])
-    multi_select_enabled = BooleanProperty(False)
-    last_selected_index = NumericProperty(-1)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.register_event_type("on_select")
-        self.register_event_type("on_double_tap")
-
-    # -----------------------------------------------------------------------
-    def on_select(self):
-        pass
-
-    def on_double_tap(self):
-        pass
-
-    # -----------------------------------------------------------------------
-    def set_curr_selected_file(self, filename, filesize):
-        self.curr_selected_file = os.path.join(self.curr_dir, filename)
-        self.curr_selected_filesize = filesize
-        self.curr_selected_is_dir = os.path.isdir(self.curr_selected_file)
-
-    def get_selected_files(self):
-        return list(self.curr_selected_files)
-
-    def get_selected_file_infos(self):
-        return list(self.curr_selected_file_infos)
-
-    def file_info_for_index(self, index):
-        if index < 0 or index >= len(self.data):
-            return None
-        item = self.data[index]
-        path = os.path.join(self.curr_dir, item["filename"])
-        return {
-            "path": path,
-            "filename": item["filename"],
-            "filesize": item["intsize"],
-            "is_dir": item["is_dir"],
-            "index": index,
-        }
-
-    def update_selected_files_from_layout(self, current_index=None):
-        layout = getattr(self, "layout_manager", None)
-        selected_nodes = getattr(layout, "selected_nodes", [])
-        selected_indices = sorted(index for index in selected_nodes if 0 <= index < len(self.data))
-        infos = [info for info in (self.file_info_for_index(index) for index in selected_indices) if info is not None]
-        self.curr_selected_file_infos = infos
-        self.curr_selected_files = [info["path"] for info in infos]
-
-        current_info = None
-        if current_index is not None and current_index in selected_indices:
-            current_info = self.file_info_for_index(current_index)
-        elif infos:
-            current_info = infos[-1]
-
-        if current_info:
-            self.curr_selected_file = current_info["path"]
-            self.curr_selected_filesize = current_info["filesize"]
-            self.curr_selected_is_dir = current_info["is_dir"]
-        else:
-            self.curr_selected_file = ""
-            self.curr_selected_filesize = 0
-            self.curr_selected_is_dir = False
-
-    # -----------------------------------------------------------------------
-    def clear_selection(self):
-        layout = getattr(self, "layout_manager", None)
-        if layout is not None:
-            layout.clear_selection()
-        for key in self.view_adapter.views:
-            if self.view_adapter.views[key].selected != None:
-                self.view_adapter.views[key].selected = False
-        self.curr_selected_files = []
-        self.curr_selected_file_infos = []
-        self.curr_selected_file = ""
-        self.curr_selected_filesize = 0
-        self.curr_selected_is_dir = False
-        self.last_selected_index = -1
-
-    # -----------------------------------------------------------------------
-    def child_dir(self, child_dir):
-        new_path = os.path.join(self.curr_dir, child_dir)
-        self.list_dir(new_dir=new_path)
-
-    def fill_dir(self, sort_key=None, switch_reverse=True, keyword=None):
-        if sort_key == None:
-            sort_key = self.curr_sort_key
-        sort_reverse = self.curr_sort_reverse
-        if sort_key != self.curr_sort_key:
-            sort_reverse = self.default_sort_reverse[sort_key]
-            self.curr_sort_reverse = sort_reverse
-            self.curr_sort_key = sort_key
-        else:
-            if switch_reverse:
-                self.curr_sort_reverse = not self.curr_sort_reverse
-                sort_reverse = self.curr_sort_reverse
-        if sort_key == "name":
-            self.curr_sort_str = ["↓" if sort_reverse else "↑", "", ""]
-        elif sort_key == "date":
-            self.curr_sort_str = ["", "↓" if sort_reverse else "↑", ""]
-        elif sort_key == "size":
-            self.curr_sort_str = ["", "", "↓" if sort_reverse else "↑"]
-        self.curr_file_list_buff = sorted(self.curr_file_list_buff, key=lambda x: x[sort_key], reverse=sort_reverse)
-
-        filtered_list = []
-        app = App.get_running_app()
-        if app.root.file_popup.firmware_mode:
-            filtered_list = filter(lambda x: x["is_dir"] or Path(x["name"]).suffix == ".bin", self.curr_file_list_buff)
-        else:
-            if keyword == None or keyword.strip() == "":
-                filtered_list = self.curr_file_list_buff
-            else:
-                filtered_list = filter(lambda x: keyword.lower() in x["name"].lower(), self.curr_file_list_buff)
-
-        # fill out the list
-        self.clear_selection()
-        self.last_selected_index = -1
-        self.data = []
-        for rv_key, file in enumerate(filtered_list):
-            try:
-                self.data.append(
-                    {
-                        "rv_key": rv_key,
-                        "filename": file["name"],
-                        "intsize": file["size"],
-                        "filesize": "--" if file["is_dir"] else Utils.humansize(file["size"]),
-                        "filedate": Utils.humandate(file["date"]),
-                        "is_dir": file["is_dir"],
-                    }
-                )
-            except IndexError:
-                logger.error("Tried to write to recycle view data at same time as reading, ignore (indexError)")
-        # trigger
-        self.dispatch("on_select")
-
-    def goto_path(self, index):
-        if index < len(self.curr_full_path_list):
-            app = App.get_running_app()
-            app.root.file_popup.ti_local_search.text = ""
-            self.list_dir(new_dir=self.curr_full_path_list[index])
-
-    def delay_search(self, keyword):
-        # if keyword == None or keyword.strip() == '':
-        #    return
-        if self.search_event is not None:
-            self.search_event.cancel()
-        self.search_event = Clock.schedule_once(partial(self.execute_search, keyword), 1)
-
-    def execute_search(self, keyword, *args):
-        self.fill_dir(keyword=keyword, switch_reverse=False)
-        self.search_event = None
-
-
-# -----------------------------------------------------------------------
-# Remote Recycle View
-# -----------------------------------------------------------------------
-class RemoteRV(DataRV):
-    # -----------------------------------------------------------------------
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.register_event_type("on_select")
-        self.register_event_type("on_double_tap")
-
-        self.base_dir = "/sd/gcodes"
-        self.base_dir_win = "\\sd\\gcodes"
-
-        self.curr_dir = self.base_dir
-        self.curr_dir_name = "gcodes"
-
-    # -----------------------------------------------------------------------
-    def parent_dir(self):
-        normpath = os.path.normpath(self.curr_dir)
-        if normpath == self.base_dir or normpath == self.base_dir_win:
-            self.list_dir(new_dir=normpath)
-        else:
-            self.list_dir(new_dir=os.path.dirname(normpath))
-
-    # -----------------------------------------------------------------------
-    def current_dir(self, *args):
-        self.list_dir(new_dir=os.path.normpath(self.curr_dir))
-
-    # -----------------------------------------------------------------------
-    def list_dir(self, new_dir=None):
-        if new_dir == None:
-            new_dir = self.curr_dir
-
-        self.clear_selection()
-        self.curr_file_list_buff = []
-
-        app = App.get_running_app()
-        threading.Thread(target=app.root.loadRemoteDir, args=(new_dir,), daemon=True).start()
-        self.curr_dir = str(new_dir)
-        # self.curr_dir_name = os.path.normpath(self.curr_dir)
-
-    def on_double_tap(self):
-        app = App.get_running_app()
-        app.root.check_and_download()
-
-
-# -----------------------------------------------------------------------
-# Local Recycle View
-# -----------------------------------------------------------------------
-class LocalRV(DataRV):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.register_event_type("on_select")
-        self.register_event_type("on_double_tap")
-        if kivy_platform == "android":
-            self.curr_dir = os.path.abspath(".carveracontroller/gcodes")
-            if not os.path.exists(self.curr_dir):
-                self.curr_dir = os.path.join(os.path.dirname(__file__), "carveracontroller/gcodes")
-        else:
-            self.curr_dir = os.path.abspath("./gcodes")
-            if not os.path.exists(self.curr_dir):
-                self.curr_dir = os.path.join(os.path.dirname(__file__), "gcodes")
-        self.curr_dir_name = os.path.basename(os.path.normpath(self.curr_dir))
-
-    # -----------------------------------------------------------------------
-    def parent_dir(self):
-        self.list_dir(new_dir=os.path.abspath(os.path.join(self.curr_dir, os.pardir)))
-
-    # -----------------------------------------------------------------------
-    def list_dir(self, new_dir=None):
-        if new_dir == None:
-            new_dir = self.curr_dir
-
-        if not new_dir.endswith(os.path.sep):
-            new_dir += os.path.sep
-
-        self.curr_file_list_buff = []
-        for dirpath, dirnames, filenames in os.walk(new_dir):
-            for dirname in dirnames:
-                if not dirname.startswith("."):
-                    file_time = 0
-                    file_path = os.path.join(new_dir, dirname)
-                    try:
-                        file_time = os.stat(file_path).st_mtime
-                    except:
-                        continue
-                    self.curr_file_list_buff.append(
-                        {"name": dirname, "path": file_path, "is_dir": True, "size": 0, "date": file_time}
-                    )
-            for filename in filenames:
-                if not filename.startswith("."):
-                    file_size = 0
-                    file_time = 0
-                    file_path = os.path.join(new_dir, filename)
-                    try:
-                        file_size = os.stat(file_path).st_size
-                        file_time = os.stat(file_path).st_mtime
-                    except:
-                        continue
-                    self.curr_file_list_buff.append(
-                        {"name": filename, "path": file_path, "is_dir": False, "size": file_size, "date": file_time}
-                    )
-            break
-
-        self.fill_dir(switch_reverse=False)
-
-        self.curr_dir = os.path.normpath(new_dir)
-        self.curr_full_path_list, path_labels = Utils.directory_breadcrumb_paths(
-            self.curr_dir,
-            root_label_markers=(self.base_dir,),
-        )
-        self.curr_path_list = path_labels
-        self.curr_dir_name = path_labels[-1] if path_labels else ""
-
-    def on_double_tap(self):
-        app = App.get_running_app()
-        if app.root.file_popup.firmware_mode:
-            app.root.check_and_upload()
-        else:
-            app.root.check_upload_and_select()
-
-
 # -----------------------------------------------------------------------
 # GCode Recycle View
 # -----------------------------------------------------------------------
@@ -3172,25 +2593,12 @@ class ManualCMDPage(Screen):
     pass
 
 
-# -----------------------------------------------------------------------
-class PopupManager(ScreenManager):
-    pass
-
-
-class RemotePage(Screen):
-    pass
-
-
-class LocalPage(Screen):
-    pass
-
-
 class Makera(RelativeLayout):
     holding = 0
     pausing = 0
     waiting = 0
     tooling = 0
-    loading_dir = ""
+    comms_waiting = 0
 
     stop = threading.Event()
     load_event = threading.Event()
@@ -3225,7 +2633,6 @@ class Makera(RelativeLayout):
     show_advanced_jog_controls = BooleanProperty(False)
     keyboard_jog_control = BooleanProperty(False)
     pendant_jog_control = BooleanProperty(False)
-    _held_jog_keys = set()
 
     gcode_viewer = ObjectProperty()
     gcode_playing = BooleanProperty(False)
@@ -3285,11 +2692,9 @@ class Makera(RelativeLayout):
 
     show_update = True
     instantFSoverride = True
-    fw_upd_text = ""
-    fw_version_new = ""
     fw_version = ""
     fw_version_checking = False
-    fw_version_checked = False
+    backing_up_config = False
 
     filetype_support = "nc"
     filetype = ""
@@ -3300,13 +2705,16 @@ class Makera(RelativeLayout):
     decompstatus = False
     decomptime = 0
 
-    ctl_upd_text = ""
-    ctl_version_new = ""
     ctl_version = ""
 
     common_local_dir_list = []
     recent_local_dir_list = []
     recent_remote_dir_list = []
+    sd_videos_available = False
+    _sd_videos_probe_inflight = False
+    # Folder the UI was waiting on when a background /sd probe started.
+    # None means the probe is the listing itself, so finish treats it normally.
+    _sd_videos_probe_keep = None
 
     lines = []
 
@@ -3321,6 +2729,7 @@ class Makera(RelativeLayout):
         "autoblow_mode": [0.0, 0],
         "autobedclean_mode": [0.0, 0],
         "ionizer_mode": [0.0, 0],
+        "timelapse_record": [0.0, 0],
         "laser_mode": [0.0, 0],
         "laser_scale": [0.0, 100],
         "laser_test": [0.0, 0],
@@ -3339,6 +2748,7 @@ class Makera(RelativeLayout):
 
     status_index = 0
     past_machine_addr = None
+    mdi_auto_correct_case = True
     allow_mdi_while_machine_running = "0"
     allow_jogging_while_machine_running = "1"
     allow_jogging_while_spindle_on = "0"
@@ -3349,11 +2759,18 @@ class Makera(RelativeLayout):
         super().__init__()
 
         Window.bind(on_request_close=self.on_request_close)
-        Window.bind(on_key_down=self._global_keyboard_keydown)
 
         self.temp_dir = tempfile.mkdtemp()
         self.ctl_version = ctl_version
-        self.file_popup = FilePopup()
+        self.file_popup = FileBrowserPopup()
+        self._pending_machine_thumb = None
+        self._update_snapshot = None
+        self._update_check_running = False
+        self._uploading_firmware = False
+        self._firmware_delete_after = None
+        self._firmware_download_cancel = None
+        self._esp_ota_cancel = None
+        self._esp_ota_conn = None
 
         self.cnc = CNC()
         self.wcs_names = self.cnc.getWCSNames()
@@ -3411,6 +2828,7 @@ class Makera(RelativeLayout):
         self.tool_drop_down = ToolDropDown()
         self.laser_drop_down = LaserDropDown()
         self.func_drop_down = FuncDropDown()
+        self.help_drop_down = DropDown(auto_width=False, width=dp(200))
         self.status_drop_down = StatusDropDown()
         self.operation_drop_down = OperationDropDown()
         self.gcode_viewer_display_drop_down = GcodeViewerDisplayDropDown()
@@ -3422,6 +2840,19 @@ class Makera(RelativeLayout):
         self.select_probe_popup = SelectAndCalibrateProbePopup()
         self.reconnection_popup = ReconnectionPopup()
         self.progress_popup = ProgressPopup()
+        self.batch_progress_popup = BatchProgressPopup()
+        self._batch_kind = None
+        self._batch_upload = False
+        self._batch_files = []
+        self._batch_index = 0
+        self._batch_completed_bytes = 0
+        self._batch_total_bytes = 0
+        self._batch_stop = False
+        self._batch_file_active = False
+        self._batch_upload_settled = False
+        self._batch_settled_index = None
+        self._pending_uploads = []
+        self._remote_deleted_paths = []
         self.input_popup = InputPopup()
         self.manual_wifi_popup = ManualWifiPopup()
 
@@ -3441,10 +2872,10 @@ class Makera(RelativeLayout):
         self.wifi_ap_status_bar = None
 
         self.local_dir_drop_down = DropDown(auto_width=False, width="190dp")
-        self.local_dir_drop_down.bind(on_select=lambda instance, x: self.file_popup.local_rv.list_dir(x))
+        self.local_dir_drop_down.bind(on_select=lambda instance, x: self.file_popup.list_device_dir(x))
 
         self.remote_dir_drop_down = DropDown(auto_width=False, width="190dp")
-        self.remote_dir_drop_down.bind(on_select=lambda instance, x: self.file_popup.remote_rv.list_dir(x))
+        self.remote_dir_drop_down.bind(on_select=lambda instance, x: self.file_popup.list_machine_dir(x))
 
         # init gcode viewer
         self.gcode_viewer = GCodeViewer()
@@ -3459,8 +2890,15 @@ class Makera(RelativeLayout):
         self.gcode_viewer.bind(sim_progress=self._on_viewer_sim_progress)
         self.gcode_viewer.bind(sim_checkpoints=self._on_viewer_sim_checkpoints)
         self.gcode_viewer.bind(sim_hud_text=self._on_viewer_sim_hud_text)
+        self.gcode_viewer.bind(sim_hud_visible=self._on_viewer_sim_hud_visible)
+        self.gcode_viewer.bind(sim_carving=self._on_viewer_sim_carving)
+        self.gcode_viewer.bind(sim_mesh_visible=self._on_viewer_sim_mesh_visible)
         self._on_viewer_sim_hud_text(self.gcode_viewer, self.gcode_viewer.sim_hud_text)
+        self._on_viewer_sim_hud_visible(self.gcode_viewer, self.gcode_viewer.sim_hud_visible)
+        self._on_viewer_sim_carving(self.gcode_viewer, self.gcode_viewer.sim_carving)
+        self._on_viewer_sim_mesh_visible(self.gcode_viewer, self.gcode_viewer.sim_mesh_visible)
         self.gcode_viewer_display_drop_down.show_grid = self.gcode_viewer.is_grid_visible()
+        self.gcode_viewer_display_drop_down.show_ghost = self.gcode_viewer.is_path_ghosted()
         self.gcode_viewer.bind(stock_visible=self._on_viewer_stock_visible)
         self._on_viewer_stock_visible(self.gcode_viewer, self.gcode_viewer.stock_visible)
         self.gcode_viewer.bind(bed_visible=self._on_viewer_bed_visible)
@@ -3474,7 +2912,7 @@ class Makera(RelativeLayout):
         self.camera_stream = Z1Camera(
             on_frame=self._show_camera_frame,
             on_streaming=self._set_camera_streaming,
-            on_error=partial(self.show_message_popup, btn_disabled=False),
+            on_reconnecting=self._set_camera_reconnecting,
         )
         self.ids.camera_splitter.bind(collapsed=self._on_camera_splitter_collapsed)
         self.ids.camera_splitter.collapse()
@@ -3494,8 +2932,11 @@ class Makera(RelativeLayout):
         self.machine_settings_model = None
         self.controller_setting_change_list = {}
         self.load_controller_config()
+        self.load_keyboard_shortcuts_config()
         self.load_gcode_viewer_config()
         self.load_pendant_config()
+        self.shortcut_manager = ShortcutManager(self)
+        self.shortcut_manager.install()
 
         self.usb_event = lambda instance, device_path: self.openUSB(device_path)
         self.wifi_event = lambda instance, x: self.openWIFI(x)
@@ -3506,16 +2947,22 @@ class Makera(RelativeLayout):
         self.last_connection_method = Config.get("carvera", "last_connection_method", fallback="") or ""
 
         self.fill_remote_dir_callback = None
+        self.fill_remote_dir_callback_path = None
+        self._machine_ls_lock = threading.Lock()
+        self._machine_ls_wanted_path = None
+        self._machine_ls_sent_path = None
 
         self.instantFSoverride = Config.get("carvera", "instantFSoverride") == "1"
 
         self.show_update = Config.get("carvera", "show_update") == "1"
-        self.upgrade_popup.cbx_check_at_startup.active = self.show_update
         if self.show_update:
             self.check_for_updates()
 
         if Config.has_option("carvera", "address"):
             self.past_machine_addr = Config.get("carvera", "address")
+
+        if Config.has_option("carvera", "mdi_auto_correct_case"):
+            self.mdi_auto_correct_case = Config.get("carvera", "mdi_auto_correct_case") == "1"
 
         if Config.has_option("carvera", "allow_mdi_while_machine_running"):
             self.allow_mdi_while_machine_running = Config.get("carvera", "allow_mdi_while_machine_running")
@@ -3568,6 +3015,10 @@ class Makera(RelativeLayout):
         # Auto-connect on startup only when auto-reconnect is enabled.
         if Config.getboolean("carvera", "auto_reconnect_enabled", fallback=True):
             Clock.schedule_once(lambda dt: self.reconnect_last_connection(quiet=True, for_app_launch=True))
+
+        self._suppress_reconnect_popup = False
+        self.tutorial = Tutorial(self)
+        self.tutorial.schedule_if_needed()
 
     def _parse_active_color(self, value):
         """Parse a color string like '0,255,255,255' into an RGBA list (0-1 range)."""
@@ -3624,6 +3075,10 @@ class Makera(RelativeLayout):
 
     def on_request_close(self, *args):
         # Cleanup the temporary directory when the app is closed
+        shortcut_manager = getattr(self, "shortcut_manager", None)
+        if shortcut_manager is not None:
+            shortcut_manager.uninstall()
+
         try:
             shutil.rmtree(self.temp_dir)
         except Exception as e:
@@ -3658,12 +3113,35 @@ class Makera(RelativeLayout):
         for setting in controller_config_definition:
             if "default" in setting:
                 Config.setdefault(setting["section"], setting["key"], setting["default"])
+                # The bool switch only recognises "0" and "1". An earlier default
+                # of "true" draws the switch off while the feature stays on.
+                if setting["key"] == "mdi_auto_correct_case":
+                    stored = Config.get(setting["section"], setting["key"])
+                    if str(stored).lower() == "true":
+                        Config.set(setting["section"], setting["key"], "1")
                 setting.pop("default", None)
             controller_config.append(setting)
 
         self.config_popup.settings_panel.add_json_panel(tr._("Controller"), Config, data=json.dumps(controller_config))
 
         self._update_macro_button_text()
+
+    def load_keyboard_shortcuts_config(self):
+        config_def_file = os.path.join(
+            os.path.dirname(__file__), "addons", "keyboard_shortcuts", "keyboard_shortcuts_config.json"
+        )
+        with open(config_def_file) as file:
+            shortcut_config_definition = json.load(file)
+        shortcut_config = []
+        for setting in shortcut_config_definition:
+            if "default" in setting:
+                Config.setdefault(setting["section"], setting["key"], setting["default"])
+                setting.pop("default", None)
+            shortcut_config.append(setting)
+        ShortcutManager.seed_config_if_uninitialized()
+        self.config_popup.settings_panel.add_json_panel(
+            tr._("Keyboard Shortcuts"), Config, data=json.dumps(shortcut_config)
+        )
 
     def load_gcode_viewer_config(self):
         config_def_file = os.path.join(os.path.dirname(__file__), "gcode_viewer_config.json")
@@ -3739,26 +3217,93 @@ class Makera(RelativeLayout):
         except Exception as e:
             logger.error(f"Failed to run macro {macro_id}: {e}")
 
-    def open_download(self):
-        webbrowser.open(DOWNLOAD_ADDRESS, new=2)
-
-    def open_fw_download(self):
-        webbrowser.open(FW_DOWNLOAD_ADDRESS, new=2)
+    def open_url(self, url):
+        if url:
+            webbrowser.open(url, new=2)
 
     def open_fw_upload(self):
-        self.file_popup.firmware_mode = True
-        if sys.platform == "ios":
-            from . import ios_helpers
-
-            ios_helpers.pick_file()
-        else:
-            self.file_popup.popup_manager.transition.duration = 0
-            self.file_popup.popup_manager.current = "local_page"
-            self.file_popup.open()
-            self.file_popup.local_rv.child_dir("")
+        self.file_popup.open_for_firmware()
 
     def open_online_docs(self):
-        webbrowser.open("https://carvera-community.gitbook.io/docs/controller/")
+        webbrowser.open(resolve_documentation_url("https://carvera-community.gitbook.io/docs/controller/"))
+
+    def open_help_menu(self, button):
+        menu = self.help_drop_down
+        menu.clear_widgets()
+        documentation = Button(text=tr._("Documentation"), size_hint_y=None, height=dp(40))
+        documentation.bind(on_release=self._open_docs_from_help_menu)
+        getting_started = Button(text=tr._("Guided tour"), size_hint_y=None, height=dp(40))
+        getting_started.bind(on_release=self._open_tour_from_help_menu)
+        # The first widget added is placed at the top.
+        menu.add_widget(documentation)
+        menu.add_widget(getting_started)
+        menu.open(button)
+
+    def _open_docs_from_help_menu(self, *_args):
+        self.help_drop_down.dismiss()
+        self.func_drop_down.dismiss()
+        self.open_online_docs()
+
+    def _open_tour_from_help_menu(self, *_args):
+        self.help_drop_down.dismiss()
+        self.func_drop_down.dismiss()
+        self.tutorial.open_from_menu()
+
+    def open_file_browser(self):
+        app = App.get_running_app()
+        unavailable = app.state not in ("Idle", NOT_CONNECTED) and not app.playing
+        if unavailable or self._is_popup_open():
+            return False
+        self.file_popup.open_for_jobs()
+        return True
+
+    def open_videos_browser(self):
+        """Open the file browser on the machine Videos folder."""
+        app = App.get_running_app()
+        unavailable = app.state not in ("Idle", NOT_CONNECTED) and not app.playing
+        if unavailable or self._is_popup_open() or not self.sd_videos_available:
+            return False
+        self.file_popup.open_for_videos()
+        return True
+
+    def open_mdi(self):
+        self.content.transition.direction = "right"
+        self.content.current = "File"
+        self.cmd_manager.transition.direction = "left"
+        self.cmd_manager.current = "manual_cmd_page"
+        self.manual_cmd.focus = True
+
+    def open_gcode(self):
+        self.content.transition.direction = "right"
+        self.content.current = "File"
+        self.cmd_manager.transition.direction = "left"
+        self.cmd_manager.current = "gcode_cmd_page"
+        self.manual_cmd.focus = False
+
+    def can_send_mdi_command(self):
+        app = App.get_running_app()
+        return app.state in ("Idle", "Pause") or str(self.allow_mdi_while_machine_running).lower() in ("1", "true")
+
+    def can_open_start_job_popup(self):
+        app = App.get_running_app()
+        return (
+            app.state == "Idle" and bool(app.selected_remote_filename) and not app.playing and not self._is_popup_open()
+        )
+
+    def open_start_job_popup(self):
+        if not self.can_open_start_job_popup():
+            return False
+        self.coord_popup.mode = "Run"
+        self.coord_popup.load_config()
+        self.coord_popup.open()
+        return True
+
+    def handle_start_file_action(self):
+        app = App.get_running_app()
+        if app.state == "Pause":
+            self.controller.resumeCommand()
+        else:
+            self.open_start_job_popup()
 
     def send_bug_report(self):
         webbrowser.open("https://github.com/Carvera-Community/Carvera_Controller/issues/new")
@@ -3890,7 +3435,7 @@ class Makera(RelativeLayout):
                 bounds,
                 visible=bool(settings.get("show_stock", False)),
                 simulate_cut=simulate,
-                voxel_resolution=voxel_resolution_from_settings(settings),
+                carver_resolution=carver_resolution_from_settings(settings),
                 checkpoint_level=checkpoint_level_from_settings(settings),
                 mesh_while_playing=mesh_while_playing_from_settings(settings),
                 carver_mode=carver_mode_from_settings(settings),
@@ -3902,11 +3447,16 @@ class Makera(RelativeLayout):
             return False
         return True
 
-    def _reset_stock_settings(self, shape=None, origin=None, show_stock=False):
+    def _reset_stock_settings(self, shape=None, origin=None, show_stock=False, simulate_cut=False):
         """Push a stock reset into the popup and viewer. Must already be main thread."""
         popup = getattr(self, "stock_settings_popup", None)
         if popup is not None:
-            settings = popup.reset_for_loaded_file(shape=shape, origin=origin, show_stock=show_stock)
+            settings = popup.reset_for_loaded_file(
+                shape=shape,
+                origin=origin,
+                show_stock=show_stock,
+                simulate_cut=simulate_cut,
+            )
         else:
             settings = default_settings()
             if shape is not None:
@@ -3914,7 +3464,7 @@ class Makera(RelativeLayout):
             if origin is not None:
                 settings["origin"] = origin.to_dict()
             settings["show_stock"] = bool(show_stock)
-            settings["simulate_cut"] = False
+            settings["simulate_cut"] = bool(simulate_cut) and bool(show_stock)
         return self._apply_stock_settings_impl(settings)
 
     def _should_auto_show_header_stock(self, cam_stock) -> bool:
@@ -3925,6 +3475,15 @@ class Makera(RelativeLayout):
             Config.get("carvera", "gcode_auto_show_stock")
             if Config.has_option("carvera", "gcode_auto_show_stock")
             else "1"
+        )
+        return raw not in ("0", "false", "False")
+
+    def _auto_simulate_cut_preference(self) -> bool:
+        """True when the viewer setting asks to simulate cuts on automatic stock."""
+        raw = (
+            Config.get("carvera", "gcode_auto_simulate_cut")
+            if Config.has_option("carvera", "gcode_auto_simulate_cut")
+            else "0"
         )
         return raw not in ("0", "false", "False")
 
@@ -3959,8 +3518,7 @@ class Makera(RelativeLayout):
         """Hide stock for a new file load (shape/origin filled later in load_end).
 
         Must run on the main thread — touches popup widgets and rebuilds GL meshes.
-        Uses the last *applied* snapshot (not live UI) so an open popup's dirty
-        or invalid edits are discarded rather than committed.
+        Starts from factory defaults so an open popup's dirty edits are discarded.
         """
         self._reset_stock_settings()
 
@@ -3972,48 +3530,96 @@ class Makera(RelativeLayout):
         self.adv_calibrate_popup.open()
 
     def open_update_popup(self):
-        self.upgrade_popup.check_button.disabled = False
-        self.upgrade_popup.open(self)
+        self.upgrade_popup.open()
+        if self._update_snapshot is None and not getattr(self, "_update_check_running", False):
+            self.check_for_updates()
 
     def close_update_popup(self):
-        if self.upgrade_popup.cbx_check_at_startup.active != self.show_update:
-            self.show_update = self.upgrade_popup.cbx_check_at_startup.active
-            Config.set("carvera", "show_update", "1" if self.show_update else "0")
-            Config.write()
-        self.upgrade_popup.dismiss(self)
+        self.upgrade_popup.dismiss()
 
-    def check_for_updates(self):
-        self.fw_upd_text = ""
-        self.fw_version_checked = False
-        self.ctl_upd_text = ""
-        UrlRequest(FW_UPD_ADDRESS, on_success=self.fw_upd_loaded)
-        UrlRequest(CTL_UPD_ADDRESS, on_success=self.ctl_upd_loaded)
+    def _update_cache_dir(self):
+        app = App.get_running_app()
+        if app is None:
+            return None
+        return os.path.join(app.user_data_dir, CACHE_SUBDIR)
 
-    def fw_upd_loaded(self, req, result):
-        # parse result
-        self.fw_upd_text = result
+    def _include_prereleases(self):
+        if Config.has_option("carvera", CONFIG_INCLUDE_PRERELEASES):
+            return Config.get("carvera", CONFIG_INCLUDE_PRERELEASES) in ("1", "true", "True")
+        return False
 
-    def check_fw_version(self):
-        self.upgrade_popup.fw_upd_text.text = self.fw_upd_text
-        self.upgrade_popup.fw_upd_text.cursor = (0, 0)  # Position the cursor at the top of the text
-        versions = re.search(r"\[[0-9]+\.[0-9]+\.[0-9]+\]", self.fw_upd_text)
-        if versions != None:
-            self.fw_version_new = versions[0][1 : len(versions[0]) - 1]
-            if self.fw_version != "":
-                app = App.get_running_app()
-                if Utils.digitize_v(self.fw_version_new) > Utils.digitize_v(self.fw_version):
-                    app.fw_has_update = True
-                    self.upgrade_popup.fw_version_txt.text = (
-                        tr._(" New version detected: v") + self.fw_version_new + tr._(" Current: v") + self.fw_version
-                    )
-                else:
-                    app.fw_has_update = False
-                    self.upgrade_popup.fw_version_txt.text = tr._(" Current version: v") + self.fw_version
-        self.fw_version_checked = True
+    def check_for_updates(self, force=False):
+        if getattr(self, "_update_check_running", False):
+            return
+        self._update_check_running = True
+        self.upgrade_popup.set_checking(True)
+        include_prereleases = self._include_prereleases()
+        current_controller = self.ctl_version
+        current_firmware = self.fw_version
+        cache_dir = self._update_cache_dir()
+        platform_key = detect_platform(kivy_platform=kivy_platform)
+        threading.Thread(
+            target=self._check_for_updates_worker,
+            args=(current_controller, current_firmware, include_prereleases, cache_dir, platform_key, force),
+            daemon=True,
+        ).start()
 
-    def ctl_upd_loaded(self, req, result):
-        self.ctl_upd_text = result
-        Clock.schedule_once(self.check_ctl_version, 0)
+    def apply_include_prereleases(self):
+        if self._update_snapshot is None:
+            if not getattr(self, "_update_check_running", False):
+                self.check_for_updates()
+            return
+        self._apply_update_snapshot(self._update_snapshot)
+
+    def _check_for_updates_worker(
+        self, current_controller, current_firmware, include_prereleases, cache_dir, platform_key, force=False
+    ):
+        try:
+            snapshot = check_updates(
+                current_controller=current_controller,
+                current_firmware=current_firmware,
+                include_prereleases=include_prereleases,
+                cache_dir=cache_dir,
+                platform_key=platform_key,
+                force=force,
+            )
+        except Exception:
+            logger.exception("Update check failed")
+            Clock.schedule_once(lambda *_: self._apply_update_snapshot(None, error=True), 0)
+            return
+        Clock.schedule_once(lambda *_: self._apply_update_snapshot(snapshot), 0)
+
+    def _apply_update_snapshot(self, snapshot, error=False):
+        self._update_check_running = False
+        if snapshot is not None:
+            snapshot = snapshot_with_prereleases(
+                snapshot,
+                self._include_prereleases(),
+                current_controller=self.ctl_version,
+                current_firmware=self.fw_version,
+            )
+            self._update_snapshot = snapshot
+        app = App.get_running_app()
+        if app is not None:
+            if self._update_snapshot is None:
+                app.ctl_has_update = False
+                app.fw_has_update = False
+            else:
+                app.ctl_has_update = self._update_snapshot.controller.update_available
+                app.fw_has_update = self._update_snapshot.firmware.update_available
+        self.upgrade_popup.apply_snapshot(self._update_snapshot, checking=False, error=error)
+
+    def _refresh_firmware_update_state(self):
+        if self._update_snapshot is None:
+            return
+        current_fw = self.fw_version or ""
+        current_ctl = self.ctl_version or ""
+        if (
+            self._update_snapshot.firmware.current == current_fw
+            and self._update_snapshot.controller.current == current_ctl
+        ):
+            return
+        self._apply_update_snapshot(self._update_snapshot)
 
     def change_language(self, lang_desc):
         for lang_key in translation.LANGS:
@@ -4027,28 +3633,13 @@ class Makera(RelativeLayout):
         self.message_popup.lb_content.text = tr._("Language setting applied, restart Controller app to take effect !")
         self.message_popup.open()
 
-    def check_ctl_version(self, *args):
-        self.upgrade_popup.ctl_upd_text.text = self.ctl_upd_text
-        self.upgrade_popup.ctl_upd_text.cursor = (0, 0)  # Position the cursor at the top of the text
-        versions = re.search(r"\[[0-9]+\.[0-9]+\.[0-9]+\]", self.ctl_upd_text)
-        if versions != None:
-            self.ctl_version_new = versions[0][1 : len(versions[0]) - 1]
-            app = App.get_running_app()
-            if Utils.digitize_v(self.ctl_version_new) > Utils.digitize_v(self.ctl_version):
-                app.ctl_has_update = True
-                self.upgrade_popup.ctl_version_txt.text = (
-                    tr._(" New version detected: v") + self.ctl_version_new + tr._(" Current: v") + self.ctl_version
-                )
-            else:
-                app.ctl_has_update = False
-                self.upgrade_popup.ctl_version_txt.text = tr._(" Current version: v") + self.ctl_version
-        self.ctl_version_checked = True
-
     # -----------------------------------------------------------------------
     def play(self, file_name, start_line):
-        # The pre-run check has to come before apply(): apply() already buffers the
-        # margin/probe/level sequence, so a dialog after it would be asking about
-        # commands the machine has been handed. Resume has its own confirmation,
+        if tutorial_blocks_motion():
+            return
+        # The pre-run check has to come before anything is buffered: liftToClearance()
+        # and apply() both hand commands to the machine, so a dialog after them would
+        # be asking about moves already queued. Resume has its own confirmation,
         # which shows the whole recovery sequence, so it is not doubled up here.
         if not start_line and self._pre_run_check_enabled():
             self.open_pre_run_check_popup(file_name)
@@ -4057,9 +3648,15 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def _start_play(self, file_name, start_line):
+        # Reached again after the pre-run dialog, so check the tutorial again too.
+        if tutorial_blocks_motion():
+            return
         # stop review play first
         self.gcode_playing = False
         self.gcode_viewer.dynamic_display = False
+        # Always start from the clearance height: M495 is not sent for every program (e.g. none
+        # without feed moves, or inside the path area without margin, Z probe or leveling)
+        self.controller.liftToClearance(buffer=True)
         # apply and play
         self.apply(True)
         # play file
@@ -4142,6 +3739,8 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def apply(self, buffer=False):
+        if tutorial_blocks_motion():
+            return
         app = App.get_running_app()
 
         if app.has_4axis:
@@ -4259,6 +3858,13 @@ class Makera(RelativeLayout):
             self.status_data_view.color = STATECOLOR["Disable"]
             self.tooling = 1
 
+        if self.comms_waiting == 1:
+            self.status_data_view.color = STATECOLOR["Wait"]
+            self.comms_waiting = 2
+        elif self.comms_waiting == 2:
+            self.status_data_view.color = STATECOLOR["Disable"]
+            self.comms_waiting = 1
+
         # check heartbeat
         if self.controller.sendNUM != 0 or self.controller.loadNUM != 0:
             self.heartbeat_time = time.time()
@@ -4284,32 +3890,14 @@ class Makera(RelativeLayout):
             return
 
         if time.time() - self.heartbeat_time > HEARTBEAT_TIMEOUT and self.controller.stream:
-            logger.error("Connection to machine lost")
-            # Check reconnection configuration (only if not a manual disconnect and not already reconnecting)
-            if not self.controller._manual_disconnect and not self.reconnection_popup._is_open:
-                auto_reconnect_enabled = Config.getboolean("carvera", "auto_reconnect_enabled", fallback=True)
-                reconnect_wait_time = Config.getint("carvera", "reconnect_wait_time", fallback=10)
-                reconnect_attempts = Config.getint("carvera", "reconnect_attempts", fallback=3)
-
-                # Update controller reconnection settings
-                self.controller.set_reconnection_config(auto_reconnect_enabled, reconnect_wait_time, reconnect_attempts)
-
-                if auto_reconnect_enabled:
-                    # Show reconnection popup with countdown (WiFi or USB)
-                    self.reconnection_popup.start_countdown(
-                        reconnect_attempts, reconnect_wait_time, self.attempt_reconnect, self.on_reconnect_failed
-                    )
-                    self.reconnection_popup.open()
-
-                    # Start countdown timer
-                    Clock.schedule_interval(self.reconnection_popup.countdown_tick, 1.0)
-                else:
-                    # Show reconnection popup in manual mode
-                    self.reconnection_popup.show_manual_reconnect(self.attempt_reconnect)
-                    self.reconnection_popup.open()
-
-            self.controller.close()
-            self.updateStatus()
+            if not self.comms_waiting:
+                logger.warning("Machine status response delayed — waiting on comms")
+                self.comms_waiting = 1
+                self.status_data_view.main_text = tr._("Waiting on Comms")
+                if app is not None and app.playing:
+                    # Park remaining so the stall is not subtracted when replies resume.
+                    self._remaining_anchor_sec = self._current_remaining_sec()
+                    self._remaining_anchor_time = time.time()
 
     # -----------------------------------------------------------------------
     def switch_status(self, *args):
@@ -4465,6 +4053,19 @@ class Makera(RelativeLayout):
 
         self.remote_dir_drop_down.clear_widgets()
 
+        places = machine_location_places(videos_available=self.sd_videos_available)
+        if places:
+            self.remote_dir_drop_down.add_widget(DropDownSplitter(text="       " + tr._("Locations")))
+            for path, label in places:
+                btn = DirectoryView(
+                    full_path=path,
+                    data_text=tr._(label),
+                    size_hint_y=None,
+                    height="30dp",
+                )
+                btn.bind(on_release=lambda _btn, place=path: self.remote_dir_drop_down.select(place))
+                self.remote_dir_drop_down.add_widget(btn)
+
         splitter = DropDownSplitter(text="       " + tr._("Recent Places"))
         self.remote_dir_drop_down.add_widget(splitter)
 
@@ -4480,6 +4081,47 @@ class Makera(RelativeLayout):
             self.remote_dir_drop_down.add_widget(btn)
 
         self.remote_dir_drop_down.open(button)
+        self.probe_sd_videos_dir()
+
+    def probe_sd_videos_dir(self):
+        """List /sd once it is idle, so Videos can be offered if that folder exists."""
+        app = App.get_running_app()
+        if app is None or app.state != "Idle":
+            return
+        if self.sd_videos_available or self.backing_up_config or self.downloading_config:
+            return
+        if machine_path_key(getattr(self.file_popup, "machine_dir", "")) == "/sd":
+            return
+        threading.Thread(target=self._run_sd_videos_probe, daemon=True).start()
+
+    def _run_sd_videos_probe(self):
+        """List /sd without taking the folder the file browser is waiting on.
+
+        ``_machine_ls_wanted_path`` stays whatever the UI asked for. Finish
+        still chains a newer request, and a probe that nobody interrupted
+        does not list that folder a second time.
+        """
+        with self._machine_ls_lock:
+            if self.controller.loadNUM == LOAD_DIR or self._sd_videos_probe_inflight or self.sd_videos_available:
+                return
+            self._sd_videos_probe_inflight = True
+            wanted = self._machine_ls_wanted_path
+            if wanted and machine_path_key(wanted) != "/sd":
+                self._sd_videos_probe_keep = wanted
+            else:
+                self._sd_videos_probe_keep = None
+            self._start_machine_ls("/sd")
+
+    def _note_sd_videos_listing(self, listed_path, file_list):
+        if machine_path_key(listed_path or "") != "/sd":
+            return
+        self._sd_videos_probe_inflight = False
+        if not file_list:
+            return
+        self.sd_videos_available = listing_has_directory(file_list, "videos")
+        app = App.get_running_app()
+        if app is not None:
+            app.sd_videos_available = self.sd_videos_available
 
     # -----------------------------------------------------------------------
     def _remember_connection_method(self, method):
@@ -4547,6 +4189,8 @@ class Makera(RelativeLayout):
 
     def reconnect_last_connection(self, *args, quiet=False, for_app_launch=False):
         """Reconnect using preferred/last method (WiFi address or USB device id)."""
+        if demo_is_active():
+            return False
         method = self._preferred_reconnect_method(for_app_launch=for_app_launch)
         if method == "usb":
             path = self._resolve_usb_reconnect_path()
@@ -4585,12 +4229,23 @@ class Makera(RelativeLayout):
         return False
 
     # -----------------------------------------------------------------------
-    def attempt_reconnect(self):
-        """Attempt to reconnect to the last known connection"""
-        if self.reconnection_popup._is_open:
-            Clock.unschedule(self.reconnection_popup.countdown_tick)
-            self.reconnection_popup.dismiss()
-        self.reconnect_last_connection(quiet=False, for_app_launch=False)
+    def _reconnect_in_progress(self):
+        return bool(getattr(self, "_usb_connect_in_progress", False) or getattr(self.controller, "_connecting", False))
+
+    def _auto_attempt_reconnect(self):
+        """Quiet retry used by the popup countdown."""
+        self.attempt_reconnect(quiet=True)
+
+    def attempt_reconnect(self, quiet=False):
+        """Try the last connection once.
+
+        Auto-retry passes quiet=True so a failed attempt does not stack error
+        popups. Reconnect now uses the default and reports why it failed.
+        The countdown stays armed for auto-retry; this method does not dismiss it.
+        """
+        if self._reconnect_in_progress():
+            return False
+        return self.reconnect_last_connection(quiet=quiet, for_app_launch=False)
 
     def on_reconnect_failed(self):
         """Called when all reconnection attempts have failed"""
@@ -4723,21 +4378,17 @@ class Makera(RelativeLayout):
                             self.controller.syncTime()
 
                     remote_version = re.search(r"version = [0-9]+\.[0-9]+\.[0-9]+[a-zA-Z0-9\-_]*", line)
-                    app = App.get_running_app()
                     if remote_version != None:
                         self.fw_version = remote_version[0].split("=")[1].strip()
-                        app.is_community_firmware = bool(self.fw_version) and "c" in self.fw_version.lower()
-                        self.controller.is_community_firmware = app.is_community_firmware
-                        # Model and version arrive on separate lines in either order,
-                        # so 3D probe support is recomputed from whichever lands last.
-                        self._refresh_3d_probe_support()
-                        if not app.is_community_firmware or not CNC.can_rotate_wcs:
+                        community = bool(self.fw_version) and "c" in self.fw_version.lower()
+                        self.controller.is_community_firmware = community
+                        if not community or not CNC.can_rotate_wcs:
                             self.controller.viewWCS()
-                        app.fw_version_digitized = Utils.digitize_v(self.fw_version)
                         logger.debug(f"Firmware Version detected as {self.fw_version}")
-                        Clock.schedule_once(partial(self.onFirmwareDetected, self.fw_version), 0)
-                        if self.fw_version_new != "":
-                            self.check_fw_version()
+                        Clock.schedule_once(
+                            partial(self._apply_detected_firmware, self.fw_version, community),
+                            0,
+                        )
                         # Baud upgrade is deferred until after config download / sync
                         # (see attempt_usb_baud_upgrade_if_eligible). Running it on the
                         # version line races framed config transfer and breaks the link.
@@ -4819,21 +4470,10 @@ class Makera(RelativeLayout):
 
             if self.controller.loadNUM == LOAD_DIR:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                    if self.controller.loadERR:
-                        Clock.schedule_once(
-                            partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (self.loading_dir)), 0
-                        )
-                    elif t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                        Clock.schedule_once(
-                            partial(self.loadError, tr._("Timeout loading dir") + " '%s'!" % (self.loading_dir)), 0
-                        )
-                    self.controller.loadNUM = 0
-                    self.controller.loadEOF = False
-                    self.controller.loadERR = False
-                    self.process_loaded_dir(self.fill_remote_dir)
+                    self._finish_machine_ls(t)
             if self.controller.loadNUM == LOAD_RM:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
-                    deleting_file = getattr(self, "deleting_remote_file", self.file_popup.remote_rv.curr_selected_file)
+                    deleting_file = getattr(self, "deleting_remote_file", self.file_popup.selected_machine_file)
                     delete_failed = self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT
                     if self.controller.loadERR:
                         Clock.schedule_once(
@@ -4846,19 +4486,23 @@ class Makera(RelativeLayout):
                     self.controller.loadNUM = 0
                     self.controller.loadEOF = False
                     self.controller.loadERR = False
+                    if not delete_failed:
+                        self._remote_deleted_paths.append(deleting_file)
                     if not delete_failed and getattr(self, "pending_remote_delete_files", []):
                         Clock.schedule_once(self.removeNextRemoteFile, 0)
                     else:
+                        removed = list(getattr(self, "_remote_deleted_paths", []))
+                        self._remote_deleted_paths = []
                         self.pending_remote_delete_files = []
                         self.deleting_remote_file = ""
-                        Clock.schedule_once(self.file_popup.remote_rv.current_dir, 0)
+                        Clock.schedule_once(lambda _dt, paths=removed: self._after_remote_delete(paths), 0)
             if self.controller.loadNUM == LOAD_MV:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
                     if self.controller.loadERR:
                         Clock.schedule_once(
                             partial(
                                 self.loadError,
-                                tr._("Error renaming") + " '%s'!" % (self.file_popup.remote_rv.curr_selected_file),
+                                tr._("Error renaming") + " '%s'!" % (self.file_popup.selected_machine_file),
                             ),
                             0,
                         )
@@ -4866,14 +4510,14 @@ class Makera(RelativeLayout):
                         Clock.schedule_once(
                             partial(
                                 self.loadError,
-                                tr._("Timeout renaming") + " '%s'!" % (self.file_popup.remote_rv.curr_selected_file),
+                                tr._("Timeout renaming") + " '%s'!" % (self.file_popup.selected_machine_file),
                             ),
                             0,
                         )
                     self.controller.loadNUM = 0
                     self.controller.loadEOF = False
                     self.controller.loadERR = False
-                    Clock.schedule_once(self.file_popup.remote_rv.current_dir, 0)
+                    Clock.schedule_once(self.file_popup.refresh_machine, 0)
             if self.controller.loadNUM == LOAD_MKDIR:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.short_load_time > SHORT_LOAD_TIMEOUT:
                     if self.controller.loadERR:
@@ -4895,7 +4539,7 @@ class Makera(RelativeLayout):
                     self.controller.loadNUM = 0
                     self.controller.loadEOF = False
                     self.controller.loadERR = False
-                    Clock.schedule_once(self.file_popup.remote_rv.current_dir, 0)
+                    Clock.schedule_once(self.file_popup.refresh_machine, 0)
             if self.controller.loadNUM == LOAD_WIFI:
                 if self.controller.loadEOF or self.controller.loadERR or t - self.wifi_load_time > WIFI_LOAD_TIMEOUT:
                     if self.controller.loadERR:
@@ -4921,13 +4565,19 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def open_del_confirm_popup(self):
-        selected_files = self.file_popup.remote_rv.get_selected_files()
+        if self.file_popup.location == LOCATION_DEVICE:
+            selected_files = list(self.file_popup.selected_device_paths)
+        else:
+            selected_files = list(self.file_popup.selected_machine_paths)
         if not selected_files:
             return
         self.confirm_popup.lb_title.text = tr._("Delete File or Dir")
         if len(selected_files) == 1:
             self.confirm_popup.lb_content.text = tr._("Confirm to delete file or dir") + "'%s'?" % (selected_files[0])
-            self.confirm_popup.confirm = partial(self.removeRemoteFile, selected_files[0])
+            if self.file_popup.location == LOCATION_DEVICE:
+                self.confirm_popup.confirm = partial(self.removeLocalFiles, selected_files)
+            else:
+                self.confirm_popup.confirm = partial(self.removeRemoteFile, selected_files[0])
         else:
             preview = "\n".join(selected_files[:5])
             if len(selected_files) > 5:
@@ -4936,7 +4586,10 @@ class Makera(RelativeLayout):
                 selected_files
             )
             self.confirm_popup.lb_content.text += "\n\n%s" % preview
-            self.confirm_popup.confirm = partial(self.removeRemoteFiles, selected_files)
+            if self.file_popup.location == LOCATION_DEVICE:
+                self.confirm_popup.confirm = partial(self.removeLocalFiles, selected_files)
+            else:
+                self.confirm_popup.confirm = partial(self.removeRemoteFiles, selected_files)
         self.confirm_popup.cancel = None
         self.confirm_popup.open(self)
 
@@ -5159,25 +4812,21 @@ class Makera(RelativeLayout):
         self.controller.gotoSafeZ()
 
     # -----------------------------------------------------------------------
-    def set_local_folder_to_last_opened(self):
-        self.fetch_recent_local_dir_list()
-
-        # Find the most recent directory that is still present
-        local_path = ""
-        for dir in self.recent_local_dir_list:
-            if os.path.isdir(dir):
-                local_path = dir
-                break
-
-        self.file_popup.local_rv.child_dir(local_path)
-
     def open_rename_input_popup(self):
-        self.input_popup.lb_title.text = tr._("Change name") + "'%s' to:" % (
-            self.file_popup.remote_rv.curr_selected_file
-        )
+        if self.file_popup.location == LOCATION_DEVICE:
+            src = self.file_popup.selected_device_file
+            if not src:
+                return
+            self.input_popup.lb_title.text = tr._("Change name") + "'%s' to:" % src
+            self.input_popup.txt_content.text = ""
+            self.input_popup.txt_content.password = False
+            self.input_popup.confirm = partial(self.renameLocalFile, src)
+            self.input_popup.open(self)
+            return
+        self.input_popup.lb_title.text = tr._("Change name") + "'%s' to:" % (self.file_popup.selected_machine_file)
         self.input_popup.txt_content.text = ""
         self.input_popup.txt_content.password = False
-        self.input_popup.confirm = partial(self.renameRemoteFile, self.file_popup.remote_rv.curr_selected_file)
+        self.input_popup.confirm = partial(self.renameRemoteFile, self.file_popup.selected_machine_file)
         self.input_popup.open(self)
 
     # -----------------------------------------------------------------------
@@ -5185,22 +4834,11 @@ class Makera(RelativeLayout):
         self.input_popup.lb_title.text = tr._("Input new folder name:")
         self.input_popup.txt_content.text = ""
         self.input_popup.txt_content.password = False
-        self.input_popup.confirm = self.createRemoteDir
+        if self.file_popup.location == LOCATION_DEVICE:
+            self.input_popup.confirm = self.createLocalDir
+        else:
+            self.input_popup.confirm = self.createRemoteDir
         self.input_popup.open(self)
-
-    # -----------------------------------------------------------------------
-    def open_upload_local_file_popup(self):
-        # For iOS we use the native file picker
-        if sys.platform == "ios":
-            from . import ios_helpers
-
-            ios_helpers.pick_file()
-            return
-        self.file_popup.firmware_mode = False
-        self.file_popup.popup_manager.transition.direction = "left"
-        self.file_popup.popup_manager.transition.duration = 0.3
-        self.file_popup.popup_manager.current = "local_page"
-        self.set_local_folder_to_last_opened()
 
     # -----------------------------------------------------------------------
     def open_wifi_password_input_popup(self):
@@ -5212,27 +4850,81 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def check_and_upload(self):
-        filepath = self.file_popup.local_rv.curr_selected_file
-        filename = os.path.basename(os.path.normpath(filepath))
-        if len(list(filter(lambda person: person["filename"] == filename, self.file_popup.remote_rv.data))) > 0:
-            # show message popup
-            self.confirm_popup.lb_title.text = tr._("File Already Exists")
-            self.confirm_popup.lb_content.text = tr._("Confirm to overwrite file:") + " \n '%s'?" % (filename)
-            self.confirm_popup.cancel = None
-            self.confirm_popup.confirm = partial(self.uploadLocalFile, filepath)
-            self.confirm_popup.open(self)
-        else:
-            if self.file_popup.firmware_mode:
-                # show message popup
-                self.confirm_popup.lb_title.text = tr._("Updating Firmware")
+        paths = self.file_popup.selected_files()
+        if not paths:
+            return
+        firmware = bool(self.file_popup.firmware_mode)
+        if firmware:
+            filepath = paths[0]
+            plan = self._firmware_plan(filepath)
+            self.confirm_popup.lb_title.text = tr._("Install firmware")
+            if plan.use_ota:
                 self.confirm_popup.lb_content.text = tr._(
-                    "Are you sure you want to update the firmware? A machine reset will be required to apply the new firmware."
+                    "This will send the ESP (mainboard) firmware to the machine over WiFi. "
+                    "The machine will reboot to apply it. A WiFi connection is required. "
+                    "Back up the machine configuration first if you have not already."
                 )
-                self.confirm_popup.cancel = None
-                self.confirm_popup.confirm = partial(self.uploadLocalFile, filepath)
-                self.confirm_popup.open(self)
             else:
-                self.uploadLocalFile(filepath)
+                self.confirm_popup.lb_content.text = (
+                    tr._(
+                        "This will upload the selected firmware file to the machine as %s. "
+                        "A machine reset is required to apply it. Back up the machine configuration first if you have not already."
+                    )
+                    % plan.remote_path
+                )
+            self.confirm_popup.cancel = None
+            self.confirm_popup.confirm = partial(self._confirmed_firmware_upload, filepath)
+            self.confirm_popup.open(self)
+            return
+        existing = [
+            os.path.basename(path) for path in paths if self.file_popup.machine_listing_has(os.path.basename(path))
+        ]
+        folders = self._selected_folder_names()
+        if self._open_transfer_confirm(paths, existing, folders, "upload", partial(self._start_uploads, paths)):
+            return
+        self._start_uploads(paths)
+
+    def _start_uploads(self, paths):
+        paths = [path for path in paths if path]
+        if not paths:
+            return
+        if len(paths) == 1:
+            self._batch_kind = None
+            self._batch_upload = False
+            self._pending_uploads = []
+            self.uploadLocalFile(paths[0])
+            return
+        files = []
+        for path in paths:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            files.append((path, size))
+        self._batch_upload = True
+        self._pending_uploads = list(paths)
+        self._begin_batch_progress("upload", files)
+        self._upload_next()
+
+    def _upload_next(self, *_args):
+        if getattr(self, "_batch_file_active", False):
+            self._complete_current_batch_file()
+            self._batch_file_active = False
+        pending = getattr(self, "_pending_uploads", None)
+        if not pending or getattr(self, "_batch_stop", False):
+            self._batch_upload = False
+            self._pending_uploads = []
+            self._end_batch_progress()
+            Clock.schedule_once(self.file_popup.refresh_machine, 0)
+            return
+        path = self._pending_uploads.pop(0)
+        self._show_batch_file(self._batch_index)
+        self._batch_file_active = True
+        self.uploadLocalFile(path, callback=self._upload_next)
+
+    def _confirmed_firmware_upload(self, filepath):
+        self.file_popup.dismiss()
+        self.start_firmware_install(filepath)
 
     def select_file(self, remote_path, local_cached_file_path):
         """Select a file that is already present both locally and remotely"""
@@ -5263,9 +4955,13 @@ class Makera(RelativeLayout):
         Clock.schedule_once(load_file_delayed, 0.1)
 
     def check_upload_and_select(self):
-        filepath = self.file_popup.local_rv.curr_selected_file
+        filepath = self.file_popup.selected_device_file
+        if not filepath or os.path.isdir(filepath):
+            return
         filename = os.path.basename(os.path.normpath(filepath))
-        if len(list(filter(lambda person: person["filename"] == filename, self.file_popup.remote_rv.data))) > 0:
+        if not is_job_file(filename):
+            return
+        if self.file_popup.machine_listing_has(filename):
             # show message popup
             self.confirm_popup.lb_title.text = tr._("File Already Exists")
             self.confirm_popup.lb_content.text = tr._("Confirm to overwrite file:") + " \n '%s'?" % (filename)
@@ -5277,7 +4973,11 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def view_local_file(self):
-        filepath = self.file_popup.local_rv.curr_selected_file
+        filepath = self.file_popup.selected_device_file
+        if not filepath or os.path.isdir(filepath):
+            return
+        if not is_job_file(os.path.basename(filepath)):
+            return
         app = App.get_running_app()
         app.selected_local_filename = filepath
         app.selected_remote_filename = ""
@@ -5294,8 +4994,10 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def check_and_download(self):
-        remote_path = self.file_popup.remote_rv.curr_selected_file
-        remote_size = self.file_popup.remote_rv.curr_selected_filesize
+        remote_path = self.file_popup.selected_machine_file
+        if not remote_path or not is_job_file(os.path.basename(remote_path)):
+            return
+        remote_size = self.file_popup.selected_machine_filesize
         remote_post_path = remote_path.replace("/sd/", "").replace("\\sd\\", "")
         local_path = os.path.join(self.temp_dir, remote_post_path)
         app = App.get_running_app()
@@ -5307,6 +5009,97 @@ class Makera(RelativeLayout):
         self.downloading_size = remote_size
         self.downloading_config = False
         threading.Thread(target=self.doDownload, args=(remote_path, local_path)).start()
+
+    # -----------------------------------------------------------------------
+    def check_and_save_to_device(self):
+        paths = self.file_popup.selected_files()
+        if not paths:
+            return
+        dest_dir = self.file_popup.device_dir
+        if not dest_dir:
+            return
+        jobs = []
+        existing = []
+        for remote_path in paths:
+            filename = os.path.basename(os.path.normpath(remote_path))
+            dest = os.path.join(dest_dir, filename)
+            jobs.append((remote_path, dest))
+            if self.file_popup.device_has_file(filename):
+                existing.append(filename)
+        folders = self._selected_folder_names()
+        if self._open_transfer_confirm(paths, existing, folders, "download", partial(self._start_downloads, jobs)):
+            return
+        self._start_downloads(jobs)
+
+    def _selected_folder_names(self):
+        popup = self.file_popup
+        names = []
+        for path in popup.selected_folders():
+            names.append(os.path.basename(os.path.normpath(path)))
+        return names
+
+    def _open_transfer_confirm(self, paths, existing, folders, kind, on_confirm):
+        message = transfer_confirm_message(paths, existing, folders, kind)
+        if message is None:
+            return False
+        title, body = message
+        self.confirm_popup.lb_title.text = title
+        self.confirm_popup.lb_content.text = body
+        self.confirm_popup.cancel = None
+        self.confirm_popup.confirm = on_confirm
+        self.confirm_popup.open(self)
+        return True
+
+    def _start_downloads(self, jobs):
+        jobs = [(remote, dest) for remote, dest in jobs if remote and dest]
+        if not jobs:
+            return
+        if len(jobs) == 1:
+            remote_path, dest = jobs[0]
+            self.save_machine_file_to_device(remote_path, dest)
+            return
+        files = [(remote, self.file_popup._size_for_path(remote)) for remote, _dest in jobs]
+        self._batch_download_jobs = list(jobs)
+        self._begin_batch_progress("download", files)
+        threading.Thread(target=self._download_files_worker, args=(jobs,), daemon=True).start()
+
+    def _download_files_worker(self, jobs):
+        for remote_path, dest in jobs:
+            if getattr(self, "_batch_stop", False):
+                break
+            self.downloading_file = remote_path
+            self.downloading_size = self.file_popup._size_for_path(remote_path)
+            self.downloading_config = False
+            result = self.doDownload(remote_path, dest, show_progress=True, open_after=False)
+            if result is None or result < 0 or getattr(self, "_batch_stop", False):
+                break
+            # Progress events are already queued. Count the file on the UI thread
+            # before the next download posts progress, or the finished file's final
+            # percent is painted onto the next file.
+            self._finish_batch_file_on_ui()
+        Clock.schedule_once(self._end_batch_progress, 0)
+
+    def _finish_batch_file_on_ui(self):
+        done = threading.Event()
+
+        def _finish(_dt):
+            try:
+                self._complete_current_batch_file()
+            except Exception:
+                logger.exception("Could not update batch download progress")
+            finally:
+                done.set()
+
+        Clock.schedule_once(_finish, 0)
+        done.wait()
+
+    def save_machine_file_to_device(self, remote_path, dest):
+        if not remote_path or not dest:
+            return
+        self.downloading_file = remote_path
+        self.downloading_size = self.file_popup.selected_machine_filesize
+        self.downloading_config = False
+        threading.Thread(target=self.doDownload, args=(remote_path, dest), kwargs={"open_after": False}).start()
 
     # -----------------------------------------------------------------------
     def start_back_up_config(self):
@@ -5323,22 +5116,31 @@ class Makera(RelativeLayout):
                 ):
                     item.value = ""
 
-        self.downloading_config = True
+        self.backing_up_config = True
+        self.downloading_config = False
+        self._backup_md5_mismatches = []
         Clock.schedule_once(partial(self.progressStart, tr._("Downloading config files..."), None), 0)
 
         self.fill_remote_dir_callback = self.download_config_files
-        self.file_popup.remote_rv.list_dir("/sd")
+        self.fill_remote_dir_callback_path = "/sd"
+        self.file_popup.list_machine_dir("/sd")
 
     # -----------------------------------------------------------------------
     def download_config_files(self, remote_paths):
-        matching_paths = []
-        for file_info in remote_paths:
-            if file_info["path"] in CONFIG_FILES_TO_BACK_UP:
-                logger.debug(f"Found matching config file: {file_info['path']}")
-                matching_paths.append(file_info["path"])
+        if not self.backing_up_config:
+            return
+        matching_paths = matching_backup_paths(remote_paths)
+        if not matching_paths:
+            Clock.schedule_once(self._abort_config_backup, 0)
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("No configuration files were found on the machine."), False),
+                0.1,
+            )
+            return
 
         local_paths = []
         progress = 0.0
+        step = 100.0 / len(matching_paths)
         for remote_path in matching_paths:
             local_path = os.path.join(self.temp_dir, os.path.basename(remote_path))
             local_paths.append(local_path)
@@ -5346,8 +5148,11 @@ class Makera(RelativeLayout):
             Clock.schedule_once(
                 partial(self.progressUpdate, progress, tr._("Downloading") + " \n%s" % remote_path, True), 0
             )
-            self.doDownload(remote_path, local_path, False)
-            progress += 100.0 / len(matching_paths)
+            download_result = self.doDownload(remote_path, local_path, show_progress=False, open_after=False)
+            if download_result is None or download_result < 0:
+                Clock.schedule_once(self._abort_config_backup, 0)
+                return
+            progress += step
             Clock.schedule_once(
                 partial(self.progressUpdate, progress, tr._("Downloading") + " \n%s" % remote_path, True), 0
             )
@@ -5362,42 +5167,105 @@ class Makera(RelativeLayout):
         self.progressFinish()
         content = PickFilePopup(partial(self.finish_backing_up_config, local_paths))
         self.pick_file_popup = Popup(
-            title="Choose where to back up your machine configuration",
+            title=tr._("Choose where to back up your machine configuration"),
             content=content,
             size_hint=(0.75, 0.75),
             auto_dismiss=True,
         )
-        content.on_cancel = self.pick_file_popup.dismiss
+        content.on_cancel = self._cancel_config_backup_picker
         self.pick_file_popup.open()
+
+    def _cancel_config_backup_picker(self):
+        if self.pick_file_popup is not None:
+            self.pick_file_popup.dismiss()
+            self.pick_file_popup = None
+        self._abort_config_backup()
+
+    def _abort_config_backup(self, *args):
+        self.progressFinish()
+        self.backing_up_config = False
+        self.downloading_config = False
+        self._backup_md5_mismatches = []
+        self.fill_remote_dir_callback = None
+        self.file_popup.restore_machine_root()
+
+    def _warn_video_download_md5(self, remote_path):
+        logger.warning(
+            "Kept %s despite an MD5 mismatch. This is a known issue with video file downloads from the Makera ESP32.",
+            remote_path,
+        )
+
+    def _note_config_backup_md5_mismatch(self, filename):
+        name = str(filename or "").strip()
+        if not name:
+            return
+        mismatches = getattr(self, "_backup_md5_mismatches", None)
+        if mismatches is None:
+            mismatches = []
+            self._backup_md5_mismatches = mismatches
+        if name not in mismatches:
+            mismatches.append(name)
+        logger.warning(
+            "Config backup kept %s despite an MD5 mismatch. Some machines ship with factory checksum mismatches.",
+            name,
+        )
+
+    def _config_backup_md5_warning_message(self, filenames):
+        files = [str(name) for name in filenames if str(name).strip()]
+        note = tr._(
+            "It has been observed that some machines have been shipped with mismatching "
+            "MD5 checksums from the factory, so this might be normal. It's recommended to manually verify the downloaded file."
+        )
+        if len(files) == 1:
+            detail = tr._("The MD5 checksum for '%s' did not match the MD5 of the downloaded file.") % files[0]
+        else:
+            detail = tr._("The MD5 checksum failed for:\n%s") % "\n".join(files)
+        return tr._("Configuration files backed up successfully.") + "\n\n" + detail + "\n\n" + note
 
     # -----------------------------------------------------------------------
     def finish_backing_up_config(self, downloaded_file_paths, selected_dir, _selected_file):
+        if self.pick_file_popup is not None:
+            self.pick_file_popup.dismiss()
+            self.pick_file_popup = None
+        if not selected_dir or not downloaded_file_paths:
+            self._abort_config_backup()
+            return
+
+        failed = False
         for source_file_path in downloaded_file_paths:
             dest_file_path = os.path.join(selected_dir, os.path.basename(source_file_path))
             try:
                 shutil.copyfile(source_file_path, dest_file_path)
             except Exception as e:
+                failed = True
                 Clock.schedule_once(
                     partial(
                         self.show_message_popup,
-                        tr._(f"Couldn't back up '{source_file_path}'. The error was:\n\n{e}"),
+                        tr._("Couldn't back up '%s'. The error was:\n\n%s") % (source_file_path, e),
                         False,
                     ),
                     0,
                 )
-                print("Error backing up config file:", e)
+                logger.error("Error backing up config file: %s", e)
 
-        self.pick_file_popup.dismiss()
-        self.pick_file_popup = None
+        self.backing_up_config = False
         self.downloading_config = False
-
-        # Workaround so that we don't expose the SD card root directory to the user
-        # next time they open the gcode file browser
-        self.file_popup.remote_rv.curr_dir = self.file_popup.remote_rv.base_dir
-
-        Clock.schedule_once(
-            partial(self.show_message_popup, tr._("Configuration files backed up successfully"), False), 0
-        )
+        self.file_popup.restore_machine_root()
+        md5_mismatches = list(getattr(self, "_backup_md5_mismatches", None) or [])
+        self._backup_md5_mismatches = []
+        if not failed and md5_mismatches:
+            Clock.schedule_once(
+                partial(
+                    self.show_message_popup,
+                    self._config_backup_md5_warning_message(md5_mismatches),
+                    False,
+                ),
+                0,
+            )
+        elif not failed:
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Configuration files backed up successfully."), False), 0
+            )
 
     # -----------------------------------------------------------------------
     def download_config_file(self):
@@ -5479,7 +5347,8 @@ class Makera(RelativeLayout):
         # Preserve selected file only when reconnecting to the same machine.
         # finishLoadConfig() can be called on reconnect; resume-at-line depends on
         # loaded self.lines matching selection (_last_loaded_file_key). If the user
-        # connects to a different machine (different IP/COM port), clear machine selection.
+        # connects to a different machine (different IP/COM port), clear the job
+        # including the file view, tool-change flags, and 3D simulation.
         app = App.get_running_app()
         current_key = self._get_current_machine_connection_key()
         if self._selected_file_machine_key is None:
@@ -5489,8 +5358,10 @@ class Makera(RelativeLayout):
             app.selected_remote_filename = ""
             self._last_loaded_file_key = None
             self._selected_file_machine_key = current_key
+            self.clear_selection()
             self.apply_bed_settings()
         self.updateStatus()
+        Clock.schedule_once(lambda _dt: self.probe_sd_videos_dir(), 0.5)
 
     def _get_current_machine_connection_key(self):
         """Return a stable identifier for the current machine connection."""
@@ -5517,10 +5388,73 @@ class Makera(RelativeLayout):
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(key))
         return os.path.join(self.temp_dir, f"config_{safe}.txt")
 
+    def _gcode_thumbnail_cache(self):
+        cache = thumbnail_cache_for_app()
+        if cache is not None:
+            return cache
+        app = App.get_running_app()
+        if app is None:
+            return None
+        return thumbnail_cache_for_app(app.user_data_dir)
+
+    def _machine_listing_identity(self, remote_path):
+        """Return ``(size, date_raw)`` from the current machine listing."""
+        norm = os.path.normpath(remote_path or "").replace("\\", "/")
+        for entry in getattr(self.file_popup, "_machine_entries", None) or []:
+            path = os.path.normpath(entry.get("path") or "").replace("\\", "/")
+            if path == norm:
+                return int(entry.get("size") or 0), str(entry.get("date_raw") or "")
+        return None, None
+
+    def _ingest_machine_gcode_thumbnail(self, remote_path, local_path):
+        if self.file_popup.firmware_mode or self.downloading_config or self.backing_up_config:
+            return
+        if not is_gcode_path(remote_path) and not is_gcode_path(local_path):
+            return
+        cache = self._gcode_thumbnail_cache()
+        if cache is None:
+            return
+        conn = self._get_current_machine_connection_key() or "unknown"
+        size, date_raw = self._machine_listing_identity(remote_path)
+        if size is None:
+            try:
+                size = os.path.getsize(local_path)
+            except OSError:
+                return
+            date_raw = ""
+        cache.ingest_file(local_path, machine_cache_key(conn, remote_path), size, date_raw)
+
+    def queue_machine_thumbnail(self, remote_path, source_file):
+        self._pending_machine_thumb = (os.path.normpath(remote_path or ""), source_file)
+
+    def flush_pending_machine_thumbnail(self):
+        pending = self._pending_machine_thumb
+        if not pending:
+            return
+        remote_path, source_file = pending
+        size, date_raw = self._machine_listing_identity(remote_path)
+        if size is None:
+            return
+        self._pending_machine_thumb = None
+        if self.file_popup.firmware_mode or self.backing_up_config:
+            return
+        source = source_file[:-3] if str(source_file).endswith(".lz") else source_file
+        if not is_gcode_path(source) and not is_gcode_path(remote_path):
+            return
+        cache = self._gcode_thumbnail_cache()
+        if cache is None:
+            return
+        conn = self._get_current_machine_connection_key() or "unknown"
+        cache.ingest_file(source, machine_cache_key(conn, remote_path), size, date_raw)
+
     # -----------------------------------------------------------------------
-    def doDownload(self, remote_path, local_path, show_progress=True):
+    def doDownload(self, remote_path, local_path, show_progress=True, open_after=True):
         app = App.get_running_app()
         was_config_download = self.downloading_config
+        # Config backup reuses downloading_config so /sd is not added to recents, but those
+        # files must not be applied as settings or opened in the viewer.
+        apply_config = was_config_download and open_after
+        was_backup = self.backing_up_config
         if not self.downloading_config and not os.path.exists(os.path.dirname(local_path)):
             # os.mkdir(os.path.dirname(local_path))
             os.makedirs(os.path.dirname(local_path))
@@ -5535,7 +5469,7 @@ class Makera(RelativeLayout):
             except OSError:
                 pass
 
-        if show_progress:
+        if show_progress and getattr(self, "_batch_kind", None) != "download":
             Clock.schedule_once(
                 partial(
                     self.progressStart,
@@ -5547,6 +5481,7 @@ class Makera(RelativeLayout):
         self.downloading = True
         # None = error/abort; never use False — `False >= 0` is True in Python.
         download_result = None
+        md5_failed = False
         try:
             md5 = Utils.md5(tmp_filename) if os.path.exists(tmp_filename) else ""
             # Makera framed transfer: pause RX before the download command so
@@ -5561,9 +5496,13 @@ class Makera(RelativeLayout):
                 self.controller.pauseStream(0.2)
                 progress_cb = partial(self.downloadCallback, remote_path) if show_progress else None
             download_result = self.controller.stream.download(tmp_filename, md5, progress_cb)
+            md5_failed = bool(
+                getattr(getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False)
+            )
         except Exception:
             logger.error(sys.exc_info()[1])
             download_result = None
+            md5_failed = False
             self.controller.resumeStream()
             self.downloading = False
 
@@ -5572,14 +5511,35 @@ class Makera(RelativeLayout):
 
         self.heartbeat_time = time.time()
 
+        # The Makera ESP32 advertises a digest for /sd/video and /sd/videos files
+        # that does not match the bytes. The file is fine; keep it and warn.
+        if (
+            download_result is None
+            and md5_failed
+            and is_machine_video_path(remote_path)
+            and os.path.exists(tmp_filename)
+        ):
+            self._warn_video_download_md5(remote_path)
+            try:
+                kept_size = os.path.getsize(tmp_filename)
+            except OSError:
+                kept_size = 1
+            download_result = kept_size if kept_size > 0 else 1
+        # Factory images sometimes advertise an MD5 that does not match the file.
+        # Keep the received bytes and let the backup finish; warn after it completes.
+        elif download_result is None and was_backup and md5_failed and os.path.exists(tmp_filename):
+            self._note_config_backup_md5_mismatch(remote_path)
+            try:
+                kept_size = os.path.getsize(tmp_filename)
+            except OSError:
+                kept_size = 1
+            download_result = kept_size if kept_size > 0 else 1
+
         if download_result is None:
             if os.path.exists(tmp_filename):
                 os.remove(tmp_filename)
             # show message popup
-            md5_failed = bool(
-                getattr(getattr(getattr(self.controller, "stream", None), "modem", None), "download_md5_failed", False)
-            )
-            if was_config_download:
+            if apply_config:
                 Clock.schedule_once(partial(self.finishLoadConfig, False), 0.1)
                 error_msg = (
                     tr._(
@@ -5599,6 +5559,7 @@ class Makera(RelativeLayout):
                     if md5_failed
                     else tr._("Download file error!")
                 )
+                error_msg += self._batch_unstarted_note()
                 Clock.schedule_once(partial(self.show_message_popup, error_msg, False), 0)
         elif download_result >= 0:
             if download_result > 0:
@@ -5613,12 +5574,12 @@ class Makera(RelativeLayout):
                     os.rename(tmp_filename, local_path)
                 elif os.path.exists(tmp_filename):
                     os.remove(tmp_filename)
-                if was_config_download:
+                if apply_config:
                     logger.info("Config unchanged (MD5 match), using cached file")
                     self.controller.log.put(
                         (Controller.MSG_NORMAL, tr._("Config unchanged (MD5 match), using cached file"))
                     )
-            if was_config_download:
+            if apply_config:
                 if show_progress:
                     Clock.schedule_once(partial(self.progressUpdate, 100, "", True), 0)
                 Clock.schedule_once(partial(self.finishLoadConfig, True), 0.1)
@@ -5638,26 +5599,47 @@ class Makera(RelativeLayout):
                 Clock.schedule_once(self.controller.viewDiagnoseReport, 0.5)
                 # Baud upgrade after config + sync commands have had time to finish.
                 Clock.schedule_once(self.attempt_usb_baud_upgrade_if_eligible, 2.0)
-            else:
+            elif open_after:
                 if show_progress:
                     Clock.schedule_once(
                         partial(self.progressUpdate, 0, tr._("Open cached file") + " \n%s" % local_path, True), 0
                     )
-                # Clock.schedule_once(partial(self.load_gcode_file, local_path), 0.1)
+                # Decompress QuickLZ in place first; ingesting the compressed
+                # payload would cache a false "no preview" hit.
                 self.load_gcode_file(local_path)
+                self._ingest_machine_gcode_thumbnail(remote_path, local_path)
+            else:
+                if self._decompress_downloaded_file_in_place(
+                    local_path,
+                    integrity_label=remote_path if was_backup or is_machine_video_path(remote_path) else None,
+                ):
+                    self._ingest_machine_gcode_thumbnail(remote_path, local_path)
 
-            if not was_config_download:
+            if not was_config_download and not was_backup:
                 self.update_recent_remote_dir_list(os.path.dirname(remote_path))
 
         elif download_result < 0:
             if os.path.exists(tmp_filename):
                 os.remove(tmp_filename)
             self.controller.log.put((Controller.MSG_NORMAL, tr._("Downloading is canceled manually.")))
-            if was_config_download:
+            if apply_config:
                 Clock.schedule_once(partial(self.finishLoadConfig, False), 0)
 
-        if show_progress:
-            Clock.schedule_once(self.progressFinish, 0.1)
+        if show_progress and getattr(self, "_batch_kind", None) != "download":
+            self._schedule_progress_finish(0.1)
+        return download_result
+
+    def _apply_detected_firmware(self, version, community, *_args):
+        """Publish a firmware version onto Kivy properties. Main thread only."""
+        app = App.get_running_app()
+        if app is None:
+            return
+        app.is_community_firmware = bool(community)
+        app.fw_version_digitized = Utils.digitize_v(version) if version else 0
+        self._refresh_3d_probe_support()
+
+        self.onFirmwareDetected(version)
+        self._refresh_firmware_update_state()
 
     def onFirmwareDetected(self, version, *args):
         app = App.get_running_app()
@@ -5681,7 +5663,9 @@ class Makera(RelativeLayout):
             btn_information = Button(text=tr._("More Information"))
             btn_information.bind(
                 on_release=lambda *a: (
-                    webbrowser.open("https://carvera-community.gitbook.io/docs/compatibility"),
+                    webbrowser.open(
+                        resolve_documentation_url("https://carvera-community.gitbook.io/docs/compatibility")
+                    ),
                     popup.dismiss(),
                 )
             )
@@ -5763,6 +5747,28 @@ class Makera(RelativeLayout):
         app = App.get_running_app()
         CNC.probe_3d_tool = probe_3d_tool_for_model(app.model)
         app.supports_3d_probe = bool(app.model.startswith("Z1") or app.is_community_firmware)
+        self._refresh_tool_dropdowns()
+
+    # -----------------------------------------------------------------------
+    def _refresh_tool_dropdowns(self):
+        """
+        Rebuild the tool change/set menus for the connected machine. Main thread only.
+
+        Stock values match makera.kv. "3D Probe" follows supports_3d_probe rather
+        than is_community_firmware, so a Z1 gets it; "Laser" stays community-only.
+        Rebuilt from scratch each time, so calling it from both the firmware and
+        the model handler is idempotent whichever arrives last.
+        """
+        app = App.get_running_app()
+        change_values = [
+            "Probe",
+            *(["3D Probe"] if app.supports_3d_probe else []),
+            *(f"Tool: {i}" for i in range(1, 7)),
+            *(["Laser"] if app.is_community_firmware else []),
+            "Custom",
+        ]
+        self.tool_drop_down.change_dropdown.values = change_values
+        self.tool_drop_down.set_dropdown.values = ["Empty", *change_values]
 
     # -----------------------------------------------------------------------
     def setUIForModel(self, model, *args):
@@ -5790,41 +5796,7 @@ class Makera(RelativeLayout):
             else:
                 CNC.vars["rotation_base_width"] = 330
                 CNC.vars["rotation_head_width"] = 7
-        if app.is_community_firmware:
-            self.tool_drop_down.set_dropdown.values = [
-                "Empty",
-                "Probe",
-                "3D Probe",
-                "Tool: 1",
-                "Tool: 2",
-                "Tool: 3",
-                "Tool: 4",
-                "Tool: 5",
-                "Tool: 6",
-                "Laser",
-                "Custom",
-            ]
-            self.tool_drop_down.change_dropdown.values = [
-                "Probe",
-                "3D Probe",
-                "Tool: 1",
-                "Tool: 2",
-                "Tool: 3",
-                "Tool: 4",
-                "Tool: 5",
-                "Tool: 6",
-                "Laser",
-                "Custom",
-            ]
-        elif app.supports_3d_probe:
-            # Z1 stock firmware: add the 3D probe entry only. The rest of the
-            # community list (Laser, Empty) drives commands this firmware
-            # handles differently, so the .kv defaults stand.
-            for spinner in (self.tool_drop_down.set_dropdown, self.tool_drop_down.change_dropdown):
-                if "3D Probe" not in spinner.values:
-                    values = list(spinner.values)
-                    values.insert(values.index("Probe") + 1, "3D Probe")
-                    spinner.values = values
+
         app.has_atc = bool(CNC.vars["FuncSetting"] & 4)
         # The first machine config load must happen after /sd/config.txt is parsed.
         if model_changed and self.config_loaded:
@@ -5844,27 +5816,36 @@ class Makera(RelativeLayout):
     def downloadCallback(self, remote_path, packet_size, success_count, error_count):
         """Progress callback for legacy XMODEM downloads."""
         packets = self.downloading_size / packet_size + (1 if self.downloading_size % packet_size > 0 else 0)
-        Clock.schedule_once(
-            partial(
-                self.progressUpdate, success_count * 100.0 / packets, tr._("Downloading") + " \n%s" % remote_path, False
-            ),
-            0,
-        )
+        self._post_download_progress(success_count * 100.0 / packets, remote_path)
 
     def downloadCallback_framed(self, seq_rev, totalpackets):
         """Progress callback for Makera framed downloads (seq, total)."""
         if not totalpackets:
             return
         remote_path = getattr(self, "downloading_file", "") or ""
+        self._post_download_progress(seq_rev * 100.0 / totalpackets, remote_path)
+
+    def _post_download_progress(self, percent, remote_path):
+        if getattr(self, "_batch_kind", None) == "download":
+            # Bind the file this packet belongs to. The clock can run the update
+            # after that file has been completed and the next one has started.
+            index = getattr(self, "_batch_index", 0)
+            Clock.schedule_once(
+                lambda _dt, i=index, p=percent: self._apply_download_batch_progress(i, p),
+                0,
+            )
+            return
         Clock.schedule_once(
-            partial(
-                self.progressUpdate,
-                seq_rev * 100.0 / totalpackets,
-                tr._("Downloading") + " \n%s" % remote_path,
-                False,
-            ),
+            partial(self.progressUpdate, percent, tr._("Downloading") + " \n%s" % remote_path, False),
             0,
         )
+
+    def _apply_download_batch_progress(self, index, percent):
+        if getattr(self, "_batch_kind", None) != "download":
+            return
+        if index != getattr(self, "_batch_index", None):
+            return
+        self._apply_batch_file_percent(percent)
 
     # -----------------------------------------------------------------------
     def cancelSelectFile(self):
@@ -6012,8 +5993,27 @@ class Makera(RelativeLayout):
                 )
 
     # -----------------------------------------------------------------------
-    def loadRemoteDir(self, ls_dir):
-        self.loading_dir = ls_dir
+    def request_machine_ls(self, ls_dir):
+        """UI-thread: remember *ls_dir* as the folder to show, then list it if idle."""
+        with self._machine_ls_lock:
+            self._machine_ls_wanted_path = ls_dir
+            if self.controller.loadNUM == LOAD_DIR:
+                return
+        threading.Thread(target=self._run_machine_ls, daemon=True).start()
+
+    def _run_machine_ls(self):
+        """Start `ls` for the UI-requested folder if none is in flight."""
+        with self._machine_ls_lock:
+            target = self._machine_ls_wanted_path
+            if not target or self.controller.loadNUM == LOAD_DIR:
+                return
+            self._start_machine_ls(target)
+
+    def _start_machine_ls(self, ls_dir):
+        """Send `ls` for *ls_dir*. Caller must hold `_machine_ls_lock`."""
+        self._machine_ls_sent_path = ls_dir
+        while self.controller.load_buffer.qsize() > 0:
+            self.controller.load_buffer.get_nowait()
         self.controller.sendNUM = 0
         self.controller.loadNUM = LOAD_DIR
         self.controller.loadEOF = False
@@ -6021,21 +6021,60 @@ class Makera(RelativeLayout):
         self.short_load_time = time.time()
         self.controller.lsCommand(os.path.normpath(ls_dir))
 
+    def _finish_machine_ls(self, now):
+        with self._machine_ls_lock:
+            timed_out = now - self.short_load_time > SHORT_LOAD_TIMEOUT
+            sent_path = self._machine_ls_sent_path
+            wanted_path = self._machine_ls_wanted_path
+            keep = self._sd_videos_probe_keep
+            self._sd_videos_probe_keep = None
+            superseded = machine_ls_is_superseded(sent_path, wanted_path)
+            # A background /sd probe is not the folder the UI asked for. Leave
+            # that folder alone unless a newer request arrived while probing.
+            background_probe = keep is not None and machine_path_key(sent_path or "") == "/sd"
+            if background_probe and machine_path_key(wanted_path or "") == machine_path_key(keep):
+                superseded = False
+                report_failure = False
+            else:
+                report_failure = not superseded
+            if report_failure:
+                if self.controller.loadERR:
+                    Clock.schedule_once(partial(self.loadError, tr._("Error loading dir") + " '%s'!" % (sent_path,)), 0)
+                elif timed_out:
+                    Clock.schedule_once(
+                        partial(self.loadError, tr._("Timeout loading dir") + " '%s'!" % (sent_path,)), 0
+                    )
+            self.controller.loadEOF = False
+            self.controller.loadERR = False
+            self.process_loaded_dir(sent_path)
+            if superseded and wanted_path:
+                self._start_machine_ls(wanted_path)
+            else:
+                self.controller.loadNUM = 0
+                self._machine_ls_sent_path = None
+
     # -----------------------------------------------------------------------
     def removeRemoteFile(self, filename):
         self.pending_remote_delete_files = []
+        self._remote_deleted_paths = []
         self.startRemoteDelete(filename)
 
     # -----------------------------------------------------------------------
     def removeRemoteFiles(self, filenames):
         self.pending_remote_delete_files = list(filenames)
+        self._remote_deleted_paths = []
         self.removeNextRemoteFile()
+
+    def _after_remote_delete(self, paths, *_args):
+        if paths:
+            self.file_popup.forget_selected_paths(paths)
+        self.file_popup.refresh_machine()
 
     # -----------------------------------------------------------------------
     def removeNextRemoteFile(self, *args):
         if not getattr(self, "pending_remote_delete_files", []):
             self.deleting_remote_file = ""
-            Clock.schedule_once(self.file_popup.remote_rv.current_dir, 0)
+            Clock.schedule_once(self.file_popup.refresh_machine, 0)
             return
         filename = self.pending_remote_delete_files.pop(0)
         self.startRemoteDelete(filename)
@@ -6059,7 +6098,7 @@ class Makera(RelativeLayout):
         self.controller.readEOF = False
         self.controller.readERR = False
         self.short_load_time = time.time()
-        new_name = os.path.join(self.file_popup.remote_rv.curr_dir, self.input_popup.txt_content.text)
+        new_name = os.path.join(self.file_popup.machine_dir, self.input_popup.txt_content.text)
         if filename == new_name:
             return False
         self.controller.mvCommand(os.path.normpath(filename), os.path.normpath(new_name))
@@ -6074,9 +6113,93 @@ class Makera(RelativeLayout):
         self.controller.readEOF = False
         self.controller.readERR = False
         self.short_load_time = time.time()
-        dirname = os.path.join(self.file_popup.remote_rv.curr_dir, self.input_popup.txt_content.text)
+        dirname = os.path.join(self.file_popup.machine_dir, self.input_popup.txt_content.text)
         self.controller.mkdirCommand(os.path.normpath(dirname))
         return True
+
+    # -----------------------------------------------------------------------
+    def removeLocalFiles(self, filenames):
+        errors = []
+        for path in list(filenames or []):
+            try:
+                remove_local_path(path)
+            except OSError as exc:
+                errors.append("%s: %s" % (path, exc))
+                continue
+            self._sync_local_job_path(path, "")
+        self.file_popup.cancel_multi_select()
+        self.file_popup.list_device_dir(self.file_popup.device_dir)
+        if errors:
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Error deleting") + "\n" + "\n".join(errors[:5]), False),
+                0,
+            )
+
+    def renameLocalFile(self, filename):
+        dest = local_sibling_path(filename, self.input_popup.txt_content.text)
+        if not dest:
+            return False
+        if os.path.normpath(filename) == os.path.normpath(dest):
+            return False
+        if os.path.exists(dest):
+            self.confirm_popup.lb_title.text = tr._("File Already Exists")
+            self.confirm_popup.lb_content.text = tr._("Confirm to overwrite file:") + " \n '%s'?" % (
+                os.path.basename(dest)
+            )
+            self.confirm_popup.cancel = None
+            self.confirm_popup.confirm = partial(self._apply_local_rename, filename, dest)
+            Clock.schedule_once(lambda *_: self.confirm_popup.open(self), 0)
+            return True
+        return self._apply_local_rename(filename, dest)
+
+    def _apply_local_rename(self, src, dest):
+        try:
+            rename_local_path(src, dest)
+        except OSError as exc:
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Error renaming") + " '%s'!\n%s" % (src, exc), False),
+                0,
+            )
+            return True
+        self._sync_local_job_path(src, dest)
+        self.file_popup.list_device_dir(self.file_popup.device_dir)
+        return True
+
+    def createLocalDir(self):
+        name = self.input_popup.txt_content.text.strip()
+        dest = local_child_path(self.file_popup.device_dir, name)
+        if not dest:
+            return False
+        try:
+            mkdir_local(self.file_popup.device_dir, name)
+        except OSError:
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Error making dir:") + " '%s'!" % name, False),
+                0,
+            )
+            return False
+        self.file_popup.list_device_dir(self.file_popup.device_dir)
+        return True
+
+    def _sync_local_job_path(self, old_path, new_path=""):
+        app = App.get_running_app()
+        if app is None:
+            return
+        local = (app.selected_local_filename or "").strip()
+        if not local:
+            return
+        old_norm = os.path.normpath(old_path)
+        local_norm = os.path.normpath(local)
+        replacement = os.path.normpath(new_path) if new_path else ""
+        if local_norm == old_norm:
+            app.selected_local_filename = replacement
+            return
+        prefix = old_norm + os.sep
+        if local_norm.startswith(prefix):
+            if not replacement:
+                app.selected_local_filename = ""
+            else:
+                app.selected_local_filename = replacement + local_norm[len(old_norm) :]
 
     # -----------------------------------------------------------------------
     def connectToWiFi(self):
@@ -6190,7 +6313,43 @@ class Makera(RelativeLayout):
             return None
 
     # -----------------------------------------------------------------------
-    def _verify_deferred_download_md5(self, filepath):
+    def _decompress_downloaded_file_in_place(self, filepath, integrity_label=None):
+        """Decompress a QuickLZ download in place without a `.lz/` sidecar folder."""
+        try:
+            with open(filepath, "rb") as f:
+                magic = f.read(2)
+        except OSError:
+            return False
+        if magic != b"\x00\x00":
+            return True
+
+        lz_tmp = filepath + ".lz"
+        try:
+            if os.path.exists(lz_tmp):
+                os.remove(lz_tmp)
+            os.rename(filepath, lz_tmp)
+        except OSError:
+            logger.error("Could not stage compressed download for decompress: %s", filepath)
+            return False
+
+        if not self.decompress_file(lz_tmp, filepath):
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                os.rename(lz_tmp, filepath)
+            except OSError:
+                pass
+            Clock.schedule_once(partial(self.show_message_popup, tr._("Download file error!"), False), 0)
+            return False
+
+        try:
+            os.remove(lz_tmp)
+        except OSError:
+            pass
+        return self._verify_deferred_download_md5(filepath, label=integrity_label)
+
+    # -----------------------------------------------------------------------
+    def _verify_deferred_download_md5(self, filepath, label=None):
         """Verify a machine-advertised MD5 after .lz decompress. Returns False on mismatch."""
         modem = getattr(getattr(self.controller, "stream", None), "modem", None)
         expected = getattr(modem, "deferred_download_md5", None) if modem is not None else None
@@ -6204,11 +6363,18 @@ class Makera(RelativeLayout):
             logger.info("Download MD5 matched after decompress: %s", actual)
             return True
 
+        if is_machine_video_path(label or ""):
+            self._warn_video_download_md5(label or filepath)
+            return True
+
         logger.error(
             "Download error: MD5 mismatch after decompress (expected=%s, actual=%s)",
             expected,
             actual,
         )
+        if self.backing_up_config:
+            self._note_config_backup_md5_mismatch(label or filepath)
+            return True
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -6275,11 +6441,253 @@ class Makera(RelativeLayout):
             return False
 
     # -----------------------------------------------------------------------
-    def uploadLocalFile(self, filepath, callback=None):
+    def install_firmware_release(self, release):
+        app = App.get_running_app()
+        if app is None or app.state != "Idle" or self.uploading or self.downloading:
+            self.show_message_popup(tr._("The machine must be idle to install firmware."), False)
+            return
+        machine_model = getattr(app, "model", "")
+        if not firmware_one_click_supported(machine_model):
+            self.show_message_popup(
+                tr._("One-click firmware install is only supported on C1, CA1, and Z1."),
+                False,
+            )
+            return
+        version = release.display_name if release is not None else ""
+        dest = self._firmware_plan().remote_path
+        self.confirm_popup.lb_title.text = tr._("Install firmware")
+        self.confirm_popup.lb_content.text = tr._(
+            "This will download firmware %s, verify its checksum, upload it to the machine as %s, "
+            "and then ask you to reset the machine. Back up the machine configuration first if you have not already."
+        ) % (version, dest)
+        self.confirm_popup.cancel = None
+        self.confirm_popup.confirm = partial(self._download_and_install_firmware, release, machine_model)
+        self.confirm_popup.open(self)
+
+    def _download_and_install_firmware(self, release, machine_model=""):
+        cancel_event = threading.Event()
+        self._firmware_download_cancel = cancel_event
+        Clock.schedule_once(
+            partial(
+                self.progressStart,
+                tr._("Downloading firmware") + "\n%s" % release.display_name,
+                self._cancel_firmware_download,
+            ),
+            0,
+        )
+        dest_dir = os.path.join(self.temp_dir, "firmware")
+        self._log_firmware("downloading %s" % release.display_name)
+        threading.Thread(
+            target=self._download_firmware_worker,
+            args=(release, dest_dir, cancel_event, machine_model),
+            daemon=True,
+        ).start()
+
+    def _cancel_firmware_download(self):
+        if self._firmware_download_cancel is not None:
+            self._firmware_download_cancel.set()
+
+    def _download_firmware_worker(self, release, dest_dir, cancel_event, machine_model=""):
+        def progress(received, total):
+            percent = (received * 100.0 / total) if total else 0
+            Clock.schedule_once(partial(self.progressUpdate, percent, "", False), 0)
+
+        try:
+            path = fetch_firmware_bin(
+                release,
+                dest_dir,
+                machine_model=machine_model,
+                cancel_event=cancel_event,
+                progress=progress,
+            )
+        except DownloadCancelled:
+            Clock.schedule_once(self.progressFinish, 0)
+            self._log_firmware("download cancelled")
+            return
+        except DownloadError as exc:
+            Clock.schedule_once(self.progressFinish, 0)
+            Clock.schedule_once(partial(self.show_message_popup, str(exc), False), 0.1)
+            self._log_firmware("download failed: %s" % exc, error=True)
+            return
+        except Exception:
+            logger.exception("Firmware download failed")
+            Clock.schedule_once(self.progressFinish, 0)
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Couldn't download the firmware file."), False), 0.1
+            )
+            self._log_firmware("download failed", error=True)
+            return
+        self._log_firmware("downloaded %s" % path.name)
+        Clock.schedule_once(self.progressFinish, 0)
+        Clock.schedule_once(partial(self._start_firmware_install_from_download, str(path)), 0.1)
+
+    def _start_firmware_install_from_download(self, filepath, *_args):
+        app = App.get_running_app()
+        if app is None or app.state != "Idle" or self.uploading or self.downloading:
+            self.show_message_popup(tr._("The machine must be idle to install firmware."), False)
+            try:
+                if filepath and os.path.isfile(filepath):
+                    os.remove(filepath)
+            except OSError:
+                pass
+            return
+        self.start_firmware_install(filepath, delete_after=True)
+
+    def start_firmware_install(self, filepath, *, delete_after=False):
+        app = App.get_running_app()
+        if app is None or app.state != "Idle" or self.uploading or self.downloading:
+            self.show_message_popup(tr._("The machine must be idle to install firmware."), False)
+            if delete_after:
+                self._remove_path_quietly(filepath)
+            return
+        if not filepath or not os.path.isfile(filepath):
+            self.show_message_popup(tr._("Couldn't find the firmware file."), False)
+            return
+        plan = self._firmware_plan(filepath)
+        try:
+            size = os.path.getsize(filepath)
+        except OSError:
+            size = 0
+        self._log_firmware("detected %s in %s (%s bytes)" % (plan.kind_label, os.path.basename(filepath), size))
+        self._log_firmware("sending via %s" % plan.method_description)
+        if plan.use_ota:
+            self._start_esp_ota(filepath, host=plan.ota_host, delete_after=delete_after)
+            return
+        self._firmware_delete_after = filepath if delete_after else None
+        self.uploadLocalFile(filepath, firmware=True)
+
+    def _firmware_plan(self, filepath=None):
+        app = App.get_running_app()
+        return firmware_install_plan(
+            getattr(app, "model", "") if app is not None else "",
+            filepath,
+            wifi_address=getattr(self.controller, "connection_address", ""),
+        )
+
+    def _log_firmware(self, message, *, error=False):
+        text = "Firmware: %s" % message
+        if error:
+            logger.error("%s", text)
+            self.controller.log.put((Controller.MSG_ERROR, text))
+        else:
+            logger.info("%s", text)
+            self.controller.log.put((Controller.MSG_NORMAL, text))
+
+    def _start_esp_ota(self, filepath, *, host="", delete_after=False):
+        if self.controller.connection_type != CONN_WIFI or not host:
+            self._log_firmware("ESP OTA requires WiFi; not sending", error=True)
+            self.show_message_popup(tr._("ESP firmware updates must be sent over WiFi."), False)
+            if delete_after:
+                self._remove_path_quietly(filepath)
+            return
+        self._firmware_delete_after = filepath if delete_after else None
+        cancel_event = threading.Event()
+        self._esp_ota_cancel = cancel_event
+        self._esp_ota_conn = None
+        self.uploading = True
+        Clock.schedule_once(
+            partial(
+                self.progressStart,
+                tr._("Uploading ESP firmware") + "\n%s" % os.path.basename(filepath),
+                self._cancel_esp_ota,
+            ),
+            0,
+        )
+        threading.Thread(
+            target=self._esp_ota_worker,
+            args=(filepath, host, cancel_event),
+            daemon=True,
+        ).start()
+
+    def _cancel_esp_ota(self):
+        if self._esp_ota_cancel is not None:
+            self._esp_ota_cancel.set()
+        conn = self._esp_ota_conn
+        self._esp_ota_conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _esp_ota_worker(self, filepath, host, cancel_event):
+        def progress(sent, total):
+            percent = (sent * 100.0 / total) if total else 0
+            Clock.schedule_once(partial(self.progressUpdate, percent, "", False), 0)
+
+        def on_connection(conn):
+            self._esp_ota_conn = conn
+
+        try:
+            self.controller.pauseStream(1)
+            upload_esp_ota(
+                host,
+                filepath,
+                progress=progress,
+                cancel_event=cancel_event,
+                on_connection=on_connection,
+            )
+        except EspOtaCancelled:
+            Clock.schedule_once(self.progressFinish, 0)
+            self._log_firmware("ESP OTA transfer cancelled")
+            self._cleanup_firmware_temp(success=False)
+            return
+        except EspOtaError as exc:
+            Clock.schedule_once(self.progressFinish, 0)
+            Clock.schedule_once(partial(self.show_message_popup, str(exc), False), 0.1)
+            self._log_firmware("ESP OTA transfer failed: %s" % exc, error=True)
+            self._cleanup_firmware_temp(success=False)
+            return
+        except Exception:
+            logger.exception("ESP firmware update failed")
+            Clock.schedule_once(self.progressFinish, 0)
+            Clock.schedule_once(partial(self.show_message_popup, tr._("Couldn't send the ESP firmware."), False), 0.1)
+            self._log_firmware("ESP OTA transfer failed", error=True)
+            self._cleanup_firmware_temp(success=False)
+            return
+        finally:
+            self.uploading = False
+            self._esp_ota_conn = None
+            self._esp_ota_cancel = None
+            try:
+                self.controller.resumeStream()
+            except Exception:
+                logger.debug("Could not resume stream after ESP OTA", exc_info=True)
+
+        Clock.schedule_once(self.progressFinish, 0)
+        self._log_firmware("ESP OTA transfer succeeded")
+        Clock.schedule_once(
+            partial(
+                self.show_message_popup,
+                tr._("ESP firmware was sent. The machine is rebooting; reconnect when it comes back online."),
+                False,
+            ),
+            0.1,
+        )
+        self._cleanup_firmware_temp(success=True)
+
+    def _remove_path_quietly(self, filepath):
+        try:
+            if filepath and os.path.isfile(filepath):
+                os.remove(filepath)
+        except OSError:
+            logger.warning("Could not remove temporary firmware file %s", filepath, exc_info=True)
+
+    def _cleanup_firmware_temp(self, *, success=False):
+        path = self._firmware_delete_after
+        self._firmware_delete_after = None
+        self._firmware_download_cancel = None
+        if path:
+            self._remove_path_quietly(path)
+
+    def uploadLocalFile(self, filepath, callback=None, firmware=None):
+        if firmware is None:
+            firmware = bool(self.file_popup.firmware_mode)
+        self._uploading_firmware = bool(firmware)
         self.controller.sendNUM = SEND_FILE
         self.uploading_file = filepath
         self.original_upload_filepath = filepath  # Store original path for recent directory tracking
-        if "lz" in self.filetype:  # 如果固件支持的上传文件类型为.lz，则进行压缩
+        if "lz" in self.filetype and not self._uploading_firmware:  # Compress file if supported
             qlzfilename = self.compress_file(filepath)
             if qlzfilename:
                 self.uploading_file = qlzfilename
@@ -6287,58 +6695,92 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def doUpload(self, callback):
-        self.uploading_size = os.path.getsize(self.uploading_file)
-        remotename = os.path.join(
-            self.file_popup.remote_rv.curr_dir, os.path.basename(os.path.normpath(self.uploading_file))
-        )
-        if self.file_popup.firmware_mode:
-            remotename = "/sd/firmware.bin"
+        firmware = bool(self._uploading_firmware)
+        upload_result = None
+        local_path = self.uploading_file
+        try:
+            self.uploading_size = os.path.getsize(self.uploading_file)
+        except OSError as exc:
+            logger.exception("Upload failed")
+            self.controller.log.put((Controller.MSG_ERROR, str(exc)))
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Upload file error!") + self._batch_unstarted_note(), False),
+                0,
+            )
+            if firmware:
+                self._log_firmware("SD transfer failed: %s" % exc, error=True)
+            self._cleanup_firmware_temp(success=False)
+            self._uploading_firmware = False
+            self._fail_batch_transfer()
+            return
+        remotename = os.path.join(self.file_popup.machine_dir, os.path.basename(os.path.normpath(self.uploading_file)))
+        if firmware:
+            remotename = self._firmware_plan(self.uploading_file).remote_path
         displayname = self.uploading_file
         if displayname.endswith(".lz"):
             # 删除 ".lz" 后缀
             displayname = displayname[:-3]
-        Clock.schedule_once(
-            partial(self.progressStart, tr._("Uploading") + "\n%s" % displayname, self.cancelProcessingFile), 0
-        )
+        if getattr(self, "_batch_kind", None) != "upload":
+            Clock.schedule_once(
+                partial(self.progressStart, tr._("Uploading") + "\n%s" % displayname, self.cancelProcessingFile), 0
+            )
         self.uploading = True
         self.controller.pauseStream(1)
         upload_result = None
+        last_file_error = None
         try:
             # md5 = Utils.md5(self.uploading_file)
             md5 = Utils.md5(displayname)
             self.controller.uploadCommand(os.path.normpath(remotename))
             upload_result = self.controller.stream.upload(self.uploading_file, md5, self.uploadCallback)
-        except:
-            self.controller.log.put((Controller.MSG_ERROR, str(sys.exc_info()[1])))
+            modem = getattr(self.controller.stream, "modem", None)
+            last_file_error = getattr(modem, "last_file_error", None) if modem else None
+        except Exception as exc:
+            logger.exception("Upload failed")
+            self.controller.log.put((Controller.MSG_ERROR, str(exc)))
             self.controller.resumeStream()
             self.uploading = False
+            upload_result = False
 
         self.controller.resumeStream()
         self.uploading = False
 
-        Clock.schedule_once(self.progressFinish, 0)
+        if getattr(self, "_batch_kind", None) != "upload":
+            self._schedule_progress_finish()
 
         self.heartbeat_time = time.time()
 
+        # FILE_CAN with a payload is a failed open, not a user cancel.
+        if upload_result is None and last_file_error:
+            upload_result = False
+
         if upload_result is None:
             self.controller.log.put((Controller.MSG_NORMAL, tr._("Uploading is canceled manually.")))
+            if firmware:
+                self._log_firmware("SD transfer cancelled")
             # 如果为压缩后的'.lz'文件则删除该文件
             if self.uploading_file.endswith(".lz"):
                 os.remove(self.uploading_file)
         elif not upload_result:
+            if firmware:
+                self._log_firmware("SD transfer failed", error=True)
             # 如果为压缩后的'.lz'文件则删除该文件
             if self.uploading_file.endswith(".lz"):
                 os.remove(self.uploading_file)
-            # show message popup
-            Clock.schedule_once(partial(self.show_message_popup, tr._("Upload file error!"), False), 0)
+            if last_file_error:
+                self.controller.log.put((Controller.MSG_ERROR, last_file_error))
+            Clock.schedule_once(
+                partial(self.show_message_popup, tr._("Upload file error!") + self._batch_unstarted_note(), False),
+                0,
+            )
         else:
             # copy file to application directory if needed
             remote_path = os.path.join(
-                self.file_popup.remote_rv.curr_dir, os.path.basename(os.path.normpath(self.uploading_file))
+                self.file_popup.machine_dir, os.path.basename(os.path.normpath(self.uploading_file))
             )
             remote_post_path = remote_path.replace("/sd/", "").replace("\\sd\\", "")
             local_path = os.path.join(self.temp_dir, remote_post_path)
-            if self.uploading_file != local_path and not self.file_popup.firmware_mode:
+            if self.uploading_file != local_path and not firmware:
                 if self.uploading_file.endswith(".lz"):
                     # copy lz file to .lz dir
                     lzpath, filename = os.path.split(local_path)
@@ -6358,17 +6800,20 @@ class Makera(RelativeLayout):
                     shutil.copyfile(origin_file, origin_path)
                 else:
                     if not os.path.exists(os.path.dirname(local_path)):
-                        # os.mkdir(os.path.dirname(local_path))
+                        # os.mkdir(os.path.dirname(origin_path))
                         os.makedirs(os.path.dirname(local_path))
                     shutil.copyfile(self.uploading_file, local_path)
-            if self.file_popup.firmware_mode:
+            if firmware:
+                self._log_firmware("SD transfer succeeded")
                 Clock.schedule_once(self.confirm_reset, 0)
             # update recent folder
-            if not self.file_popup.firmware_mode:
+            if not firmware:
                 self.update_recent_local_dir_list(os.path.dirname(self.original_upload_filepath))
+                remote_thumb = remotename[:-3] if str(remotename).endswith(".lz") else remotename
+                self.queue_machine_thumbnail(remote_thumb, self.original_upload_filepath)
 
             # If it is a compressed ''.lz' file, wait for the decompression to complete.
-            if self.uploading_file.endswith(".lz"):
+            if self.uploading_file.endswith(".lz") and getattr(self, "_batch_kind", None) != "upload":
                 self.log = logging.getLogger("File.Decompress")
                 self.decompstatus = True
                 os.remove(self.uploading_file)
@@ -6376,6 +6821,11 @@ class Makera(RelativeLayout):
                 Clock.schedule_once(
                     partial(self.progressStart, tr._("Decompressing") + "\n%s" % displayname, False), 0.2
                 )
+            elif self.uploading_file.endswith(".lz"):
+                self.log = logging.getLogger("File.Decompress")
+                self.decompstatus = True
+                os.remove(self.uploading_file)
+                self.decomptime = time.time()
 
         self.controller.sendNUM = 0
         if upload_result and callback:  # Only run callback if upload succeeded
@@ -6384,16 +6834,27 @@ class Makera(RelativeLayout):
                 # The callback will be triggered in updateCompressProgress when decompression finishes
                 self.pending_decompress_callback = partial(callback, remotename[:-3], origin_path)
             else:
-                callback(remotename, local_path)
+                Clock.schedule_once(lambda dt: callback(remotename, local_path), 0)
         # For iOS we display the file list remotely only so we need to refresh it but on main thread
-        if upload_result and not self.file_popup.firmware_mode and not self.uploading_file.endswith(".lz"):
-            Clock.schedule_once(self.file_popup.remote_rv.current_dir, 0)
+        if (
+            upload_result
+            and not firmware
+            and not self.uploading_file.endswith(".lz")
+            and not getattr(self, "_batch_upload", False)
+        ):
+            Clock.schedule_once(self.file_popup.refresh_machine, 0)
+        self._cleanup_firmware_temp(success=bool(upload_result))
+        self._uploading_firmware = False
+        if getattr(self, "_batch_kind", None) == "upload" and not upload_result:
+            # A failure or cancel leaves the operator to notice it, so do not start the rest.
+            self._fail_batch_transfer()
 
     # -----------------------------------------------------------------------
     def confirm_reset(self, *args):
         self.confirm_popup.lb_title.text = tr._("Update Finished")
         self.confirm_popup.lb_content.text = tr._("Confirm to reset the machine?")
         self.confirm_popup.confirm = partial(self.resetMachine)
+        self.confirm_popup.cancel = None
         self.confirm_popup.open(self)
 
     # -----------------------------------------------------------------------
@@ -6406,7 +6867,8 @@ class Makera(RelativeLayout):
         self.controller.stream.cancel_process()
 
     # -----------------------------------------------------------------------
-    def process_loaded_dir(self, *args):
+    def process_loaded_dir(self, listed_path=None):
+        listed_path = listed_path or self._machine_ls_sent_path or self.file_popup.machine_dir
         is_dir = False
         file_list = []
         while self.controller.load_buffer.qsize() > 0:
@@ -6432,58 +6894,32 @@ class Makera(RelativeLayout):
                     file_list.append(
                         {
                             "name": file_infos[0],
-                            "path": f"{self.file_popup.remote_rv.curr_dir}/{file_infos[0]}",
+                            "path": machine_child_entry_path(listed_path, file_infos[0]),
                             "is_dir": is_dir,
                             "size": int(file_infos[1]),
                             "date": timestamp,
+                            "date_raw": file_infos[2],
                         }
                     )
 
-        Clock.schedule_once(partial(self.fill_remote_dir, file_list), 0)
+        self._note_sd_videos_listing(listed_path, file_list)
+        Clock.schedule_once(partial(self.fill_remote_dir, file_list, listed_path), 0)
 
     # -----------------------------------------------------------------------
-    def fill_remote_dir(self, file_list, *args):
-        self.file_popup.remote_rv.curr_file_list_buff = file_list
-        self.file_popup.remote_rv.fill_dir(switch_reverse=False)
-
-        self.file_popup.remote_rv.curr_dir = os.path.normpath(self.file_popup.remote_rv.curr_dir)
-        self.file_popup.remote_rv.curr_dir_name = os.path.basename(os.path.normpath(self.file_popup.remote_rv.curr_dir))
-
-        self.file_popup.remote_rv.curr_full_path_list = [self.file_popup.remote_rv.curr_dir]
-        if (
-            self.file_popup.remote_rv.curr_dir == self.file_popup.remote_rv.base_dir
-            or self.file_popup.remote_rv.curr_dir == self.file_popup.remote_rv.base_dir_win
-        ):
-            self.file_popup.remote_rv.curr_path_list = ["root"]
-
-            if self.fill_remote_dir_callback:
-                threading.Thread(
-                    target=self.fill_remote_dir_callback, args=(self.file_popup.remote_rv.curr_file_list_buff,)
-                ).start()
-                self.fill_remote_dir_callback = None
-            return
-        self.file_popup.remote_rv.curr_path_list = [self.file_popup.remote_rv.curr_dir_name]
-        last_parent_dir = self.file_popup.remote_rv.curr_dir
-
-        for loop in range(5):
-            parent_dir = os.path.dirname(last_parent_dir)
-            if last_parent_dir == parent_dir:
-                break
-            self.file_popup.remote_rv.curr_full_path_list.insert(0, parent_dir)
-            if parent_dir == self.file_popup.remote_rv.base_dir or parent_dir == self.file_popup.remote_rv.base_dir_win:
-                self.file_popup.remote_rv.curr_path_list.insert(0, "root")
-                break
-            self.file_popup.remote_rv.curr_path_list.insert(0, os.path.basename(parent_dir))
-            last_parent_dir = parent_dir
-
-        if self.fill_remote_dir_callback:
-            threading.Thread(
-                target=self.fill_remote_dir_callback, args=(self.file_popup.remote_rv.curr_file_list_buff,)
-            ).start()
+    def fill_remote_dir(self, file_list, listed_path=None, *args):
+        listed_path = listed_path or None
+        self.file_popup.apply_machine_listing(file_list, listed_path=listed_path)
+        callback = self.fill_remote_dir_callback
+        callback_path = self.fill_remote_dir_callback_path
+        if callback and machine_listing_callback_matches(listed_path, callback_path):
             self.fill_remote_dir_callback = None
+            self.fill_remote_dir_callback_path = None
+            threading.Thread(target=callback, args=(file_list,)).start()
 
     # -----------------------------------------------------------------------
     def loadError(self, error_msg, *args):
+        if self.backing_up_config:
+            self._abort_config_backup()
         # close progress popups
         self.progress_popup.dismiss()
         # show message popup
@@ -6496,6 +6932,7 @@ class Makera(RelativeLayout):
 
     # --------------------------------------------------------------`---------
     def progressStart(self, text, cancel_func, *args):
+        self._progress_epoch = getattr(self, "_progress_epoch", 0) + 1
         self.progress_popup.progress_text = text
         self.progress_popup.progress_value = 0
         if cancel_func:
@@ -6505,12 +6942,183 @@ class Makera(RelativeLayout):
             self.progress_popup.btn_cancel.disabled = True
         self.progress_popup.open()
 
+    def _schedule_progress_finish(self, delay=0):
+        """Close the progress popup later, unless a newer transfer has already taken it."""
+        epoch = getattr(self, "_progress_epoch", 0)
+        Clock.schedule_once(lambda _dt, epoch=epoch: self._finish_progress(epoch), delay)
+
+    def _finish_progress(self, epoch, *args):
+        if epoch != getattr(self, "_progress_epoch", None):
+            return
+        self.progress_popup.dismiss()
+
     # --------------------------------------------------------------`---------
     def progressUpdate(self, value, progress_text, button_disabled, *args):
+        if getattr(self, "_batch_kind", None):
+            # Decompression has already settled this file's transferred bytes.
+            # A late upload percent must not paint over that or rewind the batch bar.
+            if getattr(self, "_batch_upload_settled", False) and getattr(self, "_batch_index", None) == getattr(
+                self, "_batch_settled_index", None
+            ):
+                return
+            self._apply_batch_file_percent(value)
+            return
         if progress_text != "":
             self.progress_popup.progress_text = progress_text
         self.progress_popup.btn_cancel.disabled = button_disabled
         self.progress_popup.progress_value = value
+
+    def _begin_batch_progress(self, kind, files):
+        """Open the batch popup. files is (path, size_in_bytes)."""
+        self._batch_kind = kind
+        self._batch_files = [(path, max(0, int(size))) for path, size in files]
+        self._batch_index = 0
+        self._batch_completed_bytes = 0
+        self._batch_total_bytes = sum(size for _path, size in self._batch_files)
+        self._batch_stop = False
+        self._batch_file_active = False
+        self._batch_upload_settled = False
+        self._batch_settled_index = None
+        self.batch_progress_popup.cancel = self.cancel_batch_transfer
+        if "btn_batch_cancel" in self.batch_progress_popup.ids:
+            self.batch_progress_popup.ids.btn_batch_cancel.disabled = False
+        self._show_batch_file(0)
+
+    def _show_batch_file(self, index):
+        self._batch_index = index
+        self._batch_upload_settled = False
+        self._batch_settled_index = None
+        self._apply_batch_file_percent(0)
+        if not self.batch_progress_popup._is_open:
+            self.batch_progress_popup.open()
+
+    def _batch_bar_state(self, file_percent):
+        """Return display values for the current file, or None when the index is stale."""
+        files = getattr(self, "_batch_files", None) or []
+        index = getattr(self, "_batch_index", 0)
+        if not files or index < 0 or index >= len(files):
+            return None
+        path, size = files[index]
+        completed = getattr(self, "_batch_completed_bytes", 0)
+        total = getattr(self, "_batch_total_bytes", 0)
+        file_pct, batch_pct = batch_percents(completed, size, file_percent, total)
+        if total <= 0:
+            batch_pct = min(100.0, 100.0 * (index + file_pct / 100.0) / len(files))
+        done = completed + size * file_pct / 100.0
+        return path, file_pct, batch_pct, done, total, index, files
+
+    def _batch_bytes_caption(self, done, total):
+        if total <= 0:
+            return tr._("All files")
+        return tr._("All files") + f"  {format_byte_count(done)} / {format_byte_count(total)}"
+
+    def _apply_batch_file_percent(self, file_percent):
+        state = self._batch_bar_state(file_percent)
+        if state is None:
+            return
+        path, file_pct, batch_pct, done, total, index, files = state
+        kind = tr._("Uploading") if self._batch_kind == "upload" else tr._("Downloading")
+        popup = self.batch_progress_popup
+        popup.file_text = f"{kind}\n{os.path.basename(path)}\n" + tr._("File %d of %d") % (index + 1, len(files))
+        popup.file_value = file_pct
+        popup.batch_text = self._batch_bytes_caption(done, total)
+        popup.batch_value = batch_pct
+
+    def _apply_batch_decompress_percent(self, index, percent):
+        """Show machine decompression without treating it as untransferred bytes.
+
+        The file has already been uploaded. A decompress percent near 0 must not
+        pull the overall bar backward. ``index`` is the file the event belongs to.
+        """
+        if getattr(self, "_batch_kind", None) != "upload":
+            return
+        if index != getattr(self, "_batch_index", None):
+            return
+        state = self._batch_bar_state(100.0)
+        if state is None:
+            return
+        self._batch_upload_settled = True
+        self._batch_settled_index = index
+        path, _file_pct, batch_pct, done, total, index, files = state
+        percent = min(100.0, max(0.0, float(percent)))
+        popup = self.batch_progress_popup
+        popup.file_text = f"{tr._('Decompressing')}\n{os.path.basename(path)}\n" + tr._("File %d of %d") % (
+            index + 1,
+            len(files),
+        )
+        popup.file_value = percent
+        popup.batch_text = self._batch_bytes_caption(done, total)
+        popup.batch_value = batch_pct
+
+    def _complete_current_batch_file(self):
+        files = getattr(self, "_batch_files", None) or []
+        index = getattr(self, "_batch_index", 0)
+        if 0 <= index < len(files):
+            self._batch_completed_bytes += files[index][1]
+            self._batch_index = index + 1
+            self._batch_upload_settled = False
+            self._batch_settled_index = None
+            if self._batch_index < len(files):
+                self._apply_batch_file_percent(0)
+            else:
+                self.batch_progress_popup.file_value = 100
+                self.batch_progress_popup.batch_value = 100
+                total = getattr(self, "_batch_total_bytes", 0)
+                self.batch_progress_popup.batch_text = self._batch_bytes_caption(total, total)
+
+    def _end_batch_progress(self, *_args):
+        self._batch_kind = None
+        self._batch_file_active = False
+        self._batch_stop = False
+        self._batch_upload_settled = False
+        self._batch_settled_index = None
+        popup = getattr(self, "batch_progress_popup", None)
+        if popup is not None and popup._is_open:
+            popup.dismiss()
+
+    def _fail_batch_transfer(self):
+        """Stop a multi-file transfer and close its popup. A single file is unchanged."""
+        if getattr(self, "_batch_kind", None) not in ("upload", "download"):
+            return
+        refresh = self._batch_kind == "upload"
+        self._pending_uploads = []
+        self._batch_upload = False
+        self._batch_file_active = False
+        self._batch_stop = True
+        Clock.schedule_once(self._end_batch_progress, 0)
+        if refresh and getattr(self, "file_popup", None) is not None:
+            Clock.schedule_once(self.file_popup.refresh_machine, 0)
+
+    def _batch_unstarted_note(self):
+        """Tell the operator that files after the failed one were not started."""
+        kind = getattr(self, "_batch_kind", None)
+        if kind not in ("upload", "download"):
+            return ""
+        files = getattr(self, "_batch_files", None) or []
+        index = getattr(self, "_batch_index", 0)
+        remaining = max(0, len(files) - int(index) - 1)
+        if remaining <= 0:
+            return ""
+        if remaining == 1:
+            if kind == "upload":
+                return "\n\n" + tr._("The remaining file was not uploaded.")
+            return "\n\n" + tr._("The remaining file was not downloaded.")
+        if kind == "upload":
+            return "\n\n" + tr._("The remaining %d files were not uploaded.") % remaining
+        return "\n\n" + tr._("The remaining %d files were not downloaded.") % remaining
+
+    def cancel_batch_transfer(self):
+        self._batch_stop = True
+        self._pending_uploads = []
+        self.cancelProcessingFile()
+        # An upload that already returned has no thread left to close the popup.
+        # An in-flight download must keep _batch_stop set until its worker notices.
+        if (
+            getattr(self, "_batch_kind", None) == "upload"
+            and not getattr(self, "uploading", False)
+            and not getattr(self, "_batch_file_active", False)
+        ):
+            self._fail_batch_transfer()
 
     # --------------------------------------------------------------`---------
     def progressFinish(self, *args):
@@ -6523,6 +7131,11 @@ class Makera(RelativeLayout):
         'start'/'progress'/'done' drive the progress popup. 'updated' means a
         silent refresh applied new times (no popup).
         """
+        if getattr(self, "_batch_kind", None):
+            if state in ("updated", "done"):
+                self.refresh_gcode_color_legend()
+                self._refresh_idle_progress_info()
+            return
         if state == "start":
             self.progressStart(tr._("Calculating run time estimate..."), None)
         elif state == "progress":
@@ -6627,6 +7240,7 @@ class Makera(RelativeLayout):
             or app.state == NOT_CONNECTED
             or (not app.selected_remote_filename and not app.selected_local_filename)
             or not self.selected_file_line_count
+            or self.comms_waiting
             or app.state in self._PROGRESS_TIMER_PAUSED_STATES
         ):
             # While held/paused/disconnected, leave the last progress_info unchanged so both timers freeze.
@@ -6635,11 +7249,22 @@ class Makera(RelativeLayout):
 
     # --------------------------------------------------------------`---------
     def updateCompressProgress(self, value):
-        Clock.schedule_once(partial(self.progressUpdate, value * 100.0 / self.fileCompressionBlocks, "", True), 0)
+        percent = value * 100.0 / self.fileCompressionBlocks
+        if getattr(self, "_batch_kind", None) == "upload":
+            # Bind the file this sample belongs to. The clock can run it after
+            # that file has finished and the next upload has started.
+            index = getattr(self, "_batch_index", 0)
+            Clock.schedule_once(
+                lambda _dt, index=index, percent=percent: self._apply_batch_decompress_percent(index, percent),
+                0,
+            )
+        else:
+            Clock.schedule_once(partial(self.progressUpdate, percent, "", True), 0)
         if value == self.fileCompressionBlocks:
-            Clock.schedule_once(self.progressFinish, 0)
-            # Refresh the remote dir since upload finished
-            Clock.schedule_once(self.file_popup.remote_rv.current_dir, 0)
+            if getattr(self, "_batch_kind", None) != "upload":
+                self._schedule_progress_finish()
+            if not getattr(self, "_batch_upload", False):
+                Clock.schedule_once(self.file_popup.refresh_machine, 0)
             self.decompstatus = False
             # Call pending callback after decompression completes (for .lz files)
             if hasattr(self, "pending_decompress_callback") and self.pending_decompress_callback:
@@ -6659,6 +7284,22 @@ class Makera(RelativeLayout):
             # The App.get_running_app() can return None in certain situations, especially during initialization or shutdown.
             if app is None:
                 return
+
+            if demo_is_active():
+                apply_demo_readout(self)
+                return
+
+            # Clear the comms-wait overlay. Machine state itself was never changed.
+            if self.comms_waiting:
+                self.comms_waiting = 0
+                if app.playing:
+                    # Remaining was parked when the overlay appeared.
+                    self._remaining_anchor_time = now
+                self.status_data_view.main_text = CNC.vars["state"]
+                CNC.vars["color"] = STATECOLOR.get(CNC.vars["state"], STATECOLORDEF)
+                self.status_data_view.color = CNC.vars["color"]
+                if CNC.vars["state"] != NOT_CONNECTED:
+                    logger.info("Machine status response received — comms restored")
 
             # First real machine state ends the post-connect heartbeat grace window.
             if CNC.vars["state"] not in (NOT_CONNECTED, CONNECTED):
@@ -6694,8 +7335,8 @@ class Makera(RelativeLayout):
                     self.config_loading = False
                     self._config_apply_failed = False
                     self._config_download_failures = 0
-                    self.fw_version_checked = False
                     self.fw_version = ""
+                    Clock.schedule_once(lambda *_: self._refresh_firmware_update_state(), 0)
                     app.model = ""
                     app.has_anchor2 = True
                     app.fw_version_digitized = 0
@@ -6704,6 +7345,18 @@ class Makera(RelativeLayout):
                     app.supports_3d_probe = False
                     CNC.probe_3d_tool = PROBE_3D_TOOL_NUMBER
                     app.supports_camera = False
+                    self.sd_videos_available = False
+                    self._sd_videos_probe_inflight = False
+                    self._sd_videos_probe_keep = None
+                    app.sd_videos_available = False
+                    CNC.vars["tl_status"] = 0
+                    CNC.vars["tl_transfer"] = 0
+                    CNC.vars["tl_requested"] = 0
+                    CNC.vars["tl_recording"] = 0
+                    CNC.vars["tl_sd_used"] = 0
+                    CNC.vars["tl_sd_total"] = 0
+                    CNC.vars["ota_phase"] = 0
+                    CNC.vars["ota_progress"] = 0
                     self.camera_checked = False
                     self.camera_host = ""
                     self.camera_probe += 1  # discard the result of a probe still in flight
@@ -6719,8 +7372,13 @@ class Makera(RelativeLayout):
                         self.unbind(light_state=self._on_light_state_changed)
                         delattr(self, "_light_toggle_bound")
 
-                    # Check if we should show reconnection popup (only if not a manual disconnect and not already reconnecting)
-                    if not self.controller._manual_disconnect and not self.reconnection_popup._is_open:
+                    # Check if we should show reconnection popup (only if not a manual disconnect and not already reconnecting).
+                    # Leaving the practice view restores N/A without a link drop.
+                    if (
+                        not getattr(self, "_suppress_reconnect_popup", False)
+                        and not self.controller._manual_disconnect
+                        and not self.reconnection_popup._is_open
+                    ):
                         auto_reconnect_enabled = Config.getboolean("carvera", "auto_reconnect_enabled", fallback=True)
                         reconnect_wait_time = Config.getint("carvera", "reconnect_wait_time", fallback=10)
                         reconnect_attempts = Config.getint("carvera", "reconnect_attempts", fallback=3)
@@ -6731,12 +7389,13 @@ class Makera(RelativeLayout):
                             self.reconnection_popup.start_countdown(
                                 reconnect_attempts,
                                 reconnect_wait_time,
-                                self.attempt_reconnect,
+                                self._auto_attempt_reconnect,
                                 self.on_reconnect_failed,
+                                in_progress=self._reconnect_in_progress,
+                                manual_callback=self.attempt_reconnect,
                             )
                             self.reconnection_popup.open()
                             Clock.schedule_interval(self.reconnection_popup.countdown_tick, 1.0)
-                            self.controller.start_reconnection()
                         else:
                             self.reconnection_popup.show_manual_reconnect(self.attempt_reconnect)
                             self.reconnection_popup.open()
@@ -6797,9 +7456,9 @@ class Makera(RelativeLayout):
                         self.bind_light_toggle_to_property()
                         self._light_toggle_bound = True
 
-            # show update
-            if not app.playing and self.fw_upd_text != "" and not self.fw_version_checked and app.state == "Idle":
-                self.check_fw_version()
+            # Recompute firmware update availability once the machine version is known.
+            if self._update_snapshot is not None:
+                self._refresh_firmware_update_state()
 
             # check alarm and sleep status
             if app.state == "Alarm" or app.state == "Sleep":
@@ -6931,6 +7590,7 @@ class Makera(RelativeLayout):
                     "autobedclean_switch_play",
                 ),
                 ("ionizer_mode", self.controller.setIonizerMode, "ionizermode", "ionizer_switch_play"),
+                ("timelapse_record", self.controller.setTimelapseRecord, "tl_requested", "timelapse_switch_play"),
             ):
                 elapsed = now - self.control_list[control_name][0]
                 if elapsed < 2:
@@ -7007,17 +7667,20 @@ class Makera(RelativeLayout):
             coord_system_index = CNC.vars["active_coord_system"]
             coord_system_name = self.wcs_names[coord_system_index]
             rotation_angle = CNC.vars["rotation_angle"]
+            has_rotation = abs(rotation_angle) > 0.01
             desc_key = coord_system_name.lower().replace(".", "_") + "_description"
             try:
                 wcs_description = Config.get("carvera", desc_key).strip()
             except Exception:
                 wcs_description = ""
-            if wcs_description:
-                self.coord_system_data_view.main_text = wcs_description
+            description_is_name = not wcs_description or wcs_description == coord_system_name
+            self.coord_system_data_view.main_text = wcs_description if not description_is_name else coord_system_name
+            rotation_text = f"{rotation_angle:.3f}°"
+            if description_is_name or has_rotation and self.status_index % 2 == 1:
+                self.coord_system_data_view.minr_text = rotation_text
             else:
-                self.coord_system_data_view.main_text = coord_system_name
-            self.coord_system_data_view.minr_text = coord_system_name
-            self.coord_system_data_view.scale = 80.0 if abs(rotation_angle) > 0.01 else 100.0
+                self.coord_system_data_view.minr_text = coord_system_name
+            self.coord_system_data_view.scale = 80.0 if has_rotation else 100.0
 
             if self.gcode_viewer is not None and self.gcode_viewer.bed_visible:
                 self.gcode_viewer.update_bed_wcs()
@@ -7148,8 +7811,35 @@ class Makera(RelativeLayout):
                 elif self.wpb_leveling.value > 0:
                     self.wpb_leveling.value = 84
 
+            self._refresh_timelapse_indicator(app)
+
         except:
             logger.error(sys.exc_info()[1])
+
+    def _refresh_timelapse_indicator(self, app):
+        """Red recording mark while the firmware reports that it is recording."""
+        has_status = bool(CNC.vars.get("tl_status")) and app.state not in (NOT_CONNECTED, "N/A")
+        requested = int(CNC.vars.get("tl_requested") or 0)
+        recording = int(CNC.vars.get("tl_recording") or 0)
+        active = has_status and timelapse_is_recording(recording)
+        if app.timelapse_recording != active:
+            app.timelapse_recording = active
+        if app.timelapse_status != has_status:
+            app.timelapse_status = has_status
+        if not has_status:
+            if app.timelapse_status_text:
+                app.timelapse_status_text = ""
+            return
+        text = format_timelapse_status(
+            transfer=int(CNC.vars.get("tl_transfer") or 0),
+            requested=requested,
+            recording=recording,
+            sd_used=int(CNC.vars.get("tl_sd_used") or 0),
+            sd_total=int(CNC.vars.get("tl_sd_total") or 0),
+            translate=tr._,
+        )
+        if app.timelapse_status_text != text:
+            app.timelapse_status_text = text
 
     # -----------------------------------------------------------------------
     def updateDiagnose(self, *args):
@@ -7303,9 +7993,8 @@ class Makera(RelativeLayout):
             if self.laser_drop_down.opened:
                 self.laser_drop_down.dismiss()
                 self.laser_drop_down.opened = False
-            # Keep ToolDropDown laser switch in sync so it shows off when disabled from LaserDropDown
-            self.tool_drop_down.ids.switch.set_flag = True
-            self.tool_drop_down.ids.switch.active = False
+            # Keep the Tool dropdown switch off when laser mode is disabled from the Laser dropdown.
+            self._set_switch_off_silently(self.tool_drop_down.ids.switch)
 
     def moveLineIndex(self, up=True):
         if up:
@@ -7371,6 +8060,8 @@ class Makera(RelativeLayout):
     # -----------------------------------------------------------------------
     def openUSB(self, device):
         # Serial open + DTR reset sleeps (~1s) + protocol probe must not run on the UI thread.
+        if demo_is_active():
+            return
         if getattr(self, "_usb_connect_in_progress", False):
             return
         self._usb_connect_in_progress = True
@@ -7446,6 +8137,8 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def openWIFI(self, address):
+        if demo_is_active():
+            return
         try:
             if self.controller.open(CONN_WIFI, address):
                 self.controller.connection_type = CONN_WIFI
@@ -7669,42 +8362,51 @@ class Makera(RelativeLayout):
         return True
 
     # -----------------------------------------------------------------------
+    def can_toggle_jog_mode(self):
+        app = App.get_running_app()
+        return bool(app.is_community_firmware and app.fw_version_digitized >= Utils.digitize_v("2.0.0"))
+
     def toggle_jog_mode(self):
+        if not self.can_toggle_jog_mode():
+            return False
         if self.controller.jog_mode == Controller.JOG_MODE_STEP:
             self.update_ui_for_jog_mode_cont()
-
         elif self.controller.jog_mode == Controller.JOG_MODE_CONTINUOUS:
             self.update_ui_for_jog_mode_step()
+        return True
 
     def update_ui_for_jog_mode_step(self):
         self.controller.setJogMode(Controller.JOG_MODE_STEP)
         self.ids.jog_mode_btn.text = tr._("Jog Mode:Step")
         App.get_running_app().jog_mode_text = tr._("Jog Mode:Step")
-        self.ids.step_xy.disabled = False
-        self.ids.step_a.disabled = False
-        self.ids.step_z.disabled = False
-        self.probing_popup.ids.step_xy.disabled = False
-        self.probing_popup.ids.step_a.disabled = False
-        self.probing_popup.ids.step_z.disabled = False
+        self._set_jog_step_inputs_disabled(False)
         self.update_pendant_jog_text()
 
     def update_ui_for_jog_mode_cont(self):
         self.controller.setJogMode(Controller.JOG_MODE_CONTINUOUS)
         self.ids.jog_mode_btn.text = tr._("Jog Mode:Continuous")
         App.get_running_app().jog_mode_text = tr._("Jog Mode:Continuous")
-        self.ids.step_xy.disabled = True
-        self.ids.step_a.disabled = True
-        self.ids.step_z.disabled = True
-        self.probing_popup.ids.step_xy.disabled = True
-        self.probing_popup.ids.step_a.disabled = True
-        self.probing_popup.ids.step_z.disabled = True
+        self._set_jog_step_inputs_disabled(True)
         self.update_pendant_jog_text()
 
+    def _set_jog_step_inputs_disabled(self, disabled: bool) -> None:
+        # Main window and probing popup
+        for ids_map in (self.ids, self.probing_popup.ids):
+            for name in ("step_xy", "step_a", "step_z"):
+                if name in ids_map:
+                    ids_map[name].disabled = disabled
+        # CMM workbench popup
+        cmm = getattr(self, "cmm_workbench_popup", None)
+        jog = getattr(cmm, "_jog_popup", None) if cmm is not None else None
+        if jog is not None and hasattr(jog, "set_step_widgets_disabled"):
+            jog.set_step_widgets_disabled(disabled)
+
     def _popup_prevents_jogging(self):
-        modals = [self.probing_popup]
-        if self.cmm_workbench_popup is not None:
-            modals.append(self.cmm_workbench_popup)
-        return self._is_popup_open() and not any(m.allows_external_jog() for m in modals)
+        for popup in self._open_popups():
+            if hasattr(popup, "allows_external_jog") and popup.allows_external_jog():
+                continue
+            return True
+        return False
 
     def _bind_jog_control_deps(self):
         app = App.get_running_app()
@@ -7720,7 +8422,12 @@ class Makera(RelativeLayout):
         app = App.get_running_app()
         if app is None:
             return
-        app.jog_controls_enabled = self._machine_allows_jogging()
+        jogging_allowed = self._machine_allows_jogging()
+        app.jog_controls_enabled = jogging_allowed
+        if not jogging_allowed:
+            shortcut_manager = getattr(self, "shortcut_manager", None)
+            if shortcut_manager is not None:
+                shortcut_manager.release_all_jogs()
 
     def _machine_allows_jogging(self):
         app = App.get_running_app()
@@ -7757,16 +8464,20 @@ class Makera(RelativeLayout):
 
     def toggle_keyboard_jog_control(self, disable=False):
         app = App.get_running_app()
+        if not disable and not app.jog_controls_enabled:
+            return False
         app.root.keyboard_jog_control = not app.root.keyboard_jog_control  # toggle the boolean
         if disable:
             app.root.keyboard_jog_control = False
 
         if app.root.keyboard_jog_control:
-            Window.bind(on_key_down=self._keyboard_jog_keydown, on_key_up=self._keyboard_jog_keyup)
             app.jog_keyboard_enable = "down"
         else:
-            Window.unbind(on_key_down=self._keyboard_jog_keydown, on_key_up=self._keyboard_jog_keyup)
+            shortcut_manager = getattr(self, "shortcut_manager", None)
+            if shortcut_manager is not None:
+                shortcut_manager.release_all_jogs()
             app.jog_keyboard_enable = "normal"
+        return True
 
     def toggle_pendant_jog_control(self):
         app = App.get_running_app()
@@ -7895,28 +8606,14 @@ class Makera(RelativeLayout):
         elif button_action == "step_size_changed":
             self.update_pendant_jog_text()
 
-    def _is_popup_open(self):
-        """Checks to see if any of the popups objects are open."""
-        popups_to_check = [
-            self.file_popup._is_open,
-            self.coord_popup._is_open,
-            self.xyz_probe_popup._is_open,
-            self.pairing_popup._is_open,
-            self.upgrade_popup._is_open,
-            self.language_popup._is_open,
-            self.diagnose_popup._is_open,
-            self.confirm_popup._is_open,
-            self.unlock_popup._is_open,
-            self.message_popup._is_open,
-            self.progress_popup._is_open,
-            self.input_popup._is_open,
-            self.config_popup._is_open,
-            self.probing_popup._is_open,
-            (self.cmm_workbench_popup._is_open if self.cmm_workbench_popup is not None else False),
-            self.facing_popup._is_open,
+    def _open_popups(self):
+        return [
+            child for child in Window.children if isinstance(child, ModalView) and getattr(child, "_is_open", False)
         ]
 
-        return any(popups_to_check)
+    def _is_popup_open(self):
+        """Return whether any application modal is currently open."""
+        return bool(self._open_popups())
 
     def bind_light_toggle_to_property(self):
         """Bind the light toggle button state to the LightProperty"""
@@ -7938,60 +8635,20 @@ class Makera(RelativeLayout):
             property_obj.update_from_state(self)
             logger.debug("Light state manually refreshed from CNC.vars")
 
-    def _global_keyboard_keydown(self, window, key, scancode, codepoint, modifiers):
-        COMMA_KEY = 44
-        M_KEY = 109
-        cmd_mod = "meta" if sys.platform == "darwin" else "ctrl"
-
-        # Cmd+Comma (macOS) or Ctrl+Comma (Windows/Linux) to open settings
-        if key == COMMA_KEY and cmd_mod in modifiers:
-            if not self._is_popup_open() and not self.manual_cmd.focus:
-                self.config_popup.open()
-                return True
-
-        # Ctrl+M to open manual command (MDI) page
-        if key == M_KEY and "ctrl" in modifiers:
-            self.content.transition.direction = "right"
-            self.content.current = "File"
-            self.cmd_manager.transition.direction = "left"
-            self.cmd_manager.current = "manual_cmd_page"
-            self.manual_cmd.focus = True
-
-        return False
-
-    def _keyboard_jog_keydown(self, *args):
-        app = App.get_running_app()
-
-        # Only allow keyboard jogging when machine in a suitable state and has no popups open
-        if self.is_jogging_enabled() and not self.manual_cmd.focus:
-            key = args[1]  # keycode
-
-            if app.root.controller.jog_mode == Controller.JOG_MODE_STEP:
-                if key in self._held_jog_keys:
-                    # Ignore - only move once per keypress in step mode
-                    return
-                if key in (273, 274, 275, 276, 280, 281):
-                    self._held_jog_keys.add(key)
-
-            if key == 274:  # down button
-                app.root.controller.jog(f"Y{'-' if app.invert_y_axis_jogging else ''}{app.root.step_xy.text}")
-            elif key == 273:  # up button
-                app.root.controller.jog(f"Y{'' if app.invert_y_axis_jogging else '-'}{app.root.step_xy.text}")
-            elif key == 275:  # right button
-                app.root.controller.jog(f"X{app.root.step_xy.text}")
-            elif key == 276:  # left button
-                app.root.controller.jog(f"X-{app.root.step_xy.text}")
-            elif key == 280:  # page up
-                app.root.controller.jog(f"Z{app.root.step_z.text}")
-            elif key == 281:  # page down
-                app.root.controller.jog(f"Z-{app.root.step_z.text}")
-
-    def _keyboard_jog_keyup(self, *args):
-        app = App.get_running_app()
-        key = args[1]  # keycode
-        if key in (273, 274, 275, 276, 280, 281):  # only if a jog button is released
-            self._held_jog_keys.discard(key)
-            app.root.controller.stopContinuousJog()
+    def perform_keyboard_jog(self, action_id):
+        commands = {
+            "jog_x_positive": f"X{self.step_xy.text}",
+            "jog_x_negative": f"X-{self.step_xy.text}",
+            "jog_y_positive": f"Y{self.step_xy.text}",
+            "jog_y_negative": f"Y-{self.step_xy.text}",
+            "jog_z_positive": f"Z{self.step_z.text}",
+            "jog_z_negative": f"Z-{self.step_z.text}",
+            "jog_a_positive": f"A{self.step_a.text}",
+            "jog_a_negative": f"A-{self.step_a.text}",
+        }
+        command = commands.get(action_id)
+        if command is not None:
+            self.controller.jog(command)
 
     def apply_setting_changes(self):
         if self.setting_change_list:
@@ -8015,13 +8672,13 @@ class Makera(RelativeLayout):
             self.message_popup.lb_content.text = tr._("UI Density changed, restart application to apply.")
             self.message_popup.open()
 
-        if (
-            self.controller_setting_change_list.get("allow_mdi_while_machine_running")
-            != self.allow_mdi_while_machine_running
-        ):
-            self.allow_mdi_while_machine_running = self.controller_setting_change_list.get(
+        if "mdi_auto_correct_case" in self.controller_setting_change_list:
+            self.mdi_auto_correct_case = self.controller_setting_change_list["mdi_auto_correct_case"] == "1"
+
+        if "allow_mdi_while_machine_running" in self.controller_setting_change_list:
+            self.allow_mdi_while_machine_running = self.controller_setting_change_list[
                 "allow_mdi_while_machine_running"
-            )
+            ]
 
         if "allow_jogging_while_machine_running" in self.controller_setting_change_list:
             self.allow_jogging_while_machine_running = self.controller_setting_change_list[
@@ -8037,7 +8694,10 @@ class Makera(RelativeLayout):
         ):
             self.update_jog_controls_enabled()
 
-        if self.controller_setting_change_list.get("invert_y_axis_jogging"):
+        if "keyboard_shortcuts" in self.controller_setting_change_list:
+            self.shortcut_manager.reload_from_config()
+
+        if "invert_y_axis_jogging" in self.controller_setting_change_list:
             App.get_running_app().invert_y_axis_jogging = (
                 self.controller_setting_change_list.get("invert_y_axis_jogging") == "1"
             )
@@ -8150,6 +8810,25 @@ class Makera(RelativeLayout):
     def enter_laser_mode(self):
         self.controller.setLaserMode(True)
 
+    def cancel_laser_mode_entry(self):
+        """Turn laser switches back off when the user declines the confirm dialog."""
+        self._set_switch_off_silently(self.tool_drop_down.ids.switch)
+        self._set_switch_off_silently(self.laser_drop_down.switch)
+        sw_laser = self.diagnose_popup.sw_laser
+        self._set_switch_off_silently(sw_laser.switch, sw_laser)
+
+    def _set_switch_off_silently(self, switch, flag_holder=None):
+        """Turn a switch off without sending its command.
+
+        Skip the assignment when it is already off. Setting active to the same value does not
+        run on_active, so set_flag would stay set and swallow the next On.
+        """
+        if not switch.active:
+            return
+        holder = switch if flag_holder is None else flag_holder
+        holder.set_flag = True
+        switch.active = False
+
     # -----------------------------------------------------------------------
     def open_setting_default_confirm_popup(self):
         self.confirm_popup.lb_title.text = tr._("Save As Default")
@@ -8167,7 +8846,7 @@ class Makera(RelativeLayout):
             "You are about to enable laser mode. \n\nWhen enabled the current tool will be dropped, the spindle fan locked to 90%, \nand the empty spindle nose will be set as the tool and length probed.\n\n It's recommended to remove the laser dust cap, and put on safety glasses now.\n\nAre you ready to proceed ?"
         )
         self.confirm_popup.confirm = partial(self.enter_laser_mode)
-        self.confirm_popup.cancel = None
+        self.confirm_popup.cancel = self.cancel_laser_mode_entry
         self.confirm_popup.open(self)
 
     # -----------------------------------------------------------------------
@@ -8290,10 +8969,25 @@ class Makera(RelativeLayout):
             slider.sim_checkpoints = list(value or [])
 
     def _on_viewer_sim_hud_text(self, _instance, value):
-        """Mirror cut-simulation stats onto the viewer overlay label."""
-        label = getattr(self, "sim_stats_hud", None)
-        if label is not None:
-            label.text = value or ""
+        """Mirror cut-simulation stats onto the viewer overlay."""
+        hud = getattr(self, "sim_stats_hud", None)
+        if hud is not None:
+            hud.stats_text = value or ""
+
+    def _on_viewer_sim_hud_visible(self, _instance, visible):
+        hud = getattr(self, "sim_stats_hud", None)
+        if hud is not None:
+            hud.hud_visible = bool(visible)
+
+    def _on_viewer_sim_carving(self, _instance, carving):
+        hud = getattr(self, "sim_stats_hud", None)
+        if hud is not None:
+            hud.carving = bool(carving)
+
+    def _on_viewer_sim_mesh_visible(self, _instance, visible):
+        hud = getattr(self, "sim_stats_hud", None)
+        if hud is not None:
+            hud.mesh_visible = bool(visible)
 
     def _on_viewer_stock_visible(self, _instance, visible):
         """Keep the Stock menu item highlight in sync with viewer visibility."""
@@ -8331,8 +9025,15 @@ class Makera(RelativeLayout):
         self.gcode_viewer.dynamic_display = False
 
     # -----------------------------------------------------------------------
+    def _set_preview_slider_to_end(self) -> None:
+        """Park the preview timeline knob at the end of the loaded path."""
+        slider = getattr(self, "gcode_play_slider", None)
+        if slider is not None:
+            slider.value = slider.max
+
     def gcode_play_to_end(self):
         self.gcode_viewer.show_all()
+        self._set_preview_slider_to_end()
         self.gcode_playing = False
         self.gcode_viewer.dynamic_display = False
 
@@ -8454,22 +9155,37 @@ class Makera(RelativeLayout):
 
     # -----------------------------------------------------------------------
     def _set_camera_streaming(self, streaming):
+        """Collapse the panel when the camera session actually ends.
+
+        A dropped socket stays streaming and reports reconnecting instead, so a
+        blip does not come through here.
+        """
         App.get_running_app().camera_streaming = streaming
         splitter = self.ids.get("camera_splitter")
         if splitter is not None and not streaming and not splitter.collapsed:
             splitter.collapse()
 
     # -----------------------------------------------------------------------
+    def _set_camera_reconnecting(self, reconnecting):
+        App.get_running_app().camera_reconnecting = reconnecting
+
+    # -----------------------------------------------------------------------
     def clear_selection(self):
         self.gcode_rv.data = []
         self.gcode_rv.data_length = 0
         self.gcode_viewer.clearDisplay()
+        self.gcode_viewer.begin_new_file_load()
+        self.gcode_playing = False
+        self.gcode_cannot_visualise = False
         self.wpb_play.value = 0
         self.used_tools = []
         self.upcoming_tool = 0
         self.tool_table = {}
         self.cam_metadata = CamMetadata.empty()
         self.document_unit = "mm"
+        self.file_has_ocodes = False
+        self.lines = []
+        self.selected_file_line_count = 0
         self.gcode_viewer.tool_table = {}
         self.gcode_viewer.tool_unit_scale = 1.0
         self.init_path_visibility()
@@ -8507,7 +9223,6 @@ class Makera(RelativeLayout):
     def load_start(self, *args):
         self.loading_file = True
         self._clear_play_bar_tool_markers()
-        self.cmd_manager.transition.direction = "right"
         self.cmd_manager.current = "gcode_cmd_page"
         self.gcode_rv.data = []
         self.init_path_visibility()
@@ -8599,13 +9314,18 @@ class Makera(RelativeLayout):
         self.message_popup.open(self)
 
     # ------------------------------------------------------------------------
+    def _tour_holds_file_browser(self) -> bool:
+        tutorial = getattr(self, "tutorial", None)
+        return bool(tutorial is not None and getattr(tutorial, "_files_open", False))
+
     def load_end(self, *args):
         if self.load_canceled:
             self.gcode_viewer.load_array([], True)
             self.gcode_cannot_visualise = False
             self.clear_selection()
             self.load_canceled = False
-            self.file_popup.dismiss()
+            if not self._tour_holds_file_browser():
+                self.file_popup.dismiss()
             self.progress_popup.dismiss()
             self.updateStatus()
             self.loading_file = False
@@ -8615,6 +9335,7 @@ class Makera(RelativeLayout):
             self.gcode_cannot_visualise = False
             self.gcode_viewer_distance = self.gcode_viewer.get_total_distance()
             self.gcode_viewer.show_all()
+            self._set_preview_slider_to_end()
 
         self._push_path_visibility()
         self.refresh_gcode_color_legend()
@@ -8649,15 +9370,25 @@ class Makera(RelativeLayout):
             popup.rotary_mode = bool(app.has_4axis)
             popup.has_off_axis_y = bool(app.has_off_axis_y)
         metadata = getattr(self, "cam_metadata", None) or CamMetadata.empty()
+        show_stock = self._should_auto_show_header_stock(metadata.stock)
+        simulation_available = bool(self.gcode_viewer is not None and self.gcode_viewer.simulation_available())
         self._reset_stock_settings(
             shape=shape,
             origin=origin,
-            show_stock=self._should_auto_show_header_stock(metadata.stock),
+            show_stock=show_stock,
+            simulate_cut=should_auto_simulate_cut(
+                show_stock,
+                self._auto_simulate_cut_preference(),
+                simulation_available,
+            ),
         )
         self.apply_bed_settings()
         self.coord_popup.load_config()
 
-        self.file_popup.dismiss()
+        # A finished preview normally closes the browser. The tour keeps it open
+        # so the file-browser steps can point at the tabs and actions.
+        if not self._tour_holds_file_browser():
+            self.file_popup.dismiss()
         if not getattr(self.gcode_viewer, "line_times_job_show_progress", False):
             self.progress_popup.dismiss()
 
@@ -9003,6 +9734,7 @@ class Makera(RelativeLayout):
         to_send = self.manual_cmd.text.strip()
         if to_send:
             self.manual_cmd.last_mdi_command = to_send
+            self.manual_cmd.record_sent_command(to_send)
             self.manual_rv.scroll_y = 0
             if to_send.lower() == "clear":
                 self.manual_rv.data = []
@@ -9017,6 +9749,8 @@ class Makera(RelativeLayout):
                             }
                         )
                     )
+                if self.mdi_auto_correct_case:
+                    sanitized_to_send = "\n".join(correct_command_case(line) for line in sanitized_to_send.split("\n"))
                 self.controller.executeCommand(sanitized_to_send)
         self.manual_cmd.text = ""
         hide_mdi_intellisense()
@@ -9060,6 +9794,11 @@ class MakeraApp(App):
     is_community_firmware = BooleanProperty(False)
     supports_camera = BooleanProperty(False)
     camera_streaming = BooleanProperty(False)
+    camera_reconnecting = BooleanProperty(False)
+    sd_videos_available = BooleanProperty(False)
+    timelapse_recording = BooleanProperty(False)
+    timelapse_status = BooleanProperty(False)
+    timelapse_status_text = StringProperty("")
     camera_brightness = NumericProperty(ADJUST_DEFAULT)
     camera_contrast = NumericProperty(ADJUST_DEFAULT)
     camera_gamma = NumericProperty(ADJUST_DEFAULT)
@@ -9091,6 +9830,8 @@ class MakeraApp(App):
         # Cancel any ongoing reconnection attempts to prevent hanging
         if hasattr(self.root, "controller") and self.root.controller:
             self.root.controller.cancel_reconnection()
+        if hasattr(self.root, "shortcut_manager"):
+            self.root.shortcut_manager.uninstall()
         # Stop all scheduled Clock events
         if hasattr(self.root, "blink_state"):
             Clock.unschedule(self.root.blink_state)
@@ -9146,6 +9887,8 @@ class MakeraApp(App):
             print(f"safe area query skipped: {e}")
 
     def on_pause(self):
+        if hasattr(self.root, "shortcut_manager"):
+            self.root.shortcut_manager.on_window_inactive()
         return True
 
 
@@ -9162,7 +9905,10 @@ def load_app_configs():
 
 
 def set_config_defaults(default_lang):
-    if not Config.has_section("carvera"):
+    # A missing section is a new install. An existing section without the key
+    # is an upgrade, and those users already know the workflow.
+    new_install = not Config.has_section("carvera")
+    if new_install:
         Config.add_section("carvera")
 
     if not Config.has_section("input"):
@@ -9195,6 +9941,9 @@ def set_config_defaults(default_lang):
     # Configurable config options. Don't change if they are already set
     if not Config.has_option("carvera", "show_update"):
         Config.set("carvera", "show_update", "1")
+    # No default for CONFIG_INCLUDE_PRERELEASES — the popup infers a
+    # sensible default from the running controller/firmware versions and
+    # writes the key only when the user explicitly toggles the checkbox.
     if not Config.has_option("carvera", "show_firmware_check"):
         Config.set("carvera", "show_firmware_check", "1")
     if not Config.has_option("carvera", "show_tooltips"):
@@ -9253,6 +10002,8 @@ def set_config_defaults(default_lang):
         Config.set("carvera", "usb_serial", "")
     if not Config.has_option("carvera", "last_connection_method"):
         Config.set("carvera", "last_connection_method", "")
+    if not Config.has_option("carvera", "file_browser_location"):
+        Config.set("carvera", "file_browser_location", "")
     # Migrate legacy VID:PID:SERIAL stored in usb_device_id.
     legacy_id = Config.get("carvera", "usb_device_id", fallback="") or ""
     vid_pid, legacy_serial = Utils.parse_usb_device_id(legacy_id)
@@ -9275,11 +10026,17 @@ def set_config_defaults(default_lang):
     if not Config.has_option("carvera", "show_playbar_tool_change_markers"):
         Config.set("carvera", "show_playbar_tool_change_markers", "1")
     if not Config.has_option("carvera", "auto_lights_on_connect"):
-        Config.set("carvera", "auto_lights_on_connect", "1")
+        Config.set("carvera", "auto_lights_on_connect", "0")
+    if not Config.has_option("carvera", "tutorial_completed"):
+        Config.set("carvera", "tutorial_completed", "0" if new_install else "1")
 
     # G-code viewer defaults
     if not Config.has_option("carvera", "gcode_auto_show_stock"):
         Config.set("carvera", "gcode_auto_show_stock", "1")
+    if not Config.has_option("carvera", "gcode_auto_simulate_cut"):
+        Config.set("carvera", "gcode_auto_simulate_cut", "0")
+    if not Config.has_option("carvera", "gcode_viewer_ghost_paths"):
+        Config.set("carvera", "gcode_viewer_ghost_paths", "0")
     if not Config.has_option("carvera", "gcode_highlight_enabled"):
         Config.set("carvera", "gcode_highlight_enabled", "1")
     if not Config.has_option("carvera", "gcode_color_comment"):
@@ -9330,19 +10087,11 @@ def load_constants():
     global BLOCK_SIZE
     global BLOCK_HEADER_SIZE
 
-    global FW_UPD_ADDRESS
-    global CTL_UPD_ADDRESS
-    global DOWNLOAD_ADDRESS
-    global FW_DOWNLOAD_ADDRESS
-
-    FW_UPD_ADDRESS = "https://raw.githubusercontent.com/carvera-community/carvera_community_firmware/master/version.txt"
-    CTL_UPD_ADDRESS = "https://raw.githubusercontent.com/carvera-community/carvera_controller/main/CHANGELOG.md"
-    DOWNLOAD_ADDRESS = "https://github.com/carvera-community/carvera_controller/releases/latest"
-    FW_DOWNLOAD_ADDRESS = "https://github.com/Carvera-Community/Carvera_Community_Firmware/releases/latest"
-
     SHORT_LOAD_TIMEOUT = 3  # s
     WIFI_LOAD_TIMEOUT = 30  # s
-    HEARTBEAT_TIMEOUT = 5
+    # Several status polls (STREAM_POLL is 0.2s). blink_state samples every
+    # 0.5s, so one late reply must not flip the status label.
+    HEARTBEAT_TIMEOUT = 1.5
     MAX_TOUCH_INTERVAL = 0.15
     GCODE_VIEW_SPEED = 1
 

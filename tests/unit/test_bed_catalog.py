@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from carveracontroller.addons.beds.catalog import (
     CUSTOM_CATALOG_ID,
     all_plates,
@@ -39,6 +41,17 @@ def test_plate_by_id_and_catalog_size():
     assert plate_by_id("missing") is None
     assert plate_by_id(CUSTOM_CATALOG_ID) is None
     assert plate_by_id("C1_MDF").mesh_name == "C1_MDF.obj"
+
+
+def test_only_z1_smw_plates_define_an_origin_offset():
+    z1_smw = {"Z1_SMW_Metric", "Z1_SMW_Inches"}
+    for plate in all_plates():
+        if plate.id in z1_smw:
+            assert plate.offset_x_mm == pytest.approx(-0.33 * 25.4)
+            assert plate.offset_y_mm is None
+        else:
+            assert plate.offset_x_mm is None
+            assert plate.offset_y_mm is None
 
 
 def test_catalog_mesh_files_exist():

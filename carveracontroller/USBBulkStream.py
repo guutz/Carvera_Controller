@@ -20,6 +20,7 @@ import platform
 import time
 from urllib.parse import quote, unquote
 
+from .documentation import resolve_documentation_url
 from .XMODEM import XMODEM
 
 logger = logging.getLogger(__name__)
@@ -151,13 +152,13 @@ def _hint_for_open_failure(exc):
             "The Z1 USB device was found but could not be opened due to\n"
             "insufficient permissions on the USB device.\n\n"
             "See the documentation on how to fix these permissions on Linux:\n"
-            f"{Z1_USB_DOCS_URL}#linux"
+            f"{resolve_documentation_url(Z1_USB_DOCS_URL)}#linux"
         )
     if system == "Windows":
         return (
             "The Z1 USB device was found but could not be opened.\n\n"
             "See the documentation on how to install the WinUSB driver on Windows:\n"
-            f"{Z1_USB_DOCS_URL}#windows"
+            f"{resolve_documentation_url(Z1_USB_DOCS_URL)}#windows"
         )
     return message
 
@@ -374,6 +375,32 @@ class USBBulkStream:
             return True
         self._pump(timeout_ms=1)
         return bool(self._rx_buf)
+
+    def is_link_up(self):
+        """Return True while the bulk device is still claimed.
+
+        A short read timeout means the link is idle, not dead. Bytes read by
+        the probe stay in the receive buffer. ``OSError`` (including pyusb
+        ``USBError``) means the device is gone. Other errors propagate so a
+        bug in the probe is not reported as a dead cable.
+        """
+        if self.dev is None or self.ep_in is None or self._stop:
+            return False
+        try:
+            data = self.dev.read(
+                self.ep_in.bEndpointAddress,
+                int(getattr(self.ep_in, "wMaxPacketSize", 0) or DEFAULT_MAX_PACKET),
+                timeout=1,
+            )
+        except Exception as exc:
+            if _is_timeout_error(exc):
+                return True
+            if isinstance(exc, OSError):
+                return False
+            raise
+        if data:
+            self._rx_buf.extend(bytes(data))
+        return True
 
     def reset_input_buffer(self):
         self._rx_buf.clear()

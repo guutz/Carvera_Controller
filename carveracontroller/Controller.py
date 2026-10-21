@@ -21,6 +21,7 @@ from functools import partial
 from . import Utils
 from .CNC import CMDPAT, CNC, LASER_TOOL_NUMBER, PARENPAT, SEMIPAT, ZPROBE_TOOL_NUMBER
 from .protocols import MessageKind, ProtocolSession
+from .ui.tutorial.session import blocks_machine_io, demo_is_active
 from .USBBulkStream import USBBulkStream, is_usb_bulk_address
 from .USBStream import USBStream
 from .WIFIStream import WIFIStream
@@ -50,6 +51,10 @@ STREAM_POLL_MIN = 0.05  # s (20 Hz)
 STREAM_POLL_MAX = 1.0  # s (1 Hz)
 
 DIAGNOSE_POLL = 0.5  # s
+# If firmware never acks a Ctrl+Y with ^Y, allow a new $J -c after this.
+CONTINUOUS_JOG_STOP_TIMEOUT = 2.0  # s
+# Probe an idle transport on this cadence. A tight send loop must not ioctl every spin.
+LINK_CHECK_INTERVAL = 0.5  # s
 RX_BUFFER_SIZE = 128
 
 GPAT = re.compile(r"[A-Za-z]\s*[-+]?\d+.*")
@@ -93,14 +98,6 @@ LOAD_WIFI = 7
 LOAD_CONN_WIFI = 8
 
 SEND_FILE = 1
-
-
-def session_light_commands(turn_on, is_community_firmware):
-    """G-code to apply for a connect (on) or disconnect (off) light change."""
-    commands = ["M821" if turn_on else "M822"]
-    if is_community_firmware:
-        commands.append("M337 B104" if turn_on else "M337 B0 U0 R0")
-    return commands
 
 
 CONN_USB = 0
@@ -218,9 +215,10 @@ class Controller:
         self.jog_mode = Controller.JOG_MODE_STEP
         self.jog_speed = 10000  # mm/min. A value of 0 here would suggest to use last used feed
         self.continuous_jog_active = False
-        # True after Ctrl+Y until firmware acks (^Y) — suppresses keepalives without
-        # allowing a new $J -c to start before the previous jog has stopped.
-        self._continuous_jog_stopping = False
+        # Set on Ctrl+Y until firmware acks (^Y). Suppresses keepalives and
+        # blocks a new $J -c until the previous jog has stopped, or the stop
+        # request is older than CONTINUOUS_JOG_STOP_TIMEOUT.
+        self._continuous_jog_stop_requested_at = 0.0
 
     @property
     def protocol_ready(self):
@@ -266,6 +264,8 @@ class Controller:
     def executeCommand(self, line):
         # if self.sio_status != False or self.sio_diagnose != False:      #wait for the ? or * command
         #    time.sleep(0.5)
+        if blocks_machine_io(self.stream):
+            return
         if self.stream and line:
             try:
                 if isinstance(line, str) and not line.endswith("\n"):
@@ -299,6 +299,8 @@ class Controller:
 
     def executeRealtime(self, char):
         """Send a single-byte realtime control through the active protocol."""
+        if blocks_machine_io(self.stream):
+            return
         self.executeRealtimeSequence(char)
 
     def executeRealtimeSequence(self, *chars):
@@ -308,6 +310,8 @@ class Controller:
         ``1`` as separate writes races with other commands and leaves orphaned
         ``1`` bytes in the firmware command buffer (seen as ``111…$J …``).
         """
+        if blocks_machine_io(self.stream):
+            return
         if not self.stream or not chars:
             return
         try:
@@ -454,6 +458,13 @@ class Controller:
     #     if buffer:
     #         cmd = "buffer " + cmd
     #     self.executeCommand(cmd)
+
+    def liftToClearance(self, buffer=False):
+        # only Z to coordinate.clearance_z (machine coordinates); XY stays where it is
+        cmd = "G90 G53 G0 Z%g\n" % CNC.vars["clearance_z"]
+        if buffer:
+            cmd = "buffer " + cmd
+        self.executeCommand(cmd)
 
     def gotoClearance(self, buffer=False):
         cmd = "M496.1\n"
@@ -603,12 +614,12 @@ class Controller:
         try:
             from kivy.config import Config
 
-            return Config.getboolean("carvera", "auto_lights_on_connect", fallback=True)
+            return Config.getboolean("carvera", "auto_lights_on_connect", fallback=False)
         except Exception:
             return False
 
     def apply_session_lights(self, turn_on, *, enabled=None):
-        """Turn enclosure/LED lights on at connect or off before disconnect."""
+        """Turn enclosure light on at connect or off before disconnect."""
         if turn_on and self._session_lights_applied:
             return
         if enabled is None:
@@ -620,8 +631,7 @@ class Controller:
             return
         if self.stream is None:
             return
-        for command in session_light_commands(turn_on, self.is_community_firmware):
-            self.executeCommand(command + "\n")
+        self.setLightSwitch(turn_on)
         self._session_lights_applied = turn_on
 
     def setExternalControl(self, pwm=100):
@@ -680,6 +690,14 @@ class Controller:
             self.executeCommand("M331.4\n")
         else:
             self.executeCommand("M332.4\n")
+
+    def setTimelapseRecord(self, mode):
+        """Enable or disable auto timelapse recording on the Z1. Capture starts once the machine is running."""
+        CNC.vars["tl_requested"] = 1 if mode else 0
+        if mode:
+            self.executeCommand("M951\n")
+        else:
+            self.executeCommand("M952\n")
 
     def setLaserMode(self, mode):
         if mode:
@@ -1661,6 +1679,31 @@ class Controller:
         if "H" in d:
             CNC.vars["halt_reason"] = int(d["H"][0])
 
+        # Z1 status suffix: |E:transfer,record-requested,recording,sd-used,sd-total|OTA:phase,progress
+        e_fields = d.get("E")
+        if e_fields is not None and len(e_fields) >= 5:
+            CNC.vars["tl_status"] = 1
+            CNC.vars["tl_transfer"] = int(e_fields[0])
+            CNC.vars["tl_requested"] = int(e_fields[1])
+            CNC.vars["tl_recording"] = int(e_fields[2])
+            CNC.vars["tl_sd_used"] = int(e_fields[3])
+            CNC.vars["tl_sd_total"] = int(e_fields[4])
+        else:
+            CNC.vars["tl_status"] = 0
+            CNC.vars["tl_transfer"] = 0
+            CNC.vars["tl_requested"] = 0
+            CNC.vars["tl_recording"] = 0
+            CNC.vars["tl_sd_used"] = 0
+            CNC.vars["tl_sd_total"] = 0
+
+        ota_fields = d.get("OTA")
+        if ota_fields is not None and len(ota_fields) >= 2:
+            CNC.vars["ota_phase"] = int(ota_fields[0])
+            CNC.vars["ota_progress"] = int(ota_fields[1])
+        else:
+            CNC.vars["ota_phase"] = 0
+            CNC.vars["ota_progress"] = 0
+
         self.posUpdate = True
 
     def parseBigParentheses(self, line):
@@ -1771,6 +1814,8 @@ class Controller:
         return "WiFi"
 
     def open(self, conn_type, address):
+        if demo_is_active():
+            return False
         # init connection
         method = self._connection_method_label(conn_type, address)
         # Single user-visible connect log (monitorSerial emits one MDI Received line).
@@ -1859,10 +1904,9 @@ class Controller:
         self.comms.reset()
         CNC.vars["state"] = NOT_CONNECTED
         CNC.vars["color"] = STATECOLOR[CNC.vars["state"]]
-
-        # Start reconnection if enabled (WiFi or USB; callback resolves the method).
-        if self.reconnect_enabled and self.reconnect_callback:
-            self.start_reconnection()
+        # Signal the UI thread so monitorSerial → updateStatus picks up the
+        # NOT_CONNECTED transition (reconnection popup, state cleanup, etc.).
+        self.posUpdate = True
 
     def close_manual(self):
         """Close connection manually (user initiated) - don't auto-reconnect"""
@@ -1901,49 +1945,18 @@ class Controller:
         self.cancel_reconnect_callback = cancel_callback
         self.reconnect_success_callback = success_callback
 
-    def start_reconnection(self):
-        """Start the reconnection process"""
-        if not self.reconnect_enabled or not self.reconnect_callback:
-            return
-
-        self.reconnect_countdown = self.reconnect_wait_time
-        self.reconnect_attempts_remaining = self.reconnect_attempts
-
-        # Schedule the first reconnection attempt
-        if self.reconnect_timer:
-            self.reconnect_timer.cancel()
-        self.reconnect_timer = threading.Timer(self.reconnect_wait_time, self.attempt_reconnect)
-        self.reconnect_timer.start()
-
-    def attempt_reconnect(self):
-        """Attempt to reconnect"""
-        self.reconnect_attempts_remaining -= 1
-
-        # Try to reconnect using the callback
-        if self.reconnect_callback:
-            self.reconnect_callback()
-
-        # Schedule next attempt if there are more attempts remaining
-        if self.reconnect_attempts_remaining > 0:
-            if self.reconnect_timer:
-                self.reconnect_timer.cancel()
-            self.reconnect_timer = threading.Timer(self.reconnect_wait_time, self.attempt_reconnect)
-            self.reconnect_timer.start()
-        else:
-            # All attempts exhausted, call the cancel callback
-            if self.cancel_reconnect_callback:
-                self.cancel_reconnect_callback()
-
     def cancel_reconnection(self):
-        """Cancel the reconnection process"""
-        if self.reconnect_timer:
-            self.reconnect_timer.cancel()
-            self.reconnect_timer = None
-        # Reset reconnection state
+        """Stop a leftover controller retry timer.
+
+        ReconnectionPopup owns attempts and reports failure itself. Calling the
+        cancel callback here used to surface "auto-reconnection failed" on a
+        successful reconnect and on shutdown.
+        """
+        timer = self.reconnect_timer
+        self.reconnect_timer = None
         self.reconnect_countdown = 0
-        self.reconnect_attempts_remaining = 0
-        if self.cancel_reconnect_callback:
-            self.cancel_reconnect_callback()
+        if timer is not None:
+            timer.cancel()
 
     def notify_reconnection_success(self):
         """Notify that reconnection was successful"""
@@ -1963,6 +1976,8 @@ class Controller:
     # WARNING: it has to be a single line!
     # ----------------------------------------------------------------------
     def sendGCode(self, cmd):
+        if blocks_machine_io(self.stream):
+            return
         self.executeCommand(cmd)
 
     # ----------------------------------------------------------------------
@@ -1975,7 +1990,7 @@ class Controller:
         if self.loadNUM == 0 and self.sendNUM == 0:
             if self.stream is None or not self.protocol_ready:
                 return
-            if self.continuous_jog_active and not self._continuous_jog_stopping:
+            if self.continuous_jog_active and not self._continuous_jog_stop_requested_at:
                 # Smoothie uses "?1"; Makera uses "?" + Ctrl+Z keepalive.
                 # Always one write so keepalive can't be interleaved/orphaned.
                 if self.comms.uses_framed_transfer:
@@ -2069,16 +2084,19 @@ class Controller:
                 self.stopContinuousJog()
             self.jog_mode = mode
 
+    def continuousJogBusy(self):
+        """True while a continuous jog is running or a recent stop is waiting for ^Y."""
+        if self._continuous_jog_stop_requested_at and (
+            time.monotonic() - self._continuous_jog_stop_requested_at > CONTINUOUS_JOG_STOP_TIMEOUT
+        ):
+            self._clear_continuous_jog_state()
+        return bool(self.continuous_jog_active or self._continuous_jog_stop_requested_at)
+
     def startContinuousJog(self, _dir, speed=None, scale_feed_override=None):
         """Start continuous jogging in the specified direction"""
-        if (
-            self.jog_mode != Controller.JOG_MODE_CONTINUOUS
-            or self.continuous_jog_active
-            or self._continuous_jog_stopping
-        ):
+        if self.continuousJogBusy() or self.jog_mode != Controller.JOG_MODE_CONTINUOUS:
             return
         self.continuous_jog_active = True
-        self._continuous_jog_stopping = False
         if speed is None:
             if self.jog_speed > 0 and self.jog_speed < 10000:
                 self.executeCommand(f"$J -c {_dir} F{self.jog_speed}")
@@ -2099,13 +2117,13 @@ class Controller:
         # Send Ctrl+Y, then wait for firmware ^Y before allowing a new $J -c.
         # Mark stopping immediately so status polls stop sending keepalives that
         # would otherwise fight the stop request.
-        if self.stream is not None and self.continuous_jog_active and not self._continuous_jog_stopping:
-            self._continuous_jog_stopping = True
+        if self.stream is not None and self.continuous_jog_active and not self._continuous_jog_stop_requested_at:
+            self._continuous_jog_stop_requested_at = time.monotonic()
             self.executeRealtime(0x19)
 
     def _clear_continuous_jog_state(self):
         self.continuous_jog_active = False
-        self._continuous_jog_stopping = False
+        self._continuous_jog_stop_requested_at = 0.0
 
     def jog(self, _dir, speed=None):
         if self.jog_mode == Controller.JOG_MODE_STEP:
@@ -2364,9 +2382,6 @@ class Controller:
                     if msg:
                         CNC.vars["alarm_message"] = msg
             else:
-                # Firmware continuous-jog timeout: clear local state so jogging can restart.
-                if "Stop request timeout" in line or "Internal stop request reset" in line:
-                    self._clear_continuous_jog_state()
                 self.log.put((self.MSG_NORMAL, line))
         except (LookupError, ArithmeticError, ValueError) as e:
             self.log.put((self.MSG_ERROR, f"Failed to parse machine response: {line}"))
@@ -2437,6 +2452,27 @@ class Controller:
                     self.load_buffer.put(line2)
                     self.load_buffer_size += len(line2) + 1
 
+    def _link_lost(self):
+        """Close when the active transport reports the link is down.
+
+        Returns True when ``streamIO`` should leave its loop. A probe that
+        raises is treated as link loss so the I/O thread cannot die with the
+        session still marked open.
+        """
+        stream = self.stream
+        if stream is None:
+            return False
+        try:
+            up = stream.is_link_up()
+        except Exception:
+            logger.exception("Link probe failed — closing connection")
+            up = False
+        if up:
+            return False
+        logger.error("Transport link lost — closing connection")
+        self.close()
+        return True
+
     # ----------------------------------------------------------------------
     # thread performing I/O on serial line
     # ----------------------------------------------------------------------
@@ -2446,6 +2482,7 @@ class Controller:
         dynamic_delay = 0.1
         tr = td = time.time()
         last_error = ""
+        last_link_check = 0.0
 
         while not self.stop.is_set():
             if not self.stream or self.paused:
@@ -2475,8 +2512,23 @@ class Controller:
                         allow_wire_switch = self.sendNUM == 0 and self.loadNUM == 0
                         for message in self.comms.feed(data, allow_wire_switch=allow_wire_switch):
                             self._handle_protocol_message(message)
-                    dynamic_delay = 0
+                        dynamic_delay = 0
+                    elif self._link_lost():
+                        # Readable socket/port returned no data — link is dead
+                        # (e.g. TCP peer sent FIN, or USB port vanished).
+                        break
+                    else:
+                        # Readable but empty while the link is still up. Sleep
+                        # so a disagreeing probe cannot peg a core.
+                        dynamic_delay = 0.05
                 else:
+                    # Idle fds are not "readable", so a dead USB port that
+                    # returns 0 bytes, or a TCP socket the kernel has since
+                    # failed, would otherwise never be probed.
+                    if t - last_link_check >= LINK_CHECK_INTERVAL:
+                        last_link_check = t
+                        if self._link_lost():
+                            break
                     if self.sendNUM == 0 and self.loadNUM == 0:
                         dynamic_delay = 0.1 if dynamic_delay >= 0.09 else dynamic_delay + 0.01
                     else:
@@ -2491,6 +2543,8 @@ class Controller:
                 if last_error != exc_msg:
                     self.log.put((Controller.MSG_ERROR, exc_msg))
                     last_error = exc_msg
+                if self._link_lost():
+                    break
 
             if dynamic_delay > 0:
                 time.sleep(dynamic_delay)

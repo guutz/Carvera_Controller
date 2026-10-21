@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import array
 import zlib
+from collections.abc import Iterable
 
 import numpy as np
 
 from carveracontroller.addons.stock.simulator.carvers.backend import TileKey
-from carveracontroller.addons.stock.simulator.mesh_format import VERTEX_FORMAT
+from carveracontroller.addons.stock.simulator.mesh_format import DEFAULT_COLOR, VERTEX_FORMAT
 
 _FLOATS_PER_VERT = 12
-# Kivy Mesh indices are unsigned short; stay under 65536 vertices per draw.
+# GLES 2 Mesh: index values are uint16, and the index list itself cannot exceed 65535
 MAX_KIVY_MESH_VERTS = 65500
-_MAX_QUADS_PER_MESH = MAX_KIVY_MESH_VERTS // 4
+MAX_KIVY_MESH_INDICES = 65535
+_MAX_QUADS_PER_MESH = min(MAX_KIVY_MESH_VERTS // 4, MAX_KIVY_MESH_INDICES // 6)
+# Largest multiple of 3 that is <= both caps, so a window of this many indices never
+# references more than MAX_KIVY_MESH_VERTS distinct vertices.
+_SPLIT_WINDOW_INDICES = (min(MAX_KIVY_MESH_INDICES, MAX_KIVY_MESH_VERTS) // 3) * 3
 
 PackedMesh = tuple[array.array, array.array, list]
 
@@ -86,51 +91,6 @@ def compressed_nbytes(payload: object) -> int:
     return 64
 
 
-def quad_normals(corners: np.ndarray) -> np.ndarray:
-    """Unit normals from ``(N, 4, 3)`` quads using edges 0→1 and 0→3."""
-    e1 = corners[:, 1] - corners[:, 0]
-    e2 = corners[:, 3] - corners[:, 0]
-    n = np.cross(e1, e2)
-    lens = np.linalg.norm(n, axis=1, keepdims=True)
-    return (n / np.maximum(lens, 1e-12)).astype(np.float32)
-
-
-def pick_outward_quads(
-    p00: np.ndarray,
-    p10: np.ndarray,
-    p11: np.ndarray,
-    p01: np.ndarray,
-    hint: np.ndarray,
-) -> np.ndarray:
-    """Pack ``(N, 4, 3)`` quads, choosing the diagonal whose triangles face ``hint``.
-
-    Kivy triangulates ``(0,1,2)`` and ``(0,2,3)``. On a sloped cylindrical graph the
-    two diagonals are not equivalent: the wrong one folds a triangle inward and
-    back-face culling punches a hole.
-    """
-    n = int(p00.shape[0])
-    if n == 0:
-        return np.empty((0, 4, 3), dtype=np.float32)
-
-    def _tri_n(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
-        return np.cross(b - a, c - a)
-
-    n_a1 = _tri_n(p00, p10, p11)
-    n_a2 = _tri_n(p00, p11, p01)
-    n_b1 = _tri_n(p10, p11, p01)
-    n_b2 = _tri_n(p10, p01, p00)
-    score_a = np.minimum((n_a1 * hint).sum(axis=1), (n_a2 * hint).sum(axis=1))
-    score_b = np.minimum((n_b1 * hint).sum(axis=1), (n_b2 * hint).sum(axis=1))
-    use_b = score_b > score_a
-    shell = np.empty((n, 4, 3), dtype=np.float32)
-    wb = use_b[:, None]
-    shell[:, 0] = np.where(wb, p10, p00)
-    shell[:, 1] = np.where(wb, p11, p10)
-    shell[:, 2] = np.where(wb, p01, p11)
-    shell[:, 3] = np.where(wb, p00, p01)
-    return shell
-
-
 def pack_quad_mesh(
     corners: np.ndarray,
     normals: np.ndarray,
@@ -171,7 +131,7 @@ def pack_quad_meshes(
     normals: np.ndarray,
     color: tuple[float, float, float, float],
 ) -> list[PackedMesh]:
-    """Pack quads into one or more Kivy-safe meshes (uint16 index limit)."""
+    """Pack quads into one or more Kivy-safe meshes (uint16 values and index-list length)."""
     if corners.size == 0:
         return []
     q = int(corners.shape[0])
@@ -181,6 +141,107 @@ def pack_quad_meshes(
         packed = pack_quad_mesh(corners[start:end], normals[start:end], color)
         if packed is not None:
             out.append(packed)
+    return out
+
+
+def aabb_box_mesh(
+    xmin: float,
+    ymin: float,
+    zmin: float,
+    xmax: float,
+    ymax: float,
+    zmax: float,
+    color: tuple[float, float, float, float] = DEFAULT_COLOR,
+) -> PackedMesh | None:
+    """Six outward quads for one solid box. A uniform shell is this, not a tile grid."""
+    if xmax <= xmin or ymax <= ymin or zmax <= zmin:
+        return None
+    corners = np.array(
+        (
+            ((xmin, ymin, zmax), (xmax, ymin, zmax), (xmax, ymax, zmax), (xmin, ymax, zmax)),
+            ((xmin, ymin, zmin), (xmin, ymax, zmin), (xmax, ymax, zmin), (xmax, ymin, zmin)),
+            ((xmin, ymin, zmax), (xmin, ymax, zmax), (xmin, ymax, zmin), (xmin, ymin, zmin)),
+            ((xmax, ymax, zmax), (xmax, ymin, zmax), (xmax, ymin, zmin), (xmax, ymax, zmin)),
+            ((xmax, ymin, zmax), (xmin, ymin, zmax), (xmin, ymin, zmin), (xmax, ymin, zmin)),
+            ((xmin, ymax, zmax), (xmax, ymax, zmax), (xmax, ymax, zmin), (xmin, ymax, zmin)),
+        ),
+        dtype=np.float32,
+    )
+    normals = np.array(
+        ((0, 0, 1), (0, 0, -1), (-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0)),
+        dtype=np.float32,
+    )
+    return pack_quad_mesh(corners, normals, color)
+
+
+def _split_indexed_mesh(verts: array.array, indices: array.array) -> list[PackedMesh]:
+    """Break one triangle mesh into draws that fit both GLES Mesh caps.
+
+    Triangles that straddle a split get their vertices copied into the next draw.
+    """
+    nv = len(verts) // _FLOATS_PER_VERT
+    if nv <= 0 or len(indices) < 3:
+        return []
+    if nv <= MAX_KIVY_MESH_VERTS and len(indices) <= MAX_KIVY_MESH_INDICES:
+        return [(verts, indices, VERTEX_FORMAT)]
+    src_v = np.frombuffer(memoryview(verts), dtype=np.float32).reshape(nv, _FLOATS_PER_VERT)
+    src_i = np.frombuffer(memoryview(indices), dtype=np.uint16)
+    n_used = len(src_i) - len(src_i) % 3  # ignore a dangling partial triangle
+    out: list[PackedMesh] = []
+    # Fixed windows of whole triangles: a window of N indices touches at most N distinct
+    # vertices, so both caps hold without tracking vertex counts.
+    for start in range(0, n_used, _SPLIT_WINDOW_INDICES):
+        window = src_i[start : min(start + _SPLIT_WINDOW_INDICES, n_used)]
+        used, local = np.unique(window, return_inverse=True)
+        out.append(
+            (
+                _as_f32_array(src_v[used]),
+                _as_u16_array(local.reshape(-1)),
+                VERTEX_FORMAT,
+            )
+        )
+    return out
+
+
+def coalesce_indexed_meshes(parts: Iterable) -> list[PackedMesh]:
+    """Concatenate indexed meshes, splitting before either GLES Mesh cap."""
+    out: list[PackedMesh] = []
+    cur_v = array.array("f")
+    cur_i = array.array("H")
+
+    def flush() -> None:
+        nonlocal cur_v, cur_i
+        if len(cur_v) == 0:
+            return
+        out.append((cur_v, cur_i, VERTEX_FORMAT))
+        cur_v = array.array("f")
+        cur_i = array.array("H")
+
+    for packed in parts:
+        if not packed:
+            continue
+        verts, indices, _fmt = packed
+        nv = len(verts) // _FLOATS_PER_VERT
+        ni = len(indices)
+        if nv <= 0 or ni <= 0:
+            continue
+        if nv > MAX_KIVY_MESH_VERTS or ni > MAX_KIVY_MESH_INDICES:
+            flush()
+            out.extend(_split_indexed_mesh(verts, indices))
+            continue
+        base = len(cur_v) // _FLOATS_PER_VERT
+        base_i = len(cur_i)
+        if base and (base + nv > MAX_KIVY_MESH_VERTS or base_i + ni > MAX_KIVY_MESH_INDICES):
+            flush()
+            base = 0
+        cur_v.extend(verts)
+        if base == 0:
+            cur_i.extend(indices)
+        else:
+            shifted = np.frombuffer(memoryview(indices), dtype=np.uint16).astype(np.uint32)
+            shifted += np.uint32(base)
+            cur_i.frombytes(shifted.astype(np.uint16).tobytes())
+    flush()
     return out
 
 

@@ -1,4 +1,4 @@
-// Carved voxel chunk surface (lit opaque fill with height tint / material BRDF).
+// Carved voxel chunk surface (lit opaque fill with material BRDF).
 
 ---vertex
 $HEADER$
@@ -58,7 +58,6 @@ uniform vec2 axis_yz;
 uniform vec3 surface_color;
 uniform vec3 interior_color;
 uniform float use_two_tone;
-uniform float use_height_tint;
 uniform float surface_z_eps;
 uniform float cylindrical_skin;
 uniform float stock_radius;
@@ -73,6 +72,13 @@ void main()
     vec3 light = normalize(vec3(0.35, 0.55, 1.0));
     // Two-sided diffuse so voxel pocket walls still read.
     float ndl = abs(dot(n, light));
+    // A steep chamfer is a narrow ring. Keep its shadow side from falling into the hole.
+    // Rotary shells use this same Z band for the shoulder, so leave those alone.
+    if (cylindrical_skin < 0.5) {
+        float up = clamp(stock_n.z / max(length(stock_n), 1e-6), 0.0, 1.0);
+        float steep = (1.0 - smoothstep(0.60, 0.85, up)) * step(0.40, up);
+        ndl = mix(ndl, max(ndl, 0.55 + 0.20 * up), steep);
+    }
 
     float is_surface = 1.0;
     vec3 base = surface_color;
@@ -97,13 +103,12 @@ void main()
     }
 
     vec3 albedo = base;
-    if (use_height_tint > 0.5) {
-        // Darker toward stock bottom so coplanar pocket floors separate by depth.
+    // Flat plateaus share a normal. Darken toward the stock bottom so depth
+    // still reads from above. Hue stays the material color.
+    if (cylindrical_skin < 0.5) {
         float z_span = max(stock_z_max - stock_z_min, 1e-6);
-        float t = clamp((world_z - stock_z_min) / z_span, 0.0, 1.0);
-        vec3 low = base * vec3(0.52, 0.48, 0.42);
-        vec3 high = base * vec3(1.08, 1.05, 0.98);
-        albedo = mix(low, high, t);
+        float height_t = clamp((world_z - stock_z_min) / z_span, 0.0, 1.0);
+        albedo *= mix(0.72, 1.0, height_t);
     }
 
     float metal = clamp(mix(interior_metallic, metallic, is_surface), 0.0, 1.0);

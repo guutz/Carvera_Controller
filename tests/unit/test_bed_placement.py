@@ -1,5 +1,7 @@
 """MCS→WCS placement for beds."""
 
+import pytest
+
 from carveracontroller.addons.beds.placement import (
     default_origin_xy,
     mcs_to_wcs,
@@ -12,6 +14,12 @@ def test_default_origin_xy_subtracts_anchor_width():
     x, y = default_origin_xy(-360.158, -234.568, 15.0)
     assert abs(x - (-375.158)) < 1e-9
     assert abs(y - (-249.568)) < 1e-9
+
+
+def test_default_origin_xy_adds_optional_offset():
+    x, y = default_origin_xy(-360.158, -234.568, 15.0, offset_x_mm=-0.33 * 25.4)
+    assert x == pytest.approx(-375.158 - 0.33 * 25.4)
+    assert y == pytest.approx(-249.568)
 
 
 def test_mcs_to_wcs_identity_when_unrotated():

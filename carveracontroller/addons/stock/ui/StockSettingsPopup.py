@@ -24,8 +24,8 @@ from carveracontroller.addons.stock.simulator.carver_select import (
     recommend_carver,
 )
 from carveracontroller.addons.stock.simulator.simulation_quality import (
+    DEFAULT_CARVER_RESOLUTION,
     DEFAULT_CHECKPOINT_LEVEL,
-    DEFAULT_VOXEL_RESOLUTION,
     RESOLUTION_LEVELS,
     format_cell_size_mm,
     pick_cell_size_mm,
@@ -36,6 +36,7 @@ from carveracontroller.addons.stock.stock_defaults import (
     DEFAULT_LENGTH_MM,
     DEFAULT_WIDTH_MM,
     default_settings,
+    mesh_while_playing_from_settings,
 )
 from carveracontroller.addons.stock.stock_geometry import StockBounds
 from carveracontroller.addons.stock.stock_material import (
@@ -66,6 +67,9 @@ from carveracontroller.addons.stock.stock_origin import (
 )
 from carveracontroller.addons.stock.stock_shape import CylindricalStock, RectangularStock, RotaryCylindricalStock
 from carveracontroller.translation import tr
+
+_CAM_GEOMETRY_HINT = "Cut simulation needs tool geometry from CAM comments in the loaded G-code file."
+_NATIVE_MISSING_HINT = "Cut simulation is unavailable because the native carve module is not built."
 
 
 def _stock_corner_pairs():
@@ -139,7 +143,7 @@ def _resolution_size_label(level: str, cell_mm: float | None, carver: str) -> st
     return tr._("Medium (~%s)") % token
 
 
-def _voxel_resolution_pairs(carver: str = BACKEND_VOXEL, bounds: StockBounds | None = None):
+def _carver_resolution_pairs(carver: str = BACKEND_VOXEL, bounds: StockBounds | None = None):
     """Low/medium/high labels; include mm/cell when stock size is known."""
     sizes = None
     if bounds is not None:
@@ -252,7 +256,7 @@ class StockSettingsPopup(ModalView):
         self._corner_pairs = None
         self._z_pairs = None
         self._shape_pairs = None
-        self._voxel_resolution_pairs = None
+        self._carver_resolution_pairs = None
         self._checkpoint_level_pairs = None
         self._carver_mode_pairs = None
         self._material_pairs = None
@@ -265,7 +269,7 @@ class StockSettingsPopup(ModalView):
         self.bind(simulation_available=self._schedule_fit_popup_height)
         self.bind(rotary_mode=self._on_rotary_mode)
         self.bind(has_off_axis_y=self._on_off_axis_y)
-        self.simulation_hint = tr._("Cut simulation needs tool geometry from CAM comments in the loaded G-code file.")
+        self.simulation_hint = tr._(_CAM_GEOMETRY_HINT)
         self._ensure_lists()
         self._populate_spinner_choices()
         self._write_settings_to_ui(self._settings_snapshot)
@@ -288,8 +292,8 @@ class StockSettingsPopup(ModalView):
             self._z_pairs = _rotary_z_pairs() if self.rotary_mode else _z_reference_pairs()
         if getattr(self, "_shape_pairs", None) is None:
             self._shape_pairs = _shape_kind_pairs(rotary=self.rotary_mode)
-        if getattr(self, "_voxel_resolution_pairs", None) is None:
-            self._voxel_resolution_pairs = _voxel_resolution_pairs(BACKEND_VOXEL)
+        if getattr(self, "_carver_resolution_pairs", None) is None:
+            self._carver_resolution_pairs = _carver_resolution_pairs(BACKEND_VOXEL)
         if getattr(self, "_checkpoint_level_pairs", None) is None:
             self._checkpoint_level_pairs = _checkpoint_level_pairs()
         if getattr(self, "_carver_mode_pairs", None) is None:
@@ -359,16 +363,16 @@ class StockSettingsPopup(ModalView):
 
     def _refresh_resolution_spinner_labels(self) -> None:
         """Update Low/Medium/High captions for the selected carver and stock size."""
-        if "spn_voxel_resolution" not in self.ids:
+        if "spn_carver_resolution" not in self.ids:
             return
-        level = self._voxel_resolution_from_ui()
+        level = self._carver_resolution_from_ui()
         carver = self._effective_carver_for_resolution_labels()
-        self._voxel_resolution_pairs = _voxel_resolution_pairs(
+        self._carver_resolution_pairs = _carver_resolution_pairs(
             carver,
             bounds=self._bounds_for_resolution_preview(),
         )
-        self.ids.spn_voxel_resolution.values = [lab for lab, _ in self._voxel_resolution_pairs]
-        self.ids.spn_voxel_resolution.text = self._label_for_value(self._voxel_resolution_pairs, level)
+        self.ids.spn_carver_resolution.values = [lab for lab, _ in self._carver_resolution_pairs]
+        self.ids.spn_carver_resolution.text = self._label_for_value(self._carver_resolution_pairs, level)
 
     def _pin_detachable_rows(self) -> None:
         """Keep a strong ref to rows that leave the layout so they can be re-added.
@@ -578,33 +582,41 @@ class StockSettingsPopup(ModalView):
         self._update_rotary_origin_visibility()
         self._schedule_fit_popup_height()
 
-    def reset_for_loaded_file(self, shape=None, origin=None, show_stock: bool = False) -> dict:
-        """Reset session toggles for a newly loaded file; optionally replace shape/origin.
+    def reset_for_loaded_file(
+        self,
+        shape=None,
+        origin=None,
+        show_stock: bool = False,
+        simulate_cut: bool = False,
+    ) -> dict:
+        """Replace the session with factory stock defaults for a newly loaded file.
 
-        Cut simulation is always forced off. Stock preview is off unless
-        *show_stock* is true (CAM-header stock was applied).
+        Shape and origin are replaced when provided (auto stock for the file).
+        Stock preview follows *show_stock*. Cut simulation follows *simulate_cut*
+        only when stock is shown.
 
-        Used when a new G-code file loads. Must not read the live form — dirty
-        or invalid mid-edit fields would otherwise be committed (or wipe the
-        applied baseline via a defaults fallback).
-
-        Quality / playback-mesh flags are kept from the last applied snapshot.
-        When *shape* / *origin* are provided (auto-init), they overwrite the
-        previous file's dimensions; otherwise those fields are left as-is.
+        Must not read the live form — dirty or invalid mid-edit fields would
+        otherwise be committed.
         """
-        settings = dict(self._settings_snapshot)
-        settings["show_stock"] = bool(show_stock)
-        settings["simulate_cut"] = False
-        settings["material"] = normalize_stock_material(settings.get("material"))
+        settings = default_settings()
         if shape is not None:
             settings["shape"] = shape.to_dict()
         if origin is not None:
             settings["origin"] = origin.to_dict()
+        settings["show_stock"] = bool(show_stock)
+        settings["simulate_cut"] = bool(simulate_cut) and bool(show_stock)
         self._write_settings_to_ui(settings)
         self._settings_snapshot = dict(settings)
         return settings
 
     def _refresh_simulation_availability(self):
+        from carveracontroller.addons.stock.simulator.native import native_enabled
+
+        if not native_enabled():
+            self.simulation_available = False
+            self.simulation_hint = tr._(_NATIVE_MISSING_HINT)
+            return
+        self.simulation_hint = tr._(_CAM_GEOMETRY_HINT)
         app = App.get_running_app()
         viewer = None
         if app is not None and getattr(app, "root", None) is not None:
@@ -622,7 +634,7 @@ class StockSettingsPopup(ModalView):
         ids.spn_corner.values = [lab for lab, _ in self._corner_pairs]
         if self._row_in_form("row_z_ref"):
             ids["spn_z_ref"].values = [lab for lab, _ in self._z_pairs]
-        ids.spn_voxel_resolution.values = [lab for lab, _ in self._voxel_resolution_pairs]
+        ids.spn_carver_resolution.values = [lab for lab, _ in self._carver_resolution_pairs]
         ids.spn_checkpoint_level.values = [lab for lab, _ in self._checkpoint_level_pairs]
         if "spn_carver_mode" in ids:
             ids.spn_carver_mode.values = [lab for lab, _ in self._carver_mode_pairs]
@@ -663,10 +675,10 @@ class StockSettingsPopup(ModalView):
         ids.chk_show_stock.active = bool(settings.get("show_stock", False))
         ids.chk_simulate.active = bool(settings.get("simulate_cut", False))
         if "chk_mesh_while_playing" in ids:
-            ids.chk_mesh_while_playing.active = bool(settings.get("mesh_while_playing", False))
-        ids.spn_voxel_resolution.text = self._label_for_value(
-            self._voxel_resolution_pairs,
-            settings.get("voxel_resolution", DEFAULT_VOXEL_RESOLUTION),
+            ids.chk_mesh_while_playing.active = mesh_while_playing_from_settings(settings)
+        ids.spn_carver_resolution.text = self._label_for_value(
+            self._carver_resolution_pairs,
+            settings.get("carver_resolution", DEFAULT_CARVER_RESOLUTION),
         )
         ids.spn_checkpoint_level.text = self._label_for_value(
             self._checkpoint_level_pairs,
@@ -699,12 +711,12 @@ class StockSettingsPopup(ModalView):
                 return val
         return Z_TOP
 
-    def _voxel_resolution_from_ui(self) -> str:
-        text = self.ids.spn_voxel_resolution.text
-        for lab, val in self._voxel_resolution_pairs:
+    def _carver_resolution_from_ui(self) -> str:
+        text = self.ids.spn_carver_resolution.text
+        for lab, val in self._carver_resolution_pairs:
             if lab == text:
                 return val
-        return DEFAULT_VOXEL_RESOLUTION
+        return DEFAULT_CARVER_RESOLUTION
 
     def _checkpoint_level_from_ui(self) -> str:
         text = self.ids.spn_checkpoint_level.text
@@ -781,7 +793,7 @@ class StockSettingsPopup(ModalView):
             "show_stock": bool(self.ids.chk_show_stock.active),
             "simulate_cut": simulate,
             "mesh_while_playing": mesh_while_playing,
-            "voxel_resolution": self._voxel_resolution_from_ui(),
+            "carver_resolution": self._carver_resolution_from_ui(),
             "checkpoint_level": self._checkpoint_level_from_ui(),
             "carver_mode": self._carver_mode_from_ui(),
             "material": self._material_from_ui(),

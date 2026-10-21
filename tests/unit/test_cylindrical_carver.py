@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from carveracontroller.addons.stock.simulator.carver_select import resolve_cutting_profile
 from carveracontroller.addons.stock.simulator.carvers.cylindrical import CylindricalBackend
 from carveracontroller.addons.stock.simulator.carvers.cylindrical.backend import (
     MAX_CYLINDRICAL_N_THETA,
-    _revolution_cut_radius,
-    _xyz_inside_tool,
     pick_cylindrical_dims,
-    pose_ts_cell_aligned,
     shell_floor_radius_mm,
 )
+from carveracontroller.addons.stock.simulator.native import HAS_NATIVE
 from carveracontroller.addons.stock.stock_geometry import StockBounds, rotate_yz
 from carveracontroller.addons.stock.stock_shape import RotaryCylindricalStock
 from carveracontroller.addons.tool_visualization.tool_definition import ToolDefinition, ToolType
+
+pytestmark = pytest.mark.skipif(not HAS_NATIVE, reason="native carve extension is not built")
 
 
 def _flat_tool(diameter: float = 6.0, flute_length: float = 8.0) -> ToolDefinition:
@@ -65,48 +65,6 @@ def test_indexed_a90_clears_side_not_top():
     y, z = rotate_yz(0.0, 10.0, 90.0)
     assert not cyl.is_solid_at_world(20.0, y, z)
     assert cyl.is_solid_at_world(20.0, 0.0, 10.0)
-
-
-def test_pose_ts_point_is_single_sample():
-    ts = pose_ts_cell_aligned((0, 0, 8), (0, 0, 8), 0.0, 0.0, min_x=0.0, cell_size_mm=0.5, d_theta_deg=2.0)
-    assert list(ts) == [0.0]
-
-
-def test_pose_ts_constant_a_hits_x_centers():
-    ts = pose_ts_cell_aligned(
-        (0.0, 0.0, 8.0),
-        (10.0, 0.0, 8.0),
-        0.0,
-        0.0,
-        min_x=0.0,
-        cell_size_mm=0.5,
-        d_theta_deg=2.0,
-    )
-    assert ts[0] == 0.0 and ts[-1] == 1.0
-    xs = ts * 10.0
-    for wx in np.arange(0.25, 10.0, 0.5):
-        assert np.min(np.abs(xs - wx)) < 1e-8
-
-
-def test_pose_ts_cell_aligned_hits_x_and_theta_centers():
-    ts = pose_ts_cell_aligned(
-        (8.0, 0.0, 8.0),
-        (16.0, 0.0, 8.0),
-        0.0,
-        90.0,
-        min_x=0.0,
-        cell_size_mm=0.5,
-        d_theta_deg=2.0,
-    )
-    assert ts[0] == 0.0 and ts[-1] == 1.0
-    xs = 8.0 + ts * 8.0
-    # Every X cell center between 8 and 16 is a stamp (8.25, 8.75, ..., 15.75).
-    for wx in np.arange(8.25, 16.0, 0.5):
-        assert np.min(np.abs(xs - wx)) < 1e-8
-    # Every θ cell center in (0, 90) too (1°, 3°, ..., 89°).
-    a = ts * 90.0
-    for ac in np.arange(1.0, 90.0, 2.0):
-        assert np.min(np.abs(a - ac)) < 1e-8
 
 
 def test_indexed_a90_feed_clears_along_x():
@@ -191,8 +149,8 @@ def test_cylindrical_mesh_is_regular_grid():
     cyl = CylindricalBackend(bounds, 2.0, shape)
     meshes = cyl.mesh_tiles(cyl.initial_surface_keys())
     n_verts = sum(len(m[0]) // 12 for m in meshes.values() if m)
-    n_quads = (cyl.nx - 1) * cyl.n_theta + 2 * cyl.n_theta
-    assert n_verts == n_quads * 4
+    # Welded shell corners, plus a private ring and center on each end cap.
+    assert n_verts == cyl.nx * cyl.n_theta + 2 * (cyl.n_theta + 1)
 
 
 def test_cylindrical_sloped_mesh_stays_regular():
@@ -204,8 +162,8 @@ def test_cylindrical_sloped_mesh_stays_regular():
     cyl.radii[:, :] = 6.0 + 3.0 * xs + 2.0 * th
     meshes = cyl.mesh_tiles(cyl.initial_surface_keys())
     n_verts = sum(len(m[0]) // 12 for m in meshes.values() if m)
-    n_quads = (cyl.nx - 1) * cyl.n_theta + 2 * cyl.n_theta
-    assert n_verts == n_quads * 4
+    # Welded shell corners, plus a private ring and center on each end cap.
+    assert n_verts == cyl.nx * cyl.n_theta + 2 * (cyl.n_theta + 1)
 
 
 def test_cylindrical_slope_triangles_face_outward():
@@ -281,6 +239,51 @@ def test_cylindrical_ball_mill_clears_top():
     assert dirty
     assert not cyl.is_solid_at_world(20.0, 0.0, 10.0)
     assert cyl.is_solid_at_world(20.0, 0.0, 7.0)
+
+
+def test_cylindrical_relief_normals_follow_the_surface():
+    """A radial normal lights a rotary relief as a smooth bar. Shoulders must tilt."""
+    bounds = StockBounds(min_x=0, min_y=-12, min_z=-12, max_x=40, max_y=12, max_z=12)
+    shape = RotaryCylindricalStock(diameter_mm=20.0, length_mm=40.0)
+    cyl = CylindricalBackend(bounds, 1.0, shape)
+    cyl.radii[:, :] = np.float32(10.0)
+    mid = cyl.nx // 2
+    cyl.radii[mid, :] = np.float32(6.0)
+    slot = cyl.n_theta // 2
+    cyl.radii[: mid - 2, slot] = np.float32(6.0)
+    shoulder_x = float(bounds.min_x) + (mid - 1 + 0.5) * float(cyl.cell_size)
+    plain_x = float(bounds.min_x) + (2 + 0.5) * float(cyl.cell_size)
+    tilted = 0
+    plain = 0
+    theta_tilted = 0
+    ay, az = float(cyl.axis_y), float(cyl.axis_z)
+    slot_y = ay + 10.0 * float(cyl._sin_t[slot - 1])
+    slot_z = az + 10.0 * float(cyl._cos_t[slot - 1])
+    for packed in cyl.mesh_tiles(cyl.initial_surface_keys()).values():
+        if not packed:
+            continue
+        verts = np.asarray(packed[0], dtype=np.float64).reshape(-1, 12)
+        for row in verts:
+            n = row[3:6]
+            nlen = float(np.linalg.norm(n))
+            if nlen < 1e-6 or abs(n[0]) > 0.9:
+                continue
+            radial = np.array((0.0, row[1] - ay, row[2] - az))
+            rlen = float(np.linalg.norm(radial))
+            if rlen < 1e-6:
+                continue
+            align = abs(float(np.dot(n, radial)) / (nlen * rlen))
+            if abs(row[0] - shoulder_x) < 0.2 and rlen > 8.0:
+                if align < 0.95:
+                    tilted += 1
+            elif abs(row[0] - plain_x) < 0.2 and abs(row[1] - slot_y) < 0.8 and abs(row[2] - slot_z) < 0.8:
+                if align < 0.95:
+                    theta_tilted += 1
+            elif abs(row[0] - plain_x) < 0.2 and rlen > 8.0 and align > 0.99:
+                plain += 1
+    assert tilted > 10
+    assert theta_tilted > 0
+    assert plain > 10
 
 
 def test_cylindrical_mesh_has_end_caps():
@@ -379,9 +382,13 @@ def test_cylindrical_through_axis_does_not_pinch_mesh():
     ring = cyl.radii[ix]
     assert np.any(ring <= 1e-6)
     meshes = cyl.mesh_tiles(cyl.initial_surface_keys())
-    n_verts = sum(len(m[0]) // 12 for m in meshes.values() if m)
-    n_quads = (cyl.nx - 1) * cyl.n_theta + 2 * cyl.n_theta
-    assert n_verts == n_quads * 4
+    parts = [m for m in meshes.values() if m]
+    n_verts = sum(len(m[0]) // 12 for m in parts)
+    # Welded shell corners, plus a private ring and center on each end cap.
+    # GLES splits copy the shared ring where two draws meet.
+    seams = cyl.n_theta * max(0, len(parts) - 1)
+    assert n_verts == cyl.nx * cyl.n_theta + 2 * (cyl.n_theta + 1) + seams
+    assert sum(len(m[1]) for m in parts) == 6 * cyl.nx * cyl.n_theta
     checked, flipped, axis_hits, degen = _shell_triangle_stats(cyl)
     assert checked > 0
     assert flipped == 0
@@ -397,8 +404,8 @@ def test_cylindrical_thin_waist_still_meshes():
     cyl.radii[:, :] = np.float32(0.3)
     meshes = cyl.mesh_tiles(cyl.initial_surface_keys())
     n_verts = sum(len(m[0]) // 12 for m in meshes.values() if m)
-    n_quads = (cyl.nx - 1) * cyl.n_theta + 2 * cyl.n_theta
-    assert n_verts == n_quads * 4
+    # Welded shell corners, plus a private ring and center on each end cap.
+    assert n_verts == cyl.nx * cyl.n_theta + 2 * (cyl.n_theta + 1)
     checked, flipped, axis_hits, degen = _shell_triangle_stats(cyl)
     assert checked > 0
     assert flipped == 0
@@ -488,53 +495,3 @@ def test_cylindrical_vbit_helix_floor_is_smooth():
     # Tip at Z=8; a grid-aligned V-bit should cut every X cell to about that.
     assert float(np.max(floor) - np.min(floor)) < 0.08
     assert float(np.max(floor)) < 8.25
-
-
-def _binary_cut_point(cyl: CylindricalBackend, tip, angle, zs, rs, max_r, slab, wx, it):
-    uy, uz, y0, z0_axis = cyl._ray_frame(it, angle)
-
-    def _inside(r_field):
-        valid = r_field >= 0.0
-        yy = y0 + r_field * uy[None, :]
-        zz = z0_axis + r_field * uz[None, :]
-        return valid & _xyz_inside_tool(wx[:, None], yy, zz, tip, tip, zs, rs, None, max_r)
-
-    hit = _inside(slab)
-    hit |= _inside(np.maximum(slab - cyl.cell_size * 0.5, 0.0))
-    if not hit.any():
-        return slab, hit
-    lo = np.zeros_like(slab)
-    hi = slab.copy()
-    for _ in range(cyl._radius_search_iters()):
-        mid = 0.5 * (lo + hi)
-        ins = _inside(mid)
-        hi = np.where(ins, mid, hi)
-        lo = np.where(ins, lo, mid)
-    return np.maximum(lo, 0.0), hit
-
-
-def test_revolution_cut_matches_binary_search_for_vbit():
-    bounds = StockBounds(min_x=0, min_y=-14, min_z=-14, max_x=40, max_y=14, max_z=14)
-    shape = RotaryCylindricalStock(diameter_mm=28.0, length_mm=40.0)
-    cyl = CylindricalBackend(bounds, 0.5, shape)
-    cyl.radii[:, :] = np.float32(9.0)
-    profile = resolve_cutting_profile(_vbit())
-    zs = np.array([z for z, _r in profile], dtype=np.float64)
-    rs = np.array([r for _z, r in profile], dtype=np.float64)
-    max_r = float(np.max(rs))
-    tip = (20.0, 0.0, 8.0)
-    angle = 40.0
-    it = cyl._theta_window_indices(tip, tip, angle, max_r)
-    pad = max_r + cyl.cell_size
-    ix0 = max(0, cyl._x_index(tip[0] - pad))
-    ix1 = min(cyl.nx - 1, cyl._x_index(tip[0] + pad))
-    wx = cyl.bounds.min_x + (np.arange(ix0, ix1 + 1, dtype=np.float64) + 0.5) * cyl.cell_size
-    slab = cyl.radii[ix0 : ix1 + 1][:, it].astype(np.float64)
-    uy, uz, y0, z0_axis = cyl._ray_frame(it, angle)
-    new_an, hit_an = _revolution_cut_radius(wx, uy, uz, y0, z0_axis, tip, zs, rs, slab, cyl.cell_size * 0.5)
-    new_bin, hit_bin = _binary_cut_point(cyl, tip, angle, zs, rs, max_r, slab, wx, it)
-    assert hit_an.sum() == hit_bin.sum() or np.sum(hit_an ^ hit_bin) <= 2
-    both = hit_an & hit_bin
-    assert both.any()
-    # Binary search stops at ~stock/2^iters; analytic should be at least that close.
-    assert np.max(np.abs(new_an[both] - new_bin[both])) < 0.02

@@ -8,8 +8,8 @@ from carveracontroller.addons.stock.simulator import CheckpointStore
 from carveracontroller.addons.stock.simulator.simulation_quality import (
     CHECKPOINT_SLOTS_BY_LEVEL,
     CYLINDRICAL_TARGET_BY_LEVEL,
+    DEFAULT_CARVER_RESOLUTION,
     DEFAULT_CHECKPOINT_LEVEL,
-    DEFAULT_VOXEL_RESOLUTION,
     HEIGHTMAP_TARGET_BY_LEVEL,
     MIN_CELL_SIZE_MM,
     VOXEL_TARGET_BY_LEVEL,
@@ -17,49 +17,49 @@ from carveracontroller.addons.stock.simulator.simulation_quality import (
     checkpoint_slots_for_level,
     format_cell_size_mm,
     format_diameter_mm,
+    normalize_carver_resolution,
     normalize_checkpoint_level,
-    normalize_voxel_resolution,
     pick_cell_size_mm,
 )
 from carveracontroller.addons.stock.stock_defaults import (
+    carver_resolution_from_settings,
     checkpoint_level_from_settings,
     default_settings,
     mesh_while_playing_from_settings,
-    voxel_resolution_from_settings,
 )
 from carveracontroller.addons.stock.stock_geometry import StockBounds
 
 
 def test_voxel_preset_defaults():
-    assert VOXEL_TARGET_BY_LEVEL["low"] == 100
-    assert HEIGHTMAP_TARGET_BY_LEVEL["high"] == 1000
+    assert VOXEL_TARGET_BY_LEVEL["low"] == 200
+    assert HEIGHTMAP_TARGET_BY_LEVEL["high"] == 1200
     assert HEIGHTMAP_TARGET_BY_LEVEL["high"] > VOXEL_TARGET_BY_LEVEL["high"]
-    assert DEFAULT_VOXEL_RESOLUTION == "low"
+    assert DEFAULT_CARVER_RESOLUTION == "medium"
 
 
 def test_cell_target_for_carver():
     assert cell_target_for_carver("voxel", "high") == VOXEL_TARGET_BY_LEVEL["high"]
     assert cell_target_for_carver("heightmap", "high") == HEIGHTMAP_TARGET_BY_LEVEL["high"]
-    assert cell_target_for_carver("cylindrical", "medium") == 400
+    assert cell_target_for_carver("cylindrical", "medium") == CYLINDRICAL_TARGET_BY_LEVEL["medium"]
     assert cell_target_for_carver("unknown", "low") == VOXEL_TARGET_BY_LEVEL["low"]
 
 
 def test_checkpoint_slots_match_presets_and_store_default():
-    assert CHECKPOINT_SLOTS_BY_LEVEL == {"low": 256, "medium": 1024, "high": 4096}
+    assert CHECKPOINT_SLOTS_BY_LEVEL == {"low": 50, "medium": 100, "high": 300}
     store = CheckpointStore()
-    assert store.slot_count == CHECKPOINT_SLOTS_BY_LEVEL["medium"]
+    assert store.slot_count == 1024
     assert store.base_interval == 4
-    assert checkpoint_slots_for_level("high") == 4096
+    assert checkpoint_slots_for_level("high") == CHECKPOINT_SLOTS_BY_LEVEL["high"]
     assert checkpoint_slots_for_level("bogus") == CHECKPOINT_SLOTS_BY_LEVEL[DEFAULT_CHECKPOINT_LEVEL]
-    assert DEFAULT_CHECKPOINT_LEVEL == "medium"
+    assert DEFAULT_CHECKPOINT_LEVEL == "low"
 
 
-def test_normalize_voxel_resolution_fallbacks():
-    assert normalize_voxel_resolution("HIGH") == "high"
-    assert normalize_voxel_resolution("medium") == "medium"
-    assert normalize_voxel_resolution(None) == DEFAULT_VOXEL_RESOLUTION
-    assert normalize_voxel_resolution("nope") == DEFAULT_VOXEL_RESOLUTION
-    assert normalize_voxel_resolution(12) == DEFAULT_VOXEL_RESOLUTION
+def test_normalize_carver_resolution_fallbacks():
+    assert normalize_carver_resolution("HIGH") == "high"
+    assert normalize_carver_resolution("medium") == "medium"
+    assert normalize_carver_resolution(None) == DEFAULT_CARVER_RESOLUTION
+    assert normalize_carver_resolution("nope") == DEFAULT_CARVER_RESOLUTION
+    assert normalize_carver_resolution(12) == DEFAULT_CARVER_RESOLUTION
 
 
 def test_normalize_checkpoint_level_fallbacks():
@@ -106,7 +106,7 @@ def test_pick_cell_size_cylindrical_uses_circumference_on_short_puck():
 
 
 def test_pick_cell_size_cylindrical_long_bar_stays_fine_along_x():
-    """A long thin bar at High still targets ~800 cells along X."""
+    """A long thin bar at High still targets cells along X from the cylindrical table."""
     bounds = StockBounds(0, -15, -15, 200, 15, 15)
     high = pick_cell_size_mm(bounds, carver="cylindrical", level="high")
     assert high == pytest.approx(200 / CYLINDRICAL_TARGET_BY_LEVEL["high"])
@@ -135,20 +135,20 @@ def test_format_diameter_mm():
 
 def test_default_settings_include_quality_presets():
     settings = default_settings()
-    assert settings["voxel_resolution"] == DEFAULT_VOXEL_RESOLUTION
+    assert settings["carver_resolution"] == DEFAULT_CARVER_RESOLUTION
     assert settings["checkpoint_level"] == DEFAULT_CHECKPOINT_LEVEL
-    assert settings["mesh_while_playing"] is False
+    assert settings["mesh_while_playing"] is True
     assert settings["material"] == "beige"
-    assert voxel_resolution_from_settings(settings) == DEFAULT_VOXEL_RESOLUTION
+    assert carver_resolution_from_settings(settings) == DEFAULT_CARVER_RESOLUTION
     assert checkpoint_level_from_settings(settings) == DEFAULT_CHECKPOINT_LEVEL
-    assert mesh_while_playing_from_settings(settings) is False
+    assert mesh_while_playing_from_settings(settings) is True
 
 
 def test_settings_helpers_normalize_bad_values():
-    assert voxel_resolution_from_settings({}) == DEFAULT_VOXEL_RESOLUTION
+    assert carver_resolution_from_settings({}) == DEFAULT_CARVER_RESOLUTION
     assert checkpoint_level_from_settings({"checkpoint_level": "bogus"}) == DEFAULT_CHECKPOINT_LEVEL
-    assert voxel_resolution_from_settings({"voxel_resolution": "High"}) == "high"
-    assert mesh_while_playing_from_settings({}) is False
+    assert carver_resolution_from_settings({"carver_resolution": "High"}) == "high"
+    assert mesh_while_playing_from_settings({}) is True
     assert mesh_while_playing_from_settings({"mesh_while_playing": False}) is False
     assert mesh_while_playing_from_settings({"mesh_while_playing": 0}) is False
     assert mesh_while_playing_from_settings({"mesh_while_playing": True}) is True

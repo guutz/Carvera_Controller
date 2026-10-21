@@ -260,7 +260,7 @@
                             size_hint_x: FIELD_W
                             CheckBox:
                                 id: chk_mesh_while_playing
-                                active: False
+                                active: True
                                 disabled: not chk_simulate.active or not root.simulation_available or not chk_show_stock.active
                                 size_hint_x: None
                                 width: dp(32)
@@ -295,7 +295,7 @@
                             valign: 'middle'
                             disabled: not chk_simulate.active or not root.simulation_available or not chk_show_stock.active
                         Spinner:
-                            id: spn_voxel_resolution
+                            id: spn_carver_resolution
                             values: ['']
                             text: ''
                             size_hint_x: FIELD_W

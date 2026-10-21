@@ -5,9 +5,18 @@ from __future__ import annotations
 import math
 
 
-def default_origin_xy(anchor1_x: float, anchor1_y: float, anchor_width: float) -> tuple[float, float]:
+def default_origin_xy(
+    anchor1_x: float,
+    anchor1_y: float,
+    anchor_width: float,
+    offset_x_mm: float = 0.0,
+    offset_y_mm: float = 0.0,
+) -> tuple[float, float]:
     """MCS of the front-left top corner from Anchor 1 and L-anchor thickness."""
-    return (float(anchor1_x) - float(anchor_width), float(anchor1_y) - float(anchor_width))
+    return (
+        float(anchor1_x) - float(anchor_width) + float(offset_x_mm),
+        float(anchor1_y) - float(anchor_width) + float(offset_y_mm),
+    )
 
 
 def mcs_to_wcs(

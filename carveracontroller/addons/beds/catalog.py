@@ -14,6 +14,11 @@ CUSTOM_CATALOG_ID = "custom"
 _MESHES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "GcodeViewer", "beds"))
 
 
+# Z1 SMW beds have a 0.33 inches overhang left and right.
+_MM_PER_INCH = 25.4
+_Z1_SMW_OFFSET_X_MM = -0.33 * _MM_PER_INCH
+
+
 @dataclass(frozen=True)
 class CatalogPlate:
     """One built-in bed."""
@@ -23,6 +28,8 @@ class CatalogPlate:
     label: str
     default_material: str
     mesh_name: str
+    offset_x_mm: float | None = None
+    offset_y_mm: float | None = None
 
     def mesh_path(self) -> str:
         return os.path.join(_MESHES_DIR, self.mesh_name)
@@ -40,8 +47,22 @@ _PLATES: tuple[CatalogPlate, ...] = (
     CatalogPlate("CA1_SMW_Metric", "CA1", "SMW (Metric)", MATERIAL_ALUMINUM, "CA1_SMW_Metric.obj"),
     CatalogPlate("CA1_SMW_Inches", "CA1", "SMW (Inches)", MATERIAL_ALUMINUM, "CA1_SMW_Inches.obj"),
     CatalogPlate("Z1_MDF", "Z1", "MDF", MATERIAL_MDF, "Z1_MDF.obj"),
-    CatalogPlate("Z1_SMW_Metric", "Z1", "SMW (Metric)", MATERIAL_ALUMINUM, "Z1_SMW_Metric.obj"),
-    CatalogPlate("Z1_SMW_Inches", "Z1", "SMW (Inches)", MATERIAL_ALUMINUM, "Z1_SMW_Inches.obj"),
+    CatalogPlate(
+        "Z1_SMW_Metric",
+        "Z1",
+        "SMW (Metric)",
+        MATERIAL_ALUMINUM,
+        "Z1_SMW_Metric.obj",
+        offset_x_mm=_Z1_SMW_OFFSET_X_MM,
+    ),
+    CatalogPlate(
+        "Z1_SMW_Inches",
+        "Z1",
+        "SMW (Inches)",
+        MATERIAL_ALUMINUM,
+        "Z1_SMW_Inches.obj",
+        offset_x_mm=_Z1_SMW_OFFSET_X_MM,
+    ),
 )
 
 _BY_ID = {p.id: p for p in _PLATES}

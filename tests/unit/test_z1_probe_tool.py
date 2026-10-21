@@ -81,3 +81,39 @@ class TestIsProbingTool:
         CNC.probe_3d_tool = Z1_PROBE_3D_TOOL_NUMBER
         for tool in (1, 6, 8888):
             assert not is_probing_tool(tool)
+
+
+class TestToolDropdowns:
+    """
+    Upstream rebuilt the tool menus from scratch on the main thread, keyed on
+    is_community_firmware. "3D Probe" has to follow supports_3d_probe instead or
+    a Z1 loses it, while "Laser" stays community-only.
+    """
+
+    @staticmethod
+    def _menus(monkeypatch, *, community, supports_3d_probe):
+        from types import SimpleNamespace
+
+        import carveracontroller.main as main_module
+
+        app = SimpleNamespace(is_community_firmware=community, supports_3d_probe=supports_3d_probe)
+        monkeypatch.setattr(main_module.App, "get_running_app", staticmethod(lambda: app))
+        change, set_ = SimpleNamespace(values=[]), SimpleNamespace(values=[])
+        fake = SimpleNamespace(tool_drop_down=SimpleNamespace(change_dropdown=change, set_dropdown=set_))
+        main_module.Makera._refresh_tool_dropdowns(fake)
+        return change.values, set_.values
+
+    def test_z1_gets_the_3d_probe_but_not_laser(self, monkeypatch):
+        change, set_ = self._menus(monkeypatch, community=False, supports_3d_probe=True)
+        assert change[:2] == ["Probe", "3D Probe"]
+        assert "Laser" not in change
+        assert set_[0] == "Empty" and set_[1:] == change
+
+    def test_community_firmware_gets_both(self, monkeypatch):
+        change, _ = self._menus(monkeypatch, community=True, supports_3d_probe=True)
+        assert "3D Probe" in change and "Laser" in change
+
+    def test_stock_carvera_matches_the_kv_defaults(self, monkeypatch):
+        change, set_ = self._menus(monkeypatch, community=False, supports_3d_probe=False)
+        assert change == ["Probe", *(f"Tool: {i}" for i in range(1, 7)), "Custom"]
+        assert set_ == ["Empty", *change]

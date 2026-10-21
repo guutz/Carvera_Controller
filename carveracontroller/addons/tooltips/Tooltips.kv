@@ -29,7 +29,8 @@
     size_hint: None, None
     width: (tooltip_label.texture_size[0] + tooltip_image.width + self.spacing + 20) if self.orientation == 'horizontal' and tooltip_image.width else max(tooltip_label.texture_size[0] + 20, tooltip_image.width + 20, 220 if tooltip_label.text else 0)
     height: (max(tooltip_label.texture_size[1], tooltip_image.height) + 20) if self.orientation == 'horizontal' and tooltip_image.width else tooltip_label.texture_size[1] + tooltip_image.height + 20
-    size: self.minimum_size
+    # Size is applied in Python. Binding it to minimum_size reintroduces a blank
+    # top gap when tooltip text changes: the unused image child still adds spacing.
     orientation: 'vertical'
     padding: 10, 10
     spacing: 15

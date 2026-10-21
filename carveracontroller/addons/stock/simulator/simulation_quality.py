@@ -8,29 +8,29 @@ from typing import Any
 from carveracontroller.addons.stock.stock_geometry import StockBounds
 
 # Target cells along the carver's reference length (see ``_reference_length_mm``).
-DEFAULT_VOXEL_RESOLUTION = "low"
+DEFAULT_CARVER_RESOLUTION = "medium"
 RESOLUTION_LEVELS = ("low", "medium", "high")
 
 # 3D voxels are memory-heavy — keep targets modest.
 VOXEL_TARGET_BY_LEVEL = {
-    "low": 100,
-    "medium": 300,
-    "high": 500,
+    "low": 200,
+    "medium": 400,
+    "high": 800,
 }
 
 # Heightmaps are 2D float arrays — can run denser for the same memory budget.
 HEIGHTMAP_TARGET_BY_LEVEL = {
-    "low": 200,
-    "medium": 500,
-    "high": 1000,
+    "low": 400,
+    "medium": 700,
+    "high": 1200,
 }
 
 # Cylindrical r(x,θ) is 2D; cell size uses max(X, πD) so a short large-diameter
 # puck does not explode in θ while a long bar stays fine-pitched along X.
 CYLINDRICAL_TARGET_BY_LEVEL = {
-    "low": 150,
-    "medium": 400,
-    "high": 800,
+    "low": 200,
+    "medium": 600,
+    "high": 1000,
 }
 
 _TARGET_BY_CARVER = {
@@ -43,7 +43,7 @@ _TARGET_BY_CARVER = {
 MIN_CELL_SIZE_MM = {
     "voxel": 0.1,
     "heightmap": 0.05,
-    "cylindrical": 0.2,
+    "cylindrical": 0.1,
 }
 MAX_CELL_SIZE_MM = {
     "voxel": 1.0,
@@ -52,26 +52,26 @@ MAX_CELL_SIZE_MM = {
 }
 
 # Equally spaced restore-point slots along the toolpath
-DEFAULT_CHECKPOINT_LEVEL = "medium"
+DEFAULT_CHECKPOINT_LEVEL = "low"
 CHECKPOINT_SLOTS_BY_LEVEL = {
-    "low": 256,
-    "medium": 1024,
-    "high": 4096,
+    "low": 50,
+    "medium": 100,
+    "high": 300,
 }
 
 
-def normalize_voxel_resolution(value: Any) -> str:
-    """Return a known resolution level, defaulting to ``low``."""
+def normalize_carver_resolution(value: Any) -> str:
+    """Return a known resolution level, defaulting to ``DEFAULT_CARVER_RESOLUTION``."""
     if isinstance(value, str):
         key = value.strip().lower()
         if key in VOXEL_TARGET_BY_LEVEL:
             return key
-    return DEFAULT_VOXEL_RESOLUTION
+    return DEFAULT_CARVER_RESOLUTION
 
 
 def cell_target_for_carver(carver: str, level: Any) -> int:
     """Cells along the reference length for ``carver`` at resolution ``level``."""
-    key = normalize_voxel_resolution(level)
+    key = normalize_carver_resolution(level)
     table = _TARGET_BY_CARVER.get(str(carver).strip().lower(), VOXEL_TARGET_BY_LEVEL)
     return int(table[key])
 
@@ -133,7 +133,7 @@ def format_diameter_mm(diameter_mm: float) -> str:
 
 
 def normalize_checkpoint_level(value: Any) -> str:
-    """Return a known checkpoint-retention level, defaulting to ``medium``."""
+    """Return a known checkpoint-retention level, defaulting to ``low``."""
     if isinstance(value, str):
         key = value.strip().lower()
         if key in CHECKPOINT_SLOTS_BY_LEVEL:

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from carveracontroller.addons.stock.simulator.carvers.array_mesh import compress_array
 from carveracontroller.addons.stock.simulator.carvers.cylindrical import CylindricalBackend
 from carveracontroller.addons.stock.simulator.carvers.heightmap import HeightmapBackend
 from carveracontroller.addons.stock.simulator.carvers.laser_map import (
@@ -14,10 +15,12 @@ from carveracontroller.addons.stock.simulator.carvers.laser_map import (
     LASER_SNAP_DELTA,
     LASER_SNAP_DROP,
     LASER_SNAP_FULL,
+    LASER_SNAP_SPARSE_FULL,
     LaserMap,
     apply_laser_tagged,
     laser_burn_uint8,
     laser_diff_payload,
+    laser_snapshot_nbytes,
     pick_laser_cell_size_mm,
     stroke_radius_mm,
 )
@@ -26,11 +29,14 @@ from carveracontroller.addons.stock.simulator.carvers.voxel.checkpoints import (
     CheckpointStore,
     restore_voxel_checkpoint,
 )
+from carveracontroller.addons.stock.simulator.native import HAS_NATIVE
 from carveracontroller.addons.stock.simulator.worker import CarveJob, StockSimulator
 from carveracontroller.addons.stock.stock_geometry import StockBounds, rotate_yz, stock_theta_deg
 from carveracontroller.addons.stock.stock_shape import RectangularStock, RotaryCylindricalStock
 from carveracontroller.addons.tool_visualization.tool_definition import ToolDefinition, ToolType
 from carveracontroller.CNC import LASER_TOOL_NUMBER
+
+pytestmark = pytest.mark.skipif(not HAS_NATIVE, reason="native carve extension is not built")
 
 
 def _flat_tool(diameter: float = 4.0) -> ToolDefinition:
@@ -178,7 +184,7 @@ def test_heightmap_laser_checkpoint_roundtrip():
     hm.engrave_segment((0.0, 0.0, 5.0), (2.0, 0.0, 5.0))
     payload = hm.snapshot_full()
     assert len(payload) == 3
-    assert payload[2][0] == LASER_SNAP_FULL
+    assert payload[2][0] in (LASER_SNAP_FULL, LASER_SNAP_SPARSE_FULL)
     hm2 = HeightmapBackend(bounds, 0.5, RectangularStock(20, 20, 5))
     hm2.restore(payload)
     assert hm2._laser is not None
@@ -196,7 +202,7 @@ def test_heightmap_laser_gop_omit_does_not_drop():
     assert hm.engrave_segment((0.0, 0.0, 5.0), (0.0, 0.0, 5.0))
     first = hm.snapshot_changed(set())
     assert first[0] == "delta"
-    assert first[2][0] == LASER_SNAP_FULL
+    assert first[2][0] in (LASER_SNAP_FULL, LASER_SNAP_SPARSE_FULL)
     mill_delta = hm.snapshot_changed(set())
     assert len(mill_delta) == 2
     assert hm.engrave_segment((2.0, 0.0, 5.0), (2.0, 0.0, 5.0))
@@ -268,7 +274,7 @@ def test_voxel_laser_checkpoint_gop_restore():
     assert vx.engrave_segment((0.0, 0.0, 4.0), (0.0, 0.0, 4.0))
     assert store.maybe_record(5, vx, None)
     assert store._items[-1].is_base
-    assert store._items[-1].laser[0] == LASER_SNAP_FULL
+    assert store._items[-1].laser[0] in (LASER_SNAP_FULL, LASER_SNAP_SPARSE_FULL)
     assert vx.engrave_segment((2.0, 0.0, 4.0), (2.0, 0.0, 4.0))
     assert store.maybe_record(10, vx, set())
     assert store._items[-1].laser[0] == LASER_SNAP_DELTA
@@ -395,3 +401,70 @@ def test_worker_skips_laser_z_plunge():
     assert sim._carve_one(backend, job) == set()
     backend.engrave_segment.assert_not_called()
     backend.carve_segment.assert_not_called()
+
+
+def test_heightmap_mill_clear_appears_in_next_delta():
+    """Mill-over-engrave must clear laser in the next checkpoint delta restore."""
+    bounds = StockBounds(-10, -10, 0, 10, 10, 5)
+    hm = HeightmapBackend(bounds, 0.5, RectangularStock(20, 20, 5))
+    assert hm.engrave_segment((0.0, 0.0, 5.0), (0.0, 0.0, 5.0))
+    base = hm.snapshot_full()
+    assert hm._laser is not None
+    assert hm._laser.intensity_at(0.0, 0.0) == 255
+    hm.carve_segment((-3.0, 0.0, 2.0), (3.0, 0.0, 2.0), _flat_tool(4.0))
+    assert hm._laser.intensity_at(0.0, 0.0) == 0
+    delta = hm.snapshot_changed(set())
+    assert delta[2][0] == LASER_SNAP_DELTA
+
+    hm2 = HeightmapBackend(bounds, 0.5, RectangularStock(20, 20, 5))
+    hm2.restore(base)
+    assert hm2._laser is not None
+    assert hm2._laser.intensity_at(0.0, 0.0) == 255
+    hm2.restore(delta)
+    assert hm2._laser.intensity_at(0.0, 0.0) == 0
+
+
+def test_voxel_allow_mask_is_stroke_window(monkeypatch):
+    bounds = StockBounds(-10, -10, -5, 10, 10, 5)
+    vx = VoxelBackend(bounds, 1.0, RectangularStock(20, 20, 10), laser_cell_size_mm=0.05)
+    shapes: list[tuple[int, int]] = []
+    origins: list[tuple[int, int]] = []
+    real_allow = vx._laser_allow_mask
+
+    def _wrapped(laser, p0, p1, a0, a1, radius):
+        allow, origin = real_allow(laser, p0, p1, a0, a1, radius)
+        shapes.append(tuple(int(s) for s in allow.shape))
+        origins.append(origin)
+        assert allow.dtype == np.uint8
+        assert allow.flags.c_contiguous
+        return allow, origin
+
+    monkeypatch.setattr(vx, "_laser_allow_mask", _wrapped)
+    assert vx.engrave_segment((0.0, 0.0, 4.0), (0.05, 0.0, 4.0))
+    assert shapes
+    nx, nv = vx._laser.nx, vx._laser.nv
+    for shape in shapes:
+        assert shape != (nx, nv)
+        assert shape[0] * shape[1] < nx * nv // 4
+    assert origins and all(len(o) == 2 for o in origins)
+
+
+def test_sparse_full_snapshot_roundtrip_and_legacy_full():
+    from carveracontroller.addons.stock.simulator.carvers.laser_map import _laser_full_payload
+
+    bounds = StockBounds(0, 0, 0, 10, 10, 2)
+    laser = LaserMap.planar(bounds, 64, 64, 0.15625)
+    assert laser.paint_segment(5.0, 5.0, 5.0, 5.0, 0.2, burn=200)
+    payload = _laser_full_payload(laser.intensity)
+    assert payload[0] == LASER_SNAP_SPARSE_FULL
+    assert laser_snapshot_nbytes(payload) > 0
+
+    other = LaserMap.planar(bounds, 64, 64, 0.15625)
+    apply_laser_tagged(other, payload)
+    assert np.array_equal(other.intensity, laser.intensity)
+
+    legacy = (LASER_SNAP_FULL, compress_array(laser.intensity))
+    blank = LaserMap.planar(bounds, 64, 64, 0.15625)
+    apply_laser_tagged(blank, legacy)
+    assert np.array_equal(blank.intensity, laser.intensity)
+    assert laser_snapshot_nbytes(legacy) > 0

@@ -139,6 +139,8 @@ class BedSettingsPopup(ModalView):
             float(CNC.vars.get("anchor1_x") or 0.0),
             float(CNC.vars.get("anchor1_y") or 0.0),
             float(CNC.vars.get("anchor_width") or 15.0),
+            0.0 if plate is None or plate.offset_x_mm is None else plate.offset_x_mm,
+            0.0 if plate is None or plate.offset_y_mm is None else plate.offset_y_mm,
         )
         return {
             "name": plate.label if plate is not None else tr._("Bed"),

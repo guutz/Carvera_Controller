@@ -9,6 +9,14 @@
     },
     {
         "type": "bool",
+        "title": "Simulate cut when stock is displayed automatically",
+        "desc": "When a loaded file shows stock from its G-code header, also turn on Simulate cut. Applies only if Automatically display stock when available is enabled and cut simulation is available. Uses the stock defaults for that file, including Update during playback.",
+        "section": "carvera",
+        "key": "gcode_auto_simulate_cut",
+        "default": "false"
+    },
+    {
+        "type": "bool",
         "title": "Enable Syntax Highlighting",
         "desc": "Colorize G-code tokens in the file viewer. Disable on low-end machines for better scroll performance.",
         "section": "carvera",

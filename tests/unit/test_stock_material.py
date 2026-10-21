@@ -35,10 +35,9 @@ def test_default_settings_include_beige_material():
     assert material_from_settings({"material": "PCB"}) == MATERIAL_PCB
 
 
-def test_beige_keeps_current_preview_and_height_tint():
+def test_beige_keeps_current_preview():
     style = style_for_material(MATERIAL_BEIGE)
     assert style.two_tone is False
-    assert style.use_height_tint is True
     assert style.surface_rgb == DEFAULT_COLOR[:3]
     assert style.interior_rgb is None
     assert style.metallic == 0.0
@@ -57,7 +56,6 @@ def test_beige_keeps_current_preview_and_height_tint():
 def test_pcb_is_copper_over_fr4():
     style = style_for_material(MATERIAL_PCB)
     assert style.two_tone is True
-    assert style.use_height_tint is False
     assert style.surface_rgb == (0.85, 0.55, 0.22)
     assert style.metallic == 1.0
     assert style.interior_metallic == 0.0
@@ -85,7 +83,6 @@ def test_aluminum_is_uniform_metal():
 def test_copper_is_uniform_metal():
     style = style_for_material(MATERIAL_COPPER)
     assert style.two_tone is False
-    assert style.use_height_tint is False
     assert style.metallic == 1.0
     assert style.interior_metallic is None
     assert style.interior_roughness is None
