@@ -419,3 +419,83 @@ the Z1 to also be on WiFi; USB-only means no camera path at all.
   `texture_size`.
 - Not yet offered in the layout editor: adding or removing **modifiers** (JSON
   only).
+
+---
+
+## Upstream merge, 2026-10-20
+
+*Added 2026-10-20 by the same controller session, after merging 208 commits of
+`origin/develop` (the 2.3.0-RC1 work) on branch `merge/upstream-develop-2026-10`.
+Two corrections to the sections above are marked **Correction**.*
+
+### Correction: the `is_community_firmware` widget list was mislabeled
+
+"The 8 real feature gates" above names **Set Origin** and **Ext. Control**. Both
+are wrong: the label-finder walked *backwards* from each `disabled:` line and
+picked up the previous widget's text. Resolved by indentation to the enclosing
+widget, the control-screen gates are **Probing…** and **Tools…** (a `Spinner`).
+Set Origin is only state-gated; Ext. Control isn't gated. The rest of the list
+(Set Rotation, Adv Calibrate, jog mode, Auto Ext. Out) was right. If you need
+this list again, resolve each `disabled:` to its enclosing widget by indentation
+— reading backwards *or* forwards from the line both overshoot.
+
+### Correction: test invocation
+
+Add `--ignore=tests/unit/test_continuous_jog_state.py` — upstream's new test
+imports `WHB04`, which only exists when `hidapi` loads. And expect **five
+failures that predate this branch**, reproduced identically on a clean
+`origin/develop` worktree:
+
+```
+test_gcode_viewer_stock.py  test_simulation_available_{with_cam_tool_table,laser_only_without_tool_table,laser_and_3d_probe_without_tool_table}
+test_tooltips.py            test_live_text_change_does_not_add_top_gap
+test_tutorial.py            test_welcome_doc_link_opens_from_its_on_screen_position
+```
+
+Not lock drift — upstream's `poetry.lock` changes were patch bumps to dev
+tooling. Suite is now ~1433 passing. `ruff` is in the poetry venv's `bin/`.
+
+### What upstream changed that matters here
+
+- **Kivy properties must not be set from the serial thread.** `monitorSerial`
+  runs off the main thread. Upstream `a91c421` moved firmware-derived property
+  writes into `_apply_detected_firmware`, scheduled via `Clock.schedule_once`.
+  Put anything derived from the version line there, not in `monitorSerial`.
+  (The disconnect block in `monitorSerial` still sets `app.model` and friends
+  directly — upstream's own remaining pattern, left as-is.)
+- **Tool menus are rebuilt from scratch**, now by `_refresh_tool_dropdowns()`
+  (extracted in the merge from upstream's inline code). "3D Probe" follows
+  `supports_3d_probe`, "Laser" `is_community_firmware`. It runs from
+  `_refresh_3d_probe_support()`, which both the firmware and model handlers call,
+  because those two status lines arrive in either order.
+- **Upstream gated the main-menu probe button on `is_community_firmware`**
+  (`3d9c81f`), which would have disabled Z1 probing outright. Both probing entry
+  points — that icon and the control screen's Probing… — now use
+  `supports_3d_probe`. Before the merge the control-screen one was still
+  community-gated on this branch too; probing was reachable on a Z1 only via the
+  main menu and the pendant.
+- **Continuous jog: use `Controller.continuousJogBusy()`, not
+  `continuous_jog_active`.** Upstream `b1d1507` dropped the firmware-message
+  handler that cleared stuck jog state, so the timeout inside
+  `continuousJogBusy()` is the *only* recovery from a lost `^Y` ack. Any pendant
+  checking the bare flag gets stuck after one. The MacroPad is moved over, with a
+  regression test.
+- **`play()` now lifts to clearance first** (`liftToClearance(buffer=True)`,
+  `7aada69`) and is blocked during the new guided tour (`tutorial_blocks_motion()`,
+  a pure flag). Both live in `_start_play` behind the pre-run check, since
+  anything buffered must come after the dialog.
+- **Upstream did not add Z1 probing.** No `T9999`, no `M480`. Our probing work
+  remains the only Z1 path.
+- Camera: upstream added reconnect-with-spinner (`72b0ca1`) and **Z1 timelapse**
+  (`c0a089f`, `timelapse.py`, recording state on the machine link — so the
+  `/sd/videos` route noted above is now used). Neither derives the camera host
+  on its own, so USB discovery composes with both.
+- Also arrived and relevant to this machine: **firmware updater support for Z1**
+  bundled lpc+esp (`beefe2b`), USB bulk link probe for connect/disconnect
+  tracking (`21ca19f`).
+
+### Merge state, as of writing
+
+`merge/upstream-develop-2026-10` holds the merge commit, **local only, not
+pushed**. `z1-usb-macropad` is untouched until the user confirms — then it is a
+fast-forward to that branch.
