@@ -499,3 +499,7 @@ tooling. Suite is now ~1433 passing. `ruff` is in the poetry venv's `bin/`.
 `merge/upstream-develop-2026-10` holds the merge commit, **local only, not
 pushed**. `z1-usb-macropad` is untouched until the user confirms — then it is a
 fast-forward to that branch.
+
+**Update, 2026-10-20:** the user confirmed; `z1-usb-macropad` was fast-forwarded
+to the merge and pushed to `fork`. The scratch branch is deleted. The branch is
+now 0 behind `origin/develop`.
